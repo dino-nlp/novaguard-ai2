@@ -393,7 +393,8 @@ async def consume_messages():
     retry_delay = 10 # seconds
     for attempt in range(max_retries):
         try:
-            from kafka import KafkaConsumer, KafkaError # Import ở đây để tránh lỗi nếu kafka-python chưa được cài khi load module
+            from kafka import KafkaConsumer # Import ở đây để tránh lỗi nếu kafka-python chưa được cài khi load module
+            from kafka.errors import KafkaError
             consumer = KafkaConsumer(
                 settings_obj.KAFKA_PR_ANALYSIS_TOPIC,
                 bootstrap_servers=settings_obj.KAFKA_BOOTSTRAP_SERVERS.split(','),

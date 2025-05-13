@@ -7,3 +7,6 @@ python-jose[cryptography] # For JWT tokens
 python-multipart # For handling form data (needed by fastapi[all] or for OAuth2 password flow)
 pydantic-settings # For managing settings/configurations
 kafka-python
+# confluent-kafka
+jinja2
+python-multipart # Đã có, nhưng cần cho form HTML
