@@ -1,0 +1,138 @@
+
+services:
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: novaguard_postgres
+    environment:
+      POSTGRES_USER: novaguard_user
+      POSTGRES_PASSWORD: novaguard_password
+      POSTGRES_DB: novaguard_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - novaguard_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U novaguard_user -d novaguard_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: novaguard_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - novaguard_network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: novaguard_kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REplication_FACTOR: 1
+      # KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - novaguard_network
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: novaguard_ollama_docker
+    ports:
+      - "11435:11434" # Map cổng 11435 của host tới cổng 11434 của container
+    volumes:
+      - ollama_docker_data:/root/.ollama # Sử dụng volume đã đổi tên
+    networks:
+      - novaguard_network
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    tty: true
+    restart: unless-stopped
+
+  novaguard_backend_api:
+    build:
+      context: ./novaguard-backend # Đường dẫn tới thư mục chứa Dockerfile của backend
+      dockerfile: Dockerfile
+    container_name: novaguard_api
+    depends_on:
+      postgres_db:
+        condition: service_healthy # Đảm bảo DB sẵn sàng
+      # kafka: # Bỏ comment khi project_service hoặc webhook_service cần Kafka
+      #   condition: service_healthy
+    ports:
+      - "8000:8000" # Map port 8000 của host tới port 8000 của container
+    volumes:
+      - ./novaguard-backend/app:/app/app # Mount code để live reload khi dev
+                                      # Đường dẫn đầu tiên là trên host, thứ hai là trong container
+                                      # Đảm bảo đường dẫn trong container khớp với nơi code được COPY trong Dockerfile
+    environment:
+      DATABASE_URL: "postgresql://novaguard_user:novaguard_password@postgres_db:5432/novaguard_db"
+      # KAFKA_BOOTSTRAP_SERVERS: "kafka:29092" # Sẽ dùng sau
+      OLLAMA_BASE_URL: "http://ollama:11434" # Service ollama trong cùng network
+      SECRET_KEY: "your-super-secret-key-please-change-this" # Nên đặt giá trị thực ở đây hoặc env file
+      ACCESS_TOKEN_EXPIRE_MINUTES: "1440" # ví dụ 1 ngày
+      # Thêm các biến môi trường khác nếu cần
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      PYTHONPATH: "/app" # Đảm bảo Python có thể tìm thấy các module trong /app
+    networks:
+      - novaguard_network
+    restart: unless-stopped
+
+  novaguard_analysis_worker:
+    build:
+      context: ./novaguard-backend # Có thể dùng cùng Dockerfile với API
+      dockerfile: Dockerfile
+    container_name: novaguard_worker
+    # Lệnh để chạy script consumer.py
+    # Đảm bảo PYTHONPATH được thiết lập để Python tìm thấy các module app.*
+    command: ["python", "-m", "app.analysis_worker.consumer"]
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+      kafka: # Worker phụ thuộc vào Kafka
+        condition: service_healthy
+    volumes: # Mount code để có thể cập nhật worker mà không cần rebuild image (cho dev)
+      - ./novaguard-backend/app:/app/app # Giống như API service
+    environment:
+      DATABASE_URL: "postgresql://novaguard_user:novaguard_password@postgres_db:5432/novaguard_db"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+      # Không cần OLLAMA_BASE_URL cho worker ở bước này
+      PYTHONPATH: "/app" # Đảm bảo các import hoạt động
+    networks:
+      - novaguard_network
+    restart: unless-stopped # Tự khởi động lại nếu bị lỗi
+
+volumes:
+  postgres_data:
+  ollama_docker_data: # <-- Đảm bảo dòng này tồn tại và tên khớp với tên volume trong service ollama
+
+networks:
+  novaguard_network:
+    driver: bridge

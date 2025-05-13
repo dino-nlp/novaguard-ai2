@@ -1,0 +1,9 @@
+fastapi[all]
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary # PostgreSQL adapter for Python
+passlib[bcrypt] # For password hashing
+python-jose[cryptography] # For JWT tokens
+python-multipart # For handling form data (needed by fastapi[all] or for OAuth2 password flow)
+pydantic-settings # For managing settings/configurations
+kafka-python
