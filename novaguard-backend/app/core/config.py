@@ -16,10 +16,12 @@ class Settings(BaseSettings):
     # GitHub OAuth App Settings
     GITHUB_CLIENT_ID: str | None = None
     GITHUB_CLIENT_SECRET: str | None = None
-    GITHUB_REDIRECT_URI: str | None = "http://localhost:8000/auth/github/callback"
-
+    GITHUB_REDIRECT_URI: str = "http://localhost:8000/api/auth/github/callback"
+    
     # GitHub Webhook Secret (cho webhook của repository)
     GITHUB_WEBHOOK_SECRET: str | None = None # Sẽ load từ .env
+    
+    SESSION_SECRET_KEY: str | None = None
 
     # Kafka settings
     KAFKA_BOOTSTRAP_SERVERS: str = "kafka:29092"

@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_title | default("NovaGuard-AI") }}</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // Basic Tailwind configuration (can be extended)
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'nv-dark': '#1e293b',       // slate-800
+                        'nv-med-dark': '#334155',  // slate-700
+                        'nv-med-light': '#475569', // slate-600
+                        'nv-light': '#f1f5f9',      // slate-100
+                        'nv-accent': '#38bdf8',     // sky-500
+                        'nv-accent-hover': '#0ea5e9', // sky-600
+                        'nv-success': '#22c55e',   // green-500
+                        'nv-error': '#ef4444',     // red-500
+                        'nv-warning': '#f59e0b',   // amber-500
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <link href="{{ url_for('static', path='/css/styles.css') }}" rel="stylesheet">
+    
+    {% block head_extra %}
+    {% endblock %}
+</head>
+<body class="bg-nv-light text-nv-dark flex flex-col min-h-screen font-sans">
+
+    <nav class="bg-nv-med-dark text-white shadow-lg sticky top-0 z-50">
+        <div class="container mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center">
+                    <a href="{{ url_for('ui_home') }}" class="text-2xl font-bold hover:text-nv-accent transition-colors duration-150">
+                        NovaGuard-AI
+                    </a>
+                </div>
+                <div class="flex items-center">
+                    {% if current_user %}
+                        <a href="{{ url_for('ui_dashboard_get') }}" class="px-3 py-2 rounded-md text-sm font-medium hover:bg-nv-med-light hover:text-nv-accent transition-colors duration-150">Dashboard</a>
+                        <span class="text-gray-400 mx-2 text-sm">|</span>
+                        <span class="px-3 py-2 rounded-md text-sm font-medium">Welcome, {{ current_user.email }}!</span>
+                        <a href="{{ url_for('ui_logout_get') }}" 
+                           class="ml-4 px-3 py-2 rounded-md text-sm font-medium bg-red-500 hover:bg-red-600 transition-colors duration-150">
+                           Logout
+                        </a>
+                    {% else %}
+                        <a href="{{ url_for('ui_login_get') }}" 
+                           class="px-3 py-2 rounded-md text-sm font-medium hover:bg-nv-med-light hover:text-nv-accent transition-colors duration-150">
+                           Login
+                        </a>
+                        <a href="{{ url_for('ui_register_get') }}" 
+                           class="ml-4 px-3 py-2 rounded-md text-sm font-medium bg-nv-accent hover:bg-nv-accent-hover transition-colors duration-150">
+                           Register
+                        </a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container mx-auto p-4 sm:p-6 lg:p-8 mt-6 mb-8 flex-grow">
+        {# --- Flash Messages Placeholder (To be implemented if needed) --- #}
+        {# {% set flashed_messages = get_flashed_messages_from_session(request) %} #}
+        {% set flashed_messages = request.session.pop("_flash_messages", []) %} {# Simplified direct access #}
+        {% if flashed_messages %}
+            <div class="mb-6 space-y-3">
+            {% for msg_item in flashed_messages %}
+                <div class="p-4 rounded-md text-sm shadow
+                            {% if msg_item.category == 'success' %} bg-green-50 border-l-4 border-green-400 text-green-700
+                            {% elif msg_item.category == 'error' %} bg-red-50 border-l-4 border-red-400 text-red-700
+                            {% elif msg_item.category == 'warning' %} bg-yellow-50 border-l-4 border-yellow-400 text-yellow-700
+                            {% else %} bg-blue-50 border-l-4 border-blue-400 text-blue-700 
+                            {% endif %}" role="alert">
+                    <p class="font-bold">
+                        {% if msg_item.category == 'success' %}Success!
+                        {% elif msg_item.category == 'error' %}Error!
+                        {% elif msg_item.category == 'warning' %}Warning!
+                        {% else %}Notice
+                        {% endif %}
+                    </p>
+                    <p>{{ msg_item.message }}</p>
+                </div>
+            {% endfor %}
+            </div>
+        {% endif %}
+        {# --- End Flash Messages --- #}
+    
+        {% block content %}
+        {% endblock %}
+    </main>
+
+    <footer class="bg-nv-dark text-nv-light text-center p-6">
+        <p>&copy; <span id="current-year">2025</span> NovaGuard-AI. All rights reserved.</p>
+    </footer>
+
+    <script>
+        document.getElementById('current-year').textContent = new Date().getFullYear();
+    </script>
+    {% block scripts_extra %}
+    {% endblock %}
+</body>
+</html>

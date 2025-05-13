@@ -1,0 +1,37 @@
+{% extends "layout/base.html" %}
+
+    {% block content %}
+    <div class="bg-white p-6 rounded-lg shadow">
+        <h1 class="text-2xl font-semibold text-nv-dark mb-4">Dashboard</h1>
+        {% if current_user %}
+            <p class="mb-6 text-gray-700">Welcome back, <strong class="text-nv-dark">{{ current_user.email }}</strong>!</p>
+            
+            <div class="mb-6">
+                <a href="{{ url_for('ui_add_project_get') }}" class="bg-nv-accent hover:bg-nv-accent-dark text-white font-bold py-2 px-4 rounded transition duration-150">
+                    Add New Project
+                </a>
+                <a href="{{ url_for('api_github_oauth_redirect') }}" class="ml-4 bg-gray-700 hover:bg-gray-800 text-white font-bold py-2 px-4 rounded transition duration-150">
+                    Connect/Reconnect GitHub Account
+                </a>
+            </div>
+
+            <h2 class="text-xl font-semibold text-nv-dark mb-3">Your Projects</h2>
+            {% if projects and projects|length > 0 %}
+                <ul class="space-y-3">
+                    {% for project in projects %}
+                        <li class="p-4 bg-gray-50 rounded shadow hover:shadow-md transition-shadow">
+                            <a href="{{ url_for('ui_project_detail_get', project_id=project.id) }}" class="font-semibold text-nv-accent hover:underline">{{ project.repo_name }}</a>
+                            <p class="text-sm text-gray-600">Main Branch: {{ project.main_branch }}</p>
+                            <p class="text-sm text-gray-600">Language: {{ project.language or 'Not set' }}</p>
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% else %}
+                <p class="text-gray-600">You haven't added any projects yet. <a href="{{ url_for('ui_add_project_get') }}" class="text-nv-accent hover:underline">Add one now!</a></p>
+            {% endif %}
+
+        {% else %}
+            <p>Please <a href="{{ url_for('ui_login_get') }}" class="text-nv-accent hover:underline">login</a> to view your dashboard.</p>
+        {% endif %}
+    </div>
+    {% endblock %}

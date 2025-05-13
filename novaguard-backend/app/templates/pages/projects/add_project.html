@@ -1,0 +1,77 @@
+{% extends "layout/base.html" %}
+
+{% block content %}
+<div class="bg-white p-6 md:p-8 rounded-lg shadow-xl max-w-2xl mx-auto">
+    <h1 class="text-2xl font-semibold text-nv-dark mb-6 border-b pb-4">Add New GitHub Project</h1>
+
+    {% if error_github %}
+    <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-6" role="alert">
+        <p class="font-bold">GitHub Connection Note</p>
+        <p>{{ error_github }} 
+            <a href="{{ url_for('api_github_oauth_redirect') }}" class="font-semibold hover:underline">Connect GitHub Account</a>
+        </p>
+    </div>
+    {% endif %}
+
+    <form action="{{ url_for('ui_add_project_post') }}" method="post" class="space-y-6">
+        <div>
+            <label for="repo_name" class="block text-sm font-medium text-gray-700 mb-1">
+                Repository Name <span class="text-red-500">*</span> (e.g., `owner/repository-name`)
+            </label>
+            <input type="text" name="repo_name" id="repo_name" required 
+                   placeholder="your-github-username/your-repo-name"
+                   class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+            <p class="mt-1 text-xs text-gray-500">This must be the full name of the repository on GitHub.</p>
+        </div>
+
+        <div>
+            <label for="github_repo_id" class="block text-sm font-medium text-gray-700 mb-1">
+                GitHub Repository ID <span class="text-red-500">*</span> (Numeric ID)
+            </label>
+            <input type="text" name="github_repo_id" id="github_repo_id" required 
+                   placeholder="e.g., 123456789 (Find this on GitHub)"
+                   pattern="[0-9]+" title="Please enter a numeric GitHub Repository ID."
+                   class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+            <p class="mt-1 text-xs text-gray-500">
+                You can often find this ID via GitHub API or some browser extensions. 
+                Example: <code>curl -H "Authorization: token YOUR_GITHUB_TOKEN" https://api.github.com/repos/OWNER/REPO</code> and look for "id".
+            </p>
+        </div>
+
+        <div>
+            <label for="main_branch" class="block text-sm font-medium text-gray-700 mb-1">
+                Main Branch <span class="text-red-500">*</span> (e.g., `main`, `master`, `develop`)
+            </label>
+            <input type="text" name="main_branch" id="main_branch" value="main" required
+                   class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+
+        <div>
+            <label for="language" class="block text-sm font-medium text-gray-700 mb-1">
+                Primary Language (Optional)
+            </label>
+            <input type="text" name="language" id="language" placeholder="e.g., Python, JavaScript, Java"
+                   class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+
+        <div>
+            <label for="custom_project_notes" class="block text-sm font-medium text-gray-700 mb-1">
+                Custom Project Notes (Optional)
+            </label>
+            <textarea name="custom_project_notes" id="custom_project_notes" rows="4"
+                      placeholder="Any specific coding conventions, architectural guidelines, or important notes for the LLM to consider during analysis."
+                      class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm"></textarea>
+        </div>
+
+        <div class="flex justify-end pt-4">
+            <a href="{{ url_for('ui_dashboard_get') }}" class="mr-3 py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-nv-accent">
+                Cancel
+            </a>
+            <button type="submit"
+                    class="py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-nv-accent hover:bg-nv-accent-hover focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-nv-accent-hover">
+                Add Project
+            </button>
+        </div>
+    </form>
+</div>
+{% endblock %}

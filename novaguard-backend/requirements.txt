@@ -10,3 +10,4 @@ kafka-python
 # confluent-kafka
 jinja2
 python-multipart # Đã có, nhưng cần cho form HTML
+itsdangerous
