@@ -1,7 +1,8 @@
 import logging
 import httpx # Cần cho việc gọi API GitHub
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
+from datetime import timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
@@ -22,122 +23,181 @@ from app.auth_service.auth_bearer import get_current_active_user # Dependency x�
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# --- Schema cho GitHub Repo (để trả về cho frontend) ---
-# Định nghĩa schema này ở đây vì nó được sử dụng và trả về bởi API này.
-# Hoặc có thể đặt trong project_schemas_module nếu muốn.
-class GitHubRepoSchema(PydanticBaseModel): # Sử dụng PydanticBaseModel đã import
-    id: int
-    name: str
-    full_name: str # owner/repo
-    private: bool
-    html_url: HttpUrl # Sử dụng HttpUrl đã import từ pydantic
-    description: Optional[str] = None
-    updated_at: datetime
-
-# --- API Endpoints ---
-
-@router.get("/github-repos", response_model=List[GitHubRepoSchema], summary="List user's GitHub repositories")
-async def list_user_github_repositories(
-    db: Session = Depends(get_db),
-    current_user: auth_schemas_module.UserPublic = Depends(get_current_active_user)
-):
+# --- Helper Function để fetch và format GitHub Repos ---
+async def _fetch_raw_github_repositories_for_user(github_token: str, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     """
-    Lấy danh sách các repositories từ tài khoản GitHub đã kết nối của người dùng.
-    Bao gồm xử lý phân trang của GitHub API.
+    Hàm helper để lấy danh sách thô các repositories từ GitHub API, xử lý phân trang.
+    Trả về list của các dicts là dữ liệu repo thô.
     """
-    logger.info(f"Fetching GitHub repositories for user: {current_user.email} (ID: {current_user.id})")
-    db_user = db.query(User).filter(User.id == current_user.id).first()
-    if not db_user or not db_user.github_access_token_encrypted:
-        logger.warning(f"User {current_user.email} has not connected their GitHub account or token is missing.")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="GitHub account not connected or access token not found for this user. Please connect via /auth/github."
-        )
-
-    github_token = decrypt_data(db_user.github_access_token_encrypted)
-    if not github_token:
-        logger.error(f"Failed to decrypt GitHub token for user {current_user.email}. Check FERNET_KEY and token integrity.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not retrieve GitHub access token due to a server error."
-        )
-
+    all_repos_data: List[Dict[str, Any]] = []
     github_repos_url = "https://api.github.com/user/repos"
     headers = {
         "Authorization": f"token {github_token}",
         "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28" # Khuyến nghị bởi GitHub
+        "X-GitHub-Api-Version": "2022-11-28"
     }
-    params = {"type": "all", "sort": "updated", "per_page": 100} 
+    params = {"type": "all", "sort": "updated", "per_page": 100} # Lấy tất cả repo (owner, collaborator, member)
     
-    all_repos_data = []
     current_url: Optional[str] = github_repos_url
     page_num = 1
 
-    async with httpx.AsyncClient() as client:
-        while current_url:
-            logger.debug(f"Fetching GitHub repos page {page_num} from URL: {current_url} with params: {params if page_num == 1 else None}")
-            try:
-                # Chỉ truyền params cho request đầu tiên, các request sau đã có params trong current_url từ Link header
-                request_params = params if page_num == 1 and current_url == github_repos_url else None
-                response = await client.get(current_url, headers=headers, params=request_params)
-                response.raise_for_status()
-                page_data = response.json()
-                if not isinstance(page_data, list):
-                    logger.error(f"Unexpected response format from GitHub (expected list): {page_data}")
-                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response format from GitHub.")
-                all_repos_data.extend(page_data)
-                
-                current_url = None 
-                if 'Link' in response.headers:
-                    links = httpx.Headers(response.headers).get_list('Link')
-                    for link_str in links:
-                        parts = link_str.split(';')
-                        if len(parts) == 2:
-                            url_part = parts[0].strip('<>')
-                            rel_part = parts[1].strip()
-                            if 'rel="next"' in rel_part:
-                                current_url = url_part
-                                page_num += 1
-                                break 
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Error fetching GitHub repositories for user {current_user.email} (Page {page_num}): {e.response.status_code} - {e.response.text}")
-                if e.response.status_code in [401, 403]:
-                    raise HTTPException(status_code=e.response.status_code, detail="GitHub token is invalid, expired, or lacks necessary permissions. Please reconnect your GitHub account.")
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Failed to fetch repositories from GitHub: {e.response.json().get('message', 'Service error')}")
-            except Exception as e:
-                logger.exception(f"Unexpected error fetching GitHub repositories (Page {page_num}).")
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not fetch repositories from GitHub due to an unexpected error.")
-    
-    formatted_repos = []
-    for repo in all_repos_data:
-        if not isinstance(repo, dict): continue
+    while current_url:
+        logger.debug(f"Fetching GitHub repos page {page_num} from URL: {current_url} with params: {params if page_num == 1 else None}")
         try:
-            # Chuyển đổi updated_at sang đối tượng datetime timezone-aware
-            updated_at_str = repo.get("updated_at")
+            request_params_internal = params if page_num == 1 and current_url == github_repos_url else None
+            response = await client.get(current_url, headers=headers, params=request_params_internal)
+            response.raise_for_status() # Raise HTTPStatusError cho 4xx/5xx
+            page_data = response.json()
+            if not isinstance(page_data, list):
+                logger.error(f"Unexpected response format from GitHub (expected list): {page_data}")
+                # Không nên raise HTTPException ở đây vì đây là helper, để hàm gọi xử lý
+                break # Thoát vòng lặp nếu dữ liệu không đúng
+            all_repos_data.extend(page_data)
+            
+            # Xử lý Link header cho phân trang
+            current_url = None 
+            if 'Link' in response.headers:
+                links_header = httpx.Headers(response.headers).get_list('Link') # Sử dụng httpx.Headers
+                for link_str_item in links_header: # Đổi tên biến để tránh xung đột
+                    parts = link_str_item.split(';')
+                    if len(parts) == 2:
+                        url_part = parts[0].strip('<>')
+                        rel_part = parts[1].strip()
+                        if 'rel="next"' in rel_part:
+                            current_url = url_part
+                            page_num += 1
+                            break 
+        except httpx.HTTPStatusError as e_status: # Đổi tên biến
+            # Ghi log lỗi và re-throw để hàm gọi có thể xử lý (ví dụ: trả về lỗi cho client API)
+            logger.error(f"GitHub API Error (Page {page_num}): {e_status.response.status_code} - {e_status.request.url} - Response: {e_status.response.text}")
+            raise # Re-throw exception để hàm gọi bên ngoài xử lý
+        except Exception as e_general: # Đổi tên biến
+            logger.exception(f"Unexpected error while fetching GitHub repositories (Page {page_num}).")
+            raise # Re-throw
+            
+    return all_repos_data
+
+async def get_formatted_github_repos_from_api_data(raw_repos_data: List[Dict[str, Any]]) -> List[project_schemas_module.GitHubRepoSchema]:
+    """
+    Hàm helper để chuyển đổi dữ liệu repo thô từ GitHub API sang list các GitHubRepoSchema.
+    """
+    formatted_repos: List[project_schemas_module.GitHubRepoSchema] = []
+    for repo_data in raw_repos_data: # Đổi tên biến repo thành repo_data
+        if not isinstance(repo_data, dict): 
+            logger.warning(f"Skipping non-dict item in raw_repos_data: {repo_data}")
+            continue
+        try:
+            updated_at_str = repo_data.get("updated_at")
             parsed_updated_at = None
             if updated_at_str:
                 try:
                     # Thử parse với định dạng Z (UTC)
                     parsed_updated_at = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
                 except ValueError:
-                    logger.warning(f"Could not parse 'updated_at' date '{updated_at_str}' for repo '{repo.get('full_name')}'. Skipping this field for this repo.")
+                    logger.warning(f"Could not parse 'updated_at' date '{updated_at_str}' for repo '{repo_data.get('full_name')}'. Using current time as fallback.")
+                    # parsed_updated_at = datetime.now(timezone.utc) # Hoặc để None nếu schema cho phép
 
-            formatted_repos.append(GitHubRepoSchema(
-                id=repo["id"],
-                name=repo["name"],
-                full_name=repo["full_name"],
-                private=repo["private"],
-                html_url=repo["html_url"],
-                description=repo.get("description"),
-                updated_at=parsed_updated_at or datetime.now(timezone.utc) # Fallback nếu parse lỗi
+            formatted_repos.append(project_schemas_module.GitHubRepoSchema(
+                id=repo_data["id"], # id repo từ GitHub
+                name=repo_data["name"],
+                full_name=repo_data["full_name"],
+                private=repo_data["private"],
+                html_url=repo_data["html_url"],
+                description=repo_data.get("description"),
+                updated_at=parsed_updated_at or datetime.now(timezone.utc), # Đảm bảo có giá trị
+                default_branch=repo_data.get("default_branch") # << LẤY default_branch
             ))
-        except Exception as e:
-            logger.warning(f"Could not parse repo data for '{repo.get('full_name', 'N/A')}': {e}. Skipping this repo.")
-            
-    logger.info(f"Successfully fetched {len(formatted_repos)} repositories for user {current_user.email}.")
+        except Exception as e_format: # Đổi tên biến
+            logger.warning(f"Could not parse repo data for '{repo_data.get('full_name', 'N/A')}': {e_format}. Skipping this repo.")
     return formatted_repos
 
+async def get_github_repos_for_user_logic(user_in_db: User, db: Session) -> List[project_schemas_module.GitHubRepoSchema]:
+    """
+    Logic cốt lõi để lấy và định dạng danh sách repo GitHub cho một user.
+    Hàm này có thể được gọi từ API endpoint và từ route UI.
+    """
+    if not user_in_db.github_access_token_encrypted:
+        logger.info(f"User {user_in_db.email} has not connected GitHub account or token is missing (logic function).")
+        # Không raise HTTPException ở đây, để hàm gọi quyết định
+        return []
+
+    github_token = decrypt_data(user_in_db.github_access_token_encrypted)
+    if not github_token:
+        logger.error(f"Failed to decrypt GitHub token for user {user_in_db.email} (logic function).")
+        # Không raise HTTPException ở đây
+        return []
+
+    raw_repos_data: List[Dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient() as client:
+            raw_repos_data = await _fetch_raw_github_repositories_for_user(github_token, client)
+    except httpx.HTTPStatusError as e_http:
+        # Log lỗi cụ thể hơn nếu có thể, ví dụ token không hợp lệ
+        if e_http.response.status_code in [401, 403]:
+            logger.warning(f"GitHub token for user {user_in_db.email} is invalid, expired, or lacks permissions: {e_http.response.status_code}")
+            # Không raise HTTPException, trả về list rỗng để UI có thể xử lý
+        else:
+            logger.error(f"HTTP error fetching GitHub repos for user {user_in_db.email}: {e_http}")
+        return [] # Trả về rỗng nếu có lỗi HTTP
+    except Exception as e_fetch_logic:
+        logger.exception(f"Unexpected error in _fetch_raw_github_repositories_for_user for {user_in_db.email}: {e_fetch_logic}")
+        return [] # Trả về rỗng nếu có lỗi không mong muốn
+
+    formatted_repos = await get_formatted_github_repos_from_api_data(raw_repos_data)
+    logger.info(f"Helper logic successfully fetched and formatted {len(formatted_repos)} repositories for user {user_in_db.email}.")
+    return formatted_repos
+
+@router.get("/github-repos", response_model=List[project_schemas_module.GitHubRepoSchema], summary="List user's GitHub repositories")
+async def list_user_github_repositories(
+    db: Session = Depends(get_db),
+    current_user_from_token: auth_schemas_module.UserPublic = Depends(get_current_active_user) # Đổi tên biến để rõ ràng
+):
+    """
+    API Endpoint: Lấy danh sách các repositories từ tài khoản GitHub đã kết nối của người dùng.
+    Sử dụng hàm helper `get_github_repos_for_user_logic`.
+    """
+    logger.info(f"API Endpoint: Fetching GitHub repositories for user: {current_user_from_token.email} (ID: {current_user_from_token.id})")
+    
+    # Lấy đối tượng User đầy đủ từ DB để có token mã hóa
+    db_user = db.query(User).filter(User.id == current_user_from_token.id).first()
+    if not db_user:
+        # Điều này không nên xảy ra nếu token hợp lệ và user được lấy từ token
+        logger.error(f"User ID {current_user_from_token.id} from token not found in DB.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User associated with token not found.")
+
+    if not db_user.github_access_token_encrypted:
+        logger.warning(f"User {current_user_from_token.email} has not connected their GitHub account or token is missing.")
+        # Trả về list rỗng thay vì raise lỗi, UI có thể thông báo "Kết nối GitHub"
+        # Hoặc, nếu muốn chặt chẽ hơn, có thể raise lỗi 403
+        # raise HTTPException(
+        #     status_code=status.HTTP_403_FORBIDDEN,
+        #     detail="GitHub account not connected or access token not found. Please connect via /auth/github."
+        # )
+        return []
+
+
+    # Gọi hàm helper logic đã được refactor
+    try:
+        repos = await get_github_repos_for_user_logic(db_user, db)
+    except Exception as e_api: # Bắt lỗi chung nếu get_github_repos_for_user_logic raise lỗi không mong muốn
+        logger.exception(f"API Endpoint: Unexpected error calling get_github_repos_for_user_logic for {db_user.email}: {e_api}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not fetch repositories from GitHub due to an unexpected server error.")
+
+    # Logic xử lý nếu token decrypt lỗi đã nằm trong get_github_repos_for_user_logic (trả về list rỗng)
+    # Hoặc nếu bạn muốn API endpoint này raise lỗi cụ thể hơn:
+    if not repos and db_user.github_access_token_encrypted:
+        # Kiểm tra lại việc giải mã token (để chắc chắn)
+        temp_token_check = decrypt_data(db_user.github_access_token_encrypted)
+        if not temp_token_check:
+            logger.error(f"API Endpoint: GitHub token decryption failed for user {db_user.email} when about to return empty list.")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Could not retrieve GitHub access token due to a server error (decryption failed)."
+            )
+        # Nếu giải mã được nhưng không có repo, có thể do user không có repo nào hoặc lỗi từ GitHub mà helper đã log
+        logger.info(f"API Endpoint: Returning empty list of repos for {db_user.email} (possibly no repos or previous fetch error logged by helper).")
+
+    return repos
 
 @router.post("/", response_model=project_schemas_module.ProjectPublic, status_code=status.HTTP_201_CREATED)
 async def create_new_project(

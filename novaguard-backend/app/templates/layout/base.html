@@ -67,17 +67,16 @@
     </nav>
 
     <main class="container mx-auto p-4 sm:p-6 lg:p-8 mt-6 mb-8 flex-grow">
-        {# --- Flash Messages Placeholder (To be implemented if needed) --- #}
-        {# {% set flashed_messages = get_flashed_messages_from_session(request) %} #}
-        {% set flashed_messages = request.session.pop("_flash_messages", []) %} {# Simplified direct access #}
+        {# --- Flash Messages --- #}
+        {% set flashed_messages = request.session.pop("_flash_messages", []) %}
         {% if flashed_messages %}
             <div class="mb-6 space-y-3">
             {% for msg_item in flashed_messages %}
                 <div class="p-4 rounded-md text-sm shadow
-                            {% if msg_item.category == 'success' %} bg-green-50 border-l-4 border-green-400 text-green-700
-                            {% elif msg_item.category == 'error' %} bg-red-50 border-l-4 border-red-400 text-red-700
-                            {% elif msg_item.category == 'warning' %} bg-yellow-50 border-l-4 border-yellow-400 text-yellow-700
-                            {% else %} bg-blue-50 border-l-4 border-blue-400 text-blue-700 
+                            {% if msg_item.category == 'success' %} bg-green-100 border-l-4 border-green-400 text-green-700
+                            {% elif msg_item.category == 'error' %} bg-red-100 border-l-4 border-red-400 text-red-700
+                            {% elif msg_item.category == 'warning' %} bg-yellow-100 border-l-4 border-yellow-400 text-yellow-700
+                            {% else %} bg-blue-100 border-l-4 border-blue-400 text-blue-700 
                             {% endif %}" role="alert">
                     <p class="font-bold">
                         {% if msg_item.category == 'success' %}Success!
@@ -98,7 +97,7 @@
     </main>
 
     <footer class="bg-nv-dark text-nv-light text-center p-6">
-        <p>&copy; <span id="current-year">2025</span> NovaGuard-AI. All rights reserved.</p>
+        <p>&copy; <span id="current-year">{{ current_year if current_year else '2024' }}</span> NovaGuard-AI. All rights reserved.</p>
     </footer>
 
     <script>

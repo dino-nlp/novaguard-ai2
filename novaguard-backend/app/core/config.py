@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     OLLAMA_DEFAULT_MODEL: str = "codellama:7b-instruct-q4_K_M"
     
     NOVAGUARD_PUBLIC_URL: str | None = None # Ví dụ: https://abcdef123.ngrok.io hoặc https://novaguard.yourcompany.com
+    
+    DEBUG: bool = False
 
     # Pydantic-Settings V2 configuration to load from .env file
     model_config = SettingsConfigDict(

@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
+from pydantic import BaseModel as PydanticBaseModel, HttpUrl 
 
 # Schema cơ bản cho Project
 class ProjectBase(BaseModel):
@@ -14,6 +15,23 @@ class ProjectBase(BaseModel):
 # Schema cho việc tạo Project (input từ API)
 class ProjectCreate(ProjectBase):
     pass # Kế thừa tất cả từ ProjectBase
+
+# --- Schema cho GitHub Repo (để trả về cho frontend) ---
+# Định nghĩa schema này ở đây vì nó được sử dụng và trả về bởi API này.
+# Hoặc có thể đặt trong project_schemas_module nếu muốn.
+class GitHubRepoSchema(PydanticBaseModel):
+    id: int
+    name: str
+    full_name: str # owner/repo
+    private: bool
+    html_url: HttpUrl
+    description: Optional[str] = None
+    updated_at: datetime
+    default_branch: Optional[str] = None # << THÊM DÒNG NÀY
+
+    class Config: # Thêm Config nếu bạn muốn dùng from_attributes hoặc các cấu hình Pydantic khác
+        from_attributes = True
+        
 
 # Schema cho việc cập nhật Project (input từ API - cho phép cập nhật một số trường)
 class ProjectUpdate(BaseModel):

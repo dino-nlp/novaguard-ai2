@@ -6,7 +6,7 @@ from urllib.parse import urlencode # Thêm urlencode
 import secrets # Thêm secrets
 from datetime import datetime # Thêm datetime
 
-from fastapi import FastAPI, Request, Depends, Form, HTTPException, status, APIRouter # Thêm APIRouter
+from fastapi import FastAPI, Request, Depends, Form, HTTPException, status, APIRouter, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -23,11 +23,13 @@ from app.core.security import verify_password, decrypt_data # Security functions
 from app.project_service.api import router as project_api_router # API router
 from app.project_service import crud_project as project_crud # CRUD cho project
 from app.project_service import schemas as project_schemas # Schemas cho project
+from app.project_service.api import get_github_repos_for_user_logic 
+
 
 from app.webhook_service.api import router as webhook_api_router # API router
 
 from app.core.db import get_db
-from app.models import User, Project # Import các model cần thiết
+from app.models import User, Project, PRAnalysisRequest, AnalysisFinding
 from sqlalchemy import func # Để dùng func.count
 
 
@@ -123,6 +125,8 @@ async def get_current_ui_user(request: Request, db: Session = Depends(get_db)) -
 ui_pages_router = APIRouter(tags=["Web UI - Pages"])
 ui_auth_router = APIRouter(prefix="/ui/auth", tags=["Web UI - Authentication"]) # Router cho UI Auth
 ui_project_router = APIRouter(prefix="/ui/projects", tags=["Web UI - Projects"]) # Router cho UI Project
+ui_report_router = APIRouter(prefix="/ui/reports", tags=["Web UI - Reports"]) # Router cho reports (đã thêm ở kế hoạch trước)
+
 
 @ui_pages_router.get("/", response_class=HTMLResponse, name="ui_home")
 async def serve_home_page(request: Request, current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)):
@@ -146,16 +150,51 @@ async def serve_dashboard_page_ui(request: Request, db: Session = Depends(get_db
     user_projects = project_crud.get_projects_by_user(db, user_id=current_user.id) # Sử dụng project_crud đã import
 
     github_connected = False
+    available_github_repos: List[project_schemas.GitHubRepoSchema] = []
     db_user_full = db.query(User).filter(User.id == current_user.id).first()
+    
     if db_user_full and db_user_full.github_access_token_encrypted:
         github_connected = True
+        logger.info(f"User {current_user.email} is connected to GitHub. Fetching their repositories.")
+        try:
+            # Gọi hàm helper đã refactor từ project_service.api
+            # Hàm get_github_repos_for_user_logic đã xử lý việc decrypt token và gọi GitHub API
+            github_repos_list_from_api = await get_github_repos_for_user_logic(db_user_full, db)
+            
+            # Lọc ra những repo chưa được thêm vào NovaGuard
+            added_repo_gh_ids = {str(p.github_repo_id) for p in user_projects} # Chuyển sang string để so sánh an toàn
+            
+            if github_repos_list_from_api:
+                for repo_from_gh in github_repos_list_from_api:
+                    if str(repo_from_gh.id) not in added_repo_gh_ids: # So sánh ID repo từ GitHub (là số) với github_repo_id (là string trong model)
+                        available_github_repos.append(repo_from_gh)
+            logger.info(f"Found {len(available_github_repos)} available GitHub repos to add for user {current_user.email}.")
 
+        except Exception as e:
+            logger.exception(f"Dashboard: Failed to fetch or filter GitHub repositories for user {current_user.email}: {e}")
+            flash_messages = request.session.get("_flash_messages", [])
+            flash_messages.append({"category": "error", "message": f"Could not load your GitHub repositories: An error occurred."})
+            request.session["_flash_messages"] = flash_messages
+            # Vẫn tiếp tục render dashboard với available_github_repos là rỗng
+    
+    if available_github_repos: # Thêm kiểm tra này
+        logger.debug("--- Python Log: AVAILABLE GITHUB REPOS for ui_add_project_get links ---")
+        for r_debug in available_github_repos: # Dùng biến khác để tránh nhầm lẫn
+            logger.debug(
+                f"Repo from Python: {r_debug.full_name}, ID: {r_debug.id} (type: {type(r_debug.id)}), "
+                f"Default Branch: {r_debug.default_branch} (type: {type(r_debug.default_branch)})"
+            )
+        logger.debug("--- Python Log: End of AVAILABLE GITHUB REPOS ---")
+    else:
+        logger.debug("--- Python Log: No available_github_repos to log details for. ---")
+        
     return templates.TemplateResponse("pages/dashboard/dashboard.html", {
         "request": request,
         "page_title": "Dashboard",
         "current_user": current_user,
-        "projects": user_projects,
+        "projects": user_projects, # Danh sách project đã thêm vào NovaGuard
         "github_connected": github_connected,
+        "available_github_repos": available_github_repos, # Danh sách repo GitHub chưa thêm
         "current_year": datetime.now().year
     })
 
@@ -228,28 +267,52 @@ async def logout_page_get(request: Request):
         
 # --- Project UI Routes ---
 @ui_project_router.get("/add", response_class=HTMLResponse, name="ui_add_project_get")
-async def add_project_page_ui_get( # Đổi tên hàm để tránh trùng lặp
-    request: Request,
+async def add_project_page_ui_get(
+    request: Request, # << LUÔN ĐẶT REQUEST LÊN ĐẦU (hoặc sau path params nếu có)
+    # Các Query parameters, tên phải khớp với key trong url_for
+    gh_repo_id: Optional[str] = Query(None), # Bỏ alias, FastAPI sẽ dùng 'gh_repo_id' làm tên query param
+    gh_repo_name: Optional[str] = Query(None), # Bỏ alias
+    gh_main_branch: Optional[str] = Query(None), # Bỏ alias
+    # Các Dependencies ở cuối
     db: Session = Depends(get_db),
     current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
 ):
-    if not current_user:
-        return RedirectResponse(url=request.url_for("ui_login_get").include_query_params(error="Please login to add a project."))
+    logger.info(
+        f"Serving 'Add Project' page for user: {current_user.email if current_user else 'Guest'}. "
+        f"Prefill data from query: gh_repo_id={gh_repo_id}, gh_repo_name={gh_repo_name}, gh_main_branch={gh_main_branch}"
+    )
 
-    logger.info(f"Serving 'Add Project' page for user: {current_user.email}")
     error_message_github: Optional[str] = None
     github_connected = False
-
-    db_user_full = db.query(User).filter(User.id == current_user.id).first()
-    if db_user_full and db_user_full.github_access_token_encrypted:
-        github_connected = True
+    if current_user:
+        db_user_full = db.query(User).filter(User.id == current_user.id).first()
+        if db_user_full and db_user_full.github_access_token_encrypted:
+            github_connected = True
+        else:
+            error_message_github = "GitHub account not connected. If you add a project manually, webhooks might not be created automatically. Please connect your GitHub account via the Dashboard."
     else:
-        error_message_github = "GitHub account not connected. Please connect your GitHub account via the Dashboard to automatically create webhooks for your projects."
-    
+        error_message_github = "Please login to connect your GitHub account."
+        # Nếu không có current_user, có thể redirect về login luôn ở đây
+        # flash_messages = request.session.get("_flash_messages", [])
+        # flash_messages.append({"category": "warning", "message": "Please login to add a project."})
+        # request.session["_flash_messages"] = flash_messages
+        # return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
+        # Tuy nhiên, get_current_ui_user đã là Optional, nên có thể để template xử lý việc current_user là None
+
+    prefill_data = {
+        "repo_id": gh_repo_id,
+        "repo_name": gh_repo_name,
+        "main_branch": gh_main_branch if gh_main_branch else "main"
+    }
+
     return templates.TemplateResponse("pages/projects/add_project.html", {
-        "request": request, "page_title": "Add New Project", "current_user": current_user,
-        "github_connected": github_connected, # Truyền biến này
-        "error_github": error_message_github, "current_year": datetime.now().year
+        "request": request,
+        "page_title": "Add New Project",
+        "current_user": current_user,
+        "github_connected": github_connected, 
+        "error_github": error_message_github,
+        "prefill_data": prefill_data,
+        "current_year": datetime.now().year
     })
 
 @ui_project_router.post("/add", response_class=RedirectResponse, name="ui_add_project_post")
@@ -341,7 +404,27 @@ async def add_project_page_ui_post( # Đổi tên hàm
 app.include_router(ui_pages_router)
 app.include_router(ui_auth_router) # Đã có prefix /ui/auth
 app.include_router(ui_project_router) # Đã có prefix /ui/projects
+app.include_router(ui_report_router) # Router cho reports
 
+
+# --- In thông tin các route đã đăng ký để debug ---
+if settings.DEBUG: # Chỉ in ra khi ở chế độ DEBUG (thêm DEBUG=True vào .env nếu cần)
+    logger.info("="*50)
+    logger.info("REGISTERED ROUTES:")
+    for route in app.routes:
+        if hasattr(route, "name"): # Các APIRoute sẽ có thuộc tính name
+            logger.info(f"Name: {route.name}, Path: {route.path}, Methods: {getattr(route, 'methods', None)}")
+            if route.name == "ui_add_project_get":
+                logger.info(f"  Specifics for 'ui_add_project_get':")
+                logger.info(f"    Class: {type(route)}")
+                # Cố gắng xem các tham số mà route này mong đợi (có thể không dễ lấy trực tiếp)
+                # Tuy nhiên, path ở trên đã cho biết nó có path params hay không.
+                # Nếu route.path_format là /ui/projects/add thì không có path params.
+                logger.info(f"    Path Format: {getattr(route, 'path_format', route.path)}")
+
+
+    logger.info("="*50)
+# --- Kết thúc phần in thông tin route ---
 
 # --- Khởi chạy Uvicorn ---
 if __name__ == "__main__":
