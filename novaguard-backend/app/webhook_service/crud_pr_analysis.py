@@ -2,6 +2,8 @@ from sqlalchemy.orm import Session
 
 from app.models import PRAnalysisRequest, PRAnalysisStatus
 from app.webhook_service.schemas_pr_analysis import PRAnalysisRequestCreate
+from sqlalchemy import func
+from typing import List
 
 def create_pr_analysis_request(db: Session, request_in: PRAnalysisRequestCreate) -> PRAnalysisRequest:
     """
@@ -50,4 +52,28 @@ def update_pr_analysis_request_status(
         db.refresh(db_request)
     return db_request
 
-# Các hàm CRUD khác nếu cần thiết sau này
+def get_pr_analysis_requests_by_project_id(
+    db: Session, project_id: int, skip: int = 0, limit: int = 20
+) -> List[PRAnalysisRequest]:
+    """
+    Lấy danh sách các PRAnalysisRequest cho một project_id, sắp xếp theo ngày yêu cầu giảm dần.
+    """
+    return (
+        db.query(PRAnalysisRequest)
+        .filter(PRAnalysisRequest.project_id == project_id)
+        .order_by(PRAnalysisRequest.requested_at.desc()) # Sắp xếp theo requested_at giảm dần
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+def count_pr_analysis_requests_by_project_id(db: Session, project_id: int) -> int:
+    """
+    Đếm tổng số PRAnalysisRequest cho một project_id.
+    """
+    count_query = (
+        db.query(func.count(PRAnalysisRequest.id)) # Sử dụng func.count
+        .filter(PRAnalysisRequest.project_id == project_id)
+    )
+    result = count_query.scalar()
+    return result if result is not None else 0

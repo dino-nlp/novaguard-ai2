@@ -19,17 +19,21 @@
             Select from your GitHub Repositories (Recommended)
         </label>
         <select id="github_repo_select" class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm" disabled>
-            <option value="" selected disabled>Loading repositories...</option> {# Option này sẽ bị thay thế bởi JS #}
+            <option value="" selected disabled>Loading repositories...</option>
         </select>
         <p id="loading_repos_message" class="mt-1 text-xs text-gray-500"></p>
     </div>
     <hr class="my-6">
     <p class="text-sm text-gray-600 mb-4 text-center">
-        {% if prefill_data.repo_name %}
+        {% if prefill_data and prefill_data.repo_name %} {# Kiểm tra prefill_data có tồn tại và có repo_name không #}
             Review the prefilled details below or select a different repository above.
         {% else %}
             Or fill the details manually:
         {% endif %}
+    </p>
+    {% else %}
+     <p class="text-sm text-gray-600 mb-4 text-center">
+        Please connect your GitHub account on the Dashboard to easily select your repositories. Otherwise, you can fill the details manually:
     </p>
     {% endif %}
 
@@ -40,7 +44,7 @@
                 Repository Name <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(Format: `owner/repository-name`)</span>
             </label>
             <input type="text" name="repo_name" id="repo_name" required 
-                   value="{{ prefill_data.repo_name or '' }}"
+                   value="{{ prefill_data.repo_name if prefill_data else '' }}"
                    placeholder="your-github-username/your-repo-name"
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
             <p class="mt-1 text-xs text-gray-500">This must be the full name of the repository on GitHub (e.g., MyOrg/my-cool-repo).</p>
@@ -51,7 +55,7 @@
                 GitHub Repository ID <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(Numeric ID from GitHub)</span>
             </label>
             <input type="text" name="github_repo_id" id="github_repo_id" required 
-                   value="{{ prefill_data.repo_id or '' }}"
+                   value="{{ prefill_data.repo_id if prefill_data else '' }}"
                    placeholder="e.g., 123456789"
                    pattern="[0-9]+" title="Please enter a numeric GitHub Repository ID."
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
@@ -65,7 +69,7 @@
                 Main Branch <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(e.g., `main`, `master`, `develop`)</span>
             </label>
             <input type="text" name="main_branch" id="main_branch" 
-                   value="{{ prefill_data.main_branch or 'main' }}" required
+                   value="{{ prefill_data.main_branch if prefill_data else 'main' }}" required
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
         </div>
 
@@ -74,7 +78,7 @@
                 Primary Language (Optional)
             </label>
             <input type="text" name="language" id="language" placeholder="e.g., Python, JavaScript, Java"
-                   value="{{ prefill_data.language or '' }}"
+                   value="" {# Bỏ prefill cho language và notes nếu không có trong prefill_data #}
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
         </div>
 
@@ -84,7 +88,7 @@
             </label>
             <textarea name="custom_project_notes" id="custom_project_notes" rows="4"
                       placeholder="Any specific coding conventions, architectural guidelines, or important notes for the LLM to consider during analysis."
-                      class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">{{ prefill_data.custom_project_notes or '' }}</textarea>
+                      class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm"></textarea>
         </div>
 
         <div class="flex justify-end pt-4">
@@ -99,7 +103,7 @@
     </form>
 </div>
 
-{% if github_connected %}
+{% if github_connected %} {# Chỉ chạy script nếu người dùng đã kết nối GitHub (biến này được truyền từ route /add) #}
 <script>
 document.addEventListener('DOMContentLoaded', function() {
     const repoSelect = document.getElementById('github_repo_select');
@@ -108,12 +112,17 @@ document.addEventListener('DOMContentLoaded', function() {
     const mainBranchInput = document.getElementById('main_branch');
     const loadingReposMessage = document.getElementById('loading_repos_message');
 
+    // Lấy giá trị prefill ban đầu từ context của Jinja2
+    // (Những giá trị này sẽ là None nếu người dùng vào trang /add trực tiếp mà không có query params)
     const initialPrefillRepoId = "{{ prefill_data.repo_id or '' }}";
     const initialPrefillRepoName = "{{ prefill_data.repo_name or '' }}";
-    // const initialPrefillMainBranch = "{{ prefill_data.main_branch or 'main' }}"; // Đã set qua value
+    // main_branch đã có value="{{ prefill_data.main_branch or 'main' }}" trong input rồi
 
     function populateSelectWithOptions(repos) {
-        // Xóa option "Loading..." hoặc các option cũ
+        if(!repoSelect) return; // Kiểm tra repoSelect tồn tại
+        if(loadingReposMessage) loadingReposMessage.style.display = 'none';
+        
+        // Xóa các option cũ (ví dụ: "Loading...")
         while (repoSelect.firstChild && (repoSelect.firstChild.disabled || repoSelect.firstChild.value === "")) {
             repoSelect.removeChild(repoSelect.firstChild);
         }
@@ -121,45 +130,53 @@ document.addEventListener('DOMContentLoaded', function() {
         let defaultOption = document.createElement('option');
         defaultOption.value = "";
         defaultOption.textContent = "-- Select a Repository --";
-        // Không selected, không disabled để user có thể chọn lại về "không chọn gì"
         repoSelect.appendChild(defaultOption);
 
         if (repos && repos.length > 0) {
             repos.forEach(repo => {
                 let option = document.createElement('option');
-                option.value = repo.id; // GitHub Repo ID (numerical)
-                option.textContent = repo.full_name; // owner/repo
+                option.value = repo.id; 
+                option.textContent = repo.full_name; 
                 option.dataset.fullName = repo.full_name;
-                option.dataset.repoId = repo.id; // Lưu lại ID dạng số
+                option.dataset.repoId = repo.id; 
                 option.dataset.defaultBranch = repo.default_branch || 'main';
                 
-                // Nếu ID này trùng với prefill_data.repo_id thì chọn nó
+                // Nếu ID này trùng với initialPrefillRepoId (từ URL query params) thì chọn nó
                 if (initialPrefillRepoId && String(repo.id) === initialPrefillRepoId) {
                     option.selected = true;
                 }
                 repoSelect.appendChild(option);
             });
             repoSelect.disabled = false;
+            // Nếu có prefill từ URL, tự động trigger 'change' để điền form lần đầu
+            if (initialPrefillRepoId && repoSelect.value === initialPrefillRepoId) {
+                repoSelect.dispatchEvent(new Event('change'));
+            } else {
+                defaultOption.selected = true; // Chọn lại option mặc định nếu không có prefill khớp
+            }
+
         } else {
             defaultOption.textContent = "No repositories found or unable to fetch.";
+            repoSelect.disabled = false; 
         }
-         if(loadingReposMessage) loadingReposMessage.style.display = 'none';
     }
     
-    if (repoSelect) { // Chỉ thực hiện nếu có element select
-        // Nếu có prefill data từ URL, không cần fetch ngay trừ khi người dùng muốn đổi
-        if (initialPrefillRepoName && initialPrefillRepoId) {
-            if(loadingReposMessage) loadingReposMessage.textContent = 'Repository details prefilled. You can select another from the list.';
-            // Vẫn fetch để user có thể chọn repo khác
-        } else {
-             if(loadingReposMessage) loadingReposMessage.textContent = 'Loading your GitHub repositories...';
-        }
-        repoSelect.disabled = true; // Disable trong khi loading hoặc nếu có prefill và chưa fetch
+    if (repoSelect) { 
+        if(loadingReposMessage) loadingReposMessage.textContent = 'Loading your GitHub repositories...';
+        repoSelect.disabled = true;
 
-        fetch("{{ url_for('list_user_github_repositories') }}")
+        // Gọi route UI mới để lấy repo, không phải API /api/projects/github-repos
+        fetch("{{ url_for('ui_list_gh_repos_for_form') }}") 
             .then(response => {
+                if (response.status === 401) {
+                     throw new Error('Unauthorized to fetch repositories. Please ensure you are logged in.');
+                }
                 if (!response.ok) {
-                    throw new Error('Failed to load repositories. Status: ' + response.status + ' ' + response.statusText);
+                    return response.json().then(err_data => {
+                        throw new Error(err_data.detail || 'Failed to load repositories. Status: ' + response.status);
+                    }).catch(() => {
+                        throw new Error('Failed to load repositories. Status: ' + response.status + ' ' + response.statusText);
+                    });
                 }
                 return response.json();
             })
@@ -167,11 +184,10 @@ document.addEventListener('DOMContentLoaded', function() {
                 populateSelectWithOptions(repos);
             })
             .catch(error => {
-                console.error('Error fetching GitHub repos:', error);
+                console.error('Error fetching GitHub repos for UI form:', error);
                 if(loadingReposMessage) loadingReposMessage.textContent = 'Could not load repositories: ' + error.message;
                 if(loadingReposMessage) loadingReposMessage.classList.add('text-red-500');
                 
-                // Xóa option "Loading..." và hiển thị lỗi
                 while (repoSelect.firstChild && (repoSelect.firstChild.disabled || repoSelect.firstChild.value === "")) {
                     repoSelect.removeChild(repoSelect.firstChild);
                 }
@@ -181,25 +197,30 @@ document.addEventListener('DOMContentLoaded', function() {
                 errorOption.selected = true;
                 errorOption.disabled = true;
                 repoSelect.appendChild(errorOption);
-                repoSelect.disabled = false; // Enable để user thấy lỗi
+                repoSelect.disabled = false;
             });
 
         repoSelect.addEventListener('change', function() {
             const selectedOption = this.options[this.selectedIndex];
-            if (selectedOption && selectedOption.value) { // Đảm bảo có value (không phải option "-- Select --")
+            if (selectedOption && selectedOption.value) { 
                 repoNameInput.value = selectedOption.dataset.fullName;
-                repoIdInput.value = selectedOption.dataset.repoId; // Sử dụng dataset để lấy ID số
+                repoIdInput.value = selectedOption.dataset.repoId;
                 mainBranchInput.value = selectedOption.dataset.defaultBranch;
             } else {
-                // Nếu chọn lại "-- Select --", xóa các trường hoặc giữ giá trị prefill ban đầu
-                repoNameInput.value = initialPrefillRepoName; // Giữ lại nếu có prefill ban đầu
-                repoIdInput.value = initialPrefillRepoId;   // Giữ lại nếu có prefill ban đầu
+                // Nếu chọn lại "-- Select --", xóa các trường (hoặc giữ giá trị prefill từ URL nếu có)
+                repoNameInput.value = initialPrefillRepoName; // Giữ lại prefill ban đầu nếu có
+                repoIdInput.value = initialPrefillRepoId;     // Giữ lại prefill ban đầu nếu có
                 mainBranchInput.value = "{{ prefill_data.main_branch or 'main' }}"; // Giữ lại prefill hoặc default
             }
         });
+    } else if (!github_connected && loadingReposMessage) { 
+        loadingReposMessage.textContent = 'Connect to GitHub on Dashboard to select repositories from this list.';
+    } else if (loadingReposMessage && !github_connected) {
+        // Nếu không có select box (vì github_connected=false) và có loading message
+        loadingReposMessage.style.display = 'none'; // Ẩn thông báo loading
     }
 });
 </script>
-{% endif %}
+{% endif %} {# Kết thúc if github_connected cho script #}
 
 {% endblock %}

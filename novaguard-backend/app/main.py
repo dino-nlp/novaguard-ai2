@@ -377,6 +377,179 @@ async def add_project_page_ui_post(
     request.session["_flash_messages"] = flash_messages
     return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
 
+
+@ui_project_router.get(
+    "/list-gh-repos-for-ui", 
+    response_model=List[project_schemas.GitHubRepoSchema], # Response là danh sách các repo schema
+    name="ui_list_gh_repos_for_form", # Đặt tên route rõ ràng
+    summary="Fetch user's GitHub repos for UI forms (uses session auth)"
+)
+async def ui_list_github_repos_for_add_project_form( # Đổi tên hàm để rõ mục đích
+    request: Request, # Cần request object
+    db: Session = Depends(get_db),
+    current_ui_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user) # Xác thực qua session
+):
+    if not current_ui_user:
+        logger.warning("UI list GH repos: Attempt to list GH repos for UI without active session.")
+        # JavaScript sẽ xử lý lỗi này, nên không cần flash message ở đây
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="User not authenticated. Please login again."
+        )
+
+    # Lấy đối tượng User đầy đủ từ DB để có token mã hóa
+    db_user_full = db.query(User).filter(User.id == current_ui_user.id).first()
+    if not db_user_full:
+        logger.error(f"UI list GH repos: User ID {current_ui_user.id} from session not found in DB.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in database.")
+
+    if not db_user_full.github_access_token_encrypted:
+        logger.info(f"UI list GH repos: User {current_ui_user.email} has not connected GitHub account. Returning empty list.")
+        return [] # Trả về list rỗng nếu chưa kết nối GitHub
+
+    try:
+        # Gọi hàm logic đã được refactor từ project_service/api.py
+        repos = await get_github_repos_for_user_logic(db_user_full, db)
+        logger.info(f"UI list GH repos: Successfully fetched {len(repos)} repos for {current_ui_user.email}")
+        return repos
+    except Exception as e:
+        logger.exception(f"UI list GH repos: Error calling get_github_repos_for_user_logic for {current_ui_user.email}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Could not fetch repositories from GitHub due to a server error."
+        )
+
+@ui_project_router.get("/{project_id_path}", response_class=HTMLResponse, name="ui_project_detail_get")
+async def project_detail_page_ui_get( # Đổi tên tham số path để tránh nhầm lẫn với biến project_id sau này
+    request: Request,
+    project_id_path: int, # Đây là path parameter, FastAPI sẽ tự động chuyển kiểu
+    db: Session = Depends(get_db),
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
+):
+    if not current_user:
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "warning", "message": "Please login to view project details."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
+
+    logger.info(f"Serving project detail page for project ID: {project_id_path}, user: {current_user.email}")
+
+    # Lấy thông tin chi tiết project từ DB, đảm bảo project thuộc user
+    project_details = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
+    
+    if not project_details:
+        logger.warning(f"Project ID {project_id_path} not found or not owned by user {current_user.email}.")
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "Project not found or you do not have access."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    # Lấy danh sách các PR analysis requests cho project này
+    # (Sử dụng pr_crud từ app.webhook_service.crud_pr_analysis)
+    pr_analysis_reqs = pr_crud.get_pr_analysis_requests_by_project_id(db, project_id=project_id_path, limit=20) # Lấy 20 PR mới nhất
+    # total_pr_reqs = pr_crud.count_pr_analysis_requests_by_project_id(db, project_id=project_id_path) # Nếu cần phân trang
+
+    # Chuyển đổi sang Pydantic model nếu template của bạn mong đợi (tùy chọn)
+    # project_details_pydantic = project_schemas.ProjectPublic.model_validate(project_details)
+    # pr_analysis_reqs_pydantic = [pr_schemas.PRAnalysisRequestItem.model_validate(req) for req in pr_analysis_reqs]
+
+    return templates.TemplateResponse("pages/projects/project_detail.html", {
+        "request": request,
+        "page_title": f"Project: {project_details.repo_name}", # Sử dụng project_details trực tiếp
+        "current_user": current_user,
+        "project": project_details, # Truyền project_details (SQLAlchemy model)
+        "pr_analysis_requests": pr_analysis_reqs, # Truyền pr_analysis_reqs (list SQLAlchemy models)
+        # "total_pr_analysis_requests": total_pr_reqs,
+        "current_year": datetime.now().year
+    })
+
+@ui_project_router.get("/{project_id}/settings", response_class=HTMLResponse, name="ui_project_settings_get")
+async def project_settings_page_ui_get(
+    request: Request,
+    project_id: int, # Path parameter
+    db: Session = Depends(get_db),
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
+):
+    if not current_user:
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "warning", "message": "Please login to access project settings."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
+
+    logger.info(f"Serving project settings page for project ID: {project_id}, user: {current_user.email}")
+
+    project = project_crud.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
+    if not project:
+        logger.warning(f"Project settings: Project ID {project_id} not found or not owned by user {current_user.email}.")
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "Project not found or you do not have access to its settings."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    return templates.TemplateResponse("pages/projects/project_settings.html", {
+        "request": request,
+        "page_title": f"Settings: {project.repo_name}",
+        "current_user": current_user,
+        "project": project, # Truyền project object (SQLAlchemy model)
+        "current_year": datetime.now().year
+    })
+
+@ui_project_router.post("/{project_id}/settings", response_class=RedirectResponse, name="ui_project_settings_post")
+async def project_settings_page_ui_post(
+    request: Request,
+    project_id: int, # Path parameter
+    # Form data
+    repo_name: str = Form(...), # Bạn có thể quyết định cho phép sửa tên repo hay không
+    main_branch: str = Form(...),
+    language: Optional[str] = Form(None),
+    custom_project_notes: Optional[str] = Form(None),
+    # Dependencies
+    db: Session = Depends(get_db),
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
+):
+    if not current_user:
+        # Mặc dù get_current_ui_user là Optional, nhưng POST request thường yêu cầu user phải đăng nhập
+        # Nếu không, redirect về login
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    logger.info(f"Processing update for project ID: {project_id} by user: {current_user.email}")
+
+    # Lấy project hiện tại để đảm bảo user sở hữu nó trước khi cập nhật
+    # và để có thể lấy github_repo_id (nếu repo_name không được phép sửa và không được gửi từ form)
+    existing_project = project_crud.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
+    if not existing_project:
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "Project not found or you do not have permission to update."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+
+    project_update_data = project_schemas.ProjectUpdate(
+        # Nếu không cho sửa repo_name từ form, bạn có thể bỏ nó khỏi ProjectUpdate
+        # hoặc lấy giá trị hiện tại từ existing_project.repo_name
+        # Tạm thời, giả sử repo_name được gửi từ form và có thể thay đổi
+        repo_name=repo_name,
+        main_branch=main_branch,
+        language=language if language and language.strip() else None, # Đảm bảo None nếu là chuỗi rỗng
+        custom_project_notes=custom_project_notes if custom_project_notes and custom_project_notes.strip() else None
+    )
+    
+    updated_project = project_crud.update_project(
+        db, project_id=project_id, project_in=project_update_data, user_id=current_user.id
+    )
+    
+    flash_messages = request.session.get("_flash_messages", [])
+    if updated_project:
+        flash_messages.append({"category": "success", "message": "Project settings updated successfully."})
+    else:
+        # Điều này không nên xảy ra nếu get_project_by_id ở trên đã thành công
+        flash_messages.append({"category": "error", "message": "Failed to update project settings."})
+    request.session["_flash_messages"] = flash_messages
+    
+    # Redirect về trang chi tiết dự án sau khi cập nhật
+    return RedirectResponse(url=request.url_for("ui_project_detail_get", project_id_path=project_id), status_code=status.HTTP_302_FOUND)
+
+
 app.include_router(ui_pages_router)
 app.include_router(ui_auth_router)
 app.include_router(ui_project_router)

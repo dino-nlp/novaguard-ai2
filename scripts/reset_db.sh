@@ -10,8 +10,8 @@ DB_USER="novaguard_user"
 DB_NAME="novaguard_db"
 
 # Check if docker-compose is running the db service (similar to init_db.sh)
-if ! docker-compose ps -q ${DB_SERVICE_NAME} > /dev/null || ! docker ps -q --filter name="^/${COMPOSE_PROJECT_NAME:-novaguard-ai}_${DB_SERVICE_NAME}_1$" > /dev/null && ! docker ps -q --filter name="^/${DB_SERVICE_NAME}$" > /dev/null ; then
-    actual_container_name=$(docker-compose ps -q ${DB_SERVICE_NAME})
+if ! docker compose ps -q ${DB_SERVICE_NAME} > /dev/null || ! docker ps -q --filter name="^/${COMPOSE_PROJECT_NAME:-novaguard-ai}_${DB_SERVICE_NAME}_1$" > /dev/null && ! docker ps -q --filter name="^/${DB_SERVICE_NAME}$" > /dev/null ; then
+    actual_container_name=$(docker compose ps -q ${DB_SERVICE_NAME})
     if [ -z "$actual_container_name" ]; then
          actual_container_name=$(docker ps --filter "name=${DB_SERVICE_NAME}" --format "{{.Names}}" | grep ${DB_SERVICE_NAME})
     fi
@@ -52,7 +52,7 @@ DROP TABLE IF EXISTS \"Users\" CASCADE;
 # ALembic specific tables if you ever use it
 # DROP TABLE IF EXISTS alembic_version CASCADE;
 
-echo "$DROP_COMMANDS" | docker-compose exec -T ${DB_SERVICE_NAME} psql -U ${DB_USER} -d ${DB_NAME}
+echo "$DROP_COMMANDS" | docker compose exec -T ${DB_SERVICE_NAME} psql -U ${DB_USER} -d ${DB_NAME}
 
 if [ $? -ne 0 ]; then
     echo "Failed to drop existing tables/functions. Continuing to apply schema anyway..."
@@ -60,7 +60,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Applying schema from $SCHEMA_FILE..."
-cat "$SCHEMA_FILE" | docker-compose exec -T ${DB_SERVICE_NAME} psql -U ${DB_USER} -d ${DB_NAME}
+cat "$SCHEMA_FILE" | docker compose exec -T ${DB_SERVICE_NAME} psql -U ${DB_USER} -d ${DB_NAME}
 
 if [ $? -eq 0 ]; then
     echo "Database reset and schema applied successfully."

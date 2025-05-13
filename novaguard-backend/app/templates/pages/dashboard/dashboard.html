@@ -26,7 +26,7 @@
             <ul class="space-y-3">
                 {% for project in projects %}
                     <li class="p-4 bg-gray-50 rounded shadow hover:shadow-md transition-shadow">
-                        <a href="{{ url_for('ui_project_detail_get', project_id=project.id) }}" class="font-semibold text-nv-accent hover:underline">{{ project.repo_name }}</a>
+                        <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" class="font-semibold text-nv-accent hover:underline">{{ project.repo_name }}</a>
                         <p class="text-sm text-gray-600">Main Branch: {{ project.main_branch }}</p>
                         <p class="text-sm text-gray-600">Language: {{ project.language or 'Not set' }}</p>
                     </li>
