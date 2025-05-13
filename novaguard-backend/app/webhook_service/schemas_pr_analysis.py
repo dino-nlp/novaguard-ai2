@@ -85,3 +85,15 @@ class GitHubWebhookPayload(BaseModel):
     repository: GitHubRepo
     sender: GitHubUser # Người thực hiện action (có thể là bot)
     # installation: Optional[dict] = None # Nếu dùng GitHub App
+    
+class PRAnalysisRequestItem(BaseModel): # Hoặc kế thừa từ PRAnalysisRequestBase nếu phù hợp
+    id: int
+    pr_number: int
+    pr_title: Optional[str] = None
+    status: PRAnalysisStatus 
+    requested_at: datetime
+    pr_github_url: Optional[HttpUrl] = None # Link tới PR trên GitHub
+
+    class Config:
+        from_attributes = True 
+        use_enum_values = True

@@ -21,13 +21,11 @@
             {% endif %}
         </div>
 
-        {# Phần hiển thị các dự án đã thêm vào NovaGuard #}
         <h2 class="text-xl font-semibold text-nv-dark mb-3">Your Projects in NovaGuard</h2>
         {% if projects and projects|length > 0 %}
             <ul class="space-y-3">
                 {% for project in projects %}
                     <li class="p-4 bg-gray-50 rounded shadow hover:shadow-md transition-shadow">
-                        {# Link đến trang chi tiết dự án sẽ được tạo ở Cụm Tính năng 1 của kế hoạch tiếp theo #}
                         <a href="{{ url_for('ui_project_detail_get', project_id=project.id) }}" class="font-semibold text-nv-accent hover:underline">{{ project.repo_name }}</a>
                         <p class="text-sm text-gray-600">Main Branch: {{ project.main_branch }}</p>
                         <p class="text-sm text-gray-600">Language: {{ project.language or 'Not set' }}</p>
@@ -43,7 +41,6 @@
             </p>
         {% endif %}
 
-        {# MỚI: Phần hiển thị các kho lưu trữ GitHub có thể thêm #}
         {% if github_connected %}
         <div class="mt-10 pt-6 border-t">
             <h2 class="text-xl font-semibold text-nv-dark mb-3">Available GitHub Repositories</h2>
@@ -72,63 +69,36 @@
                             <p class="text-xs text-gray-500">Last updated: {{ repo.updated_at.strftime('%Y-%m-%d %H:%M') if repo.updated_at else 'N/A' }}</p>
                         </div>
                         <div class="mt-3 text-right">
-                            
-                            {% set temp_params = {
-                                "gh_repo_id": repo.id|string, 
-                                "gh_repo_name": repo.full_name,
-                                "gh_main_branch": (repo.default_branch or 'main')
-                            } %}
-                            <a href="{{ url_for('ui_add_project_get', **temp_params) }}"
-                            class="inline-block bg-nv-accent hover:bg-nv-accent-dark text-white font-semibold py-1.5 px-3 rounded text-sm transition duration-150">
+                            {# --- WORKAROUND: Xây dựng URL thủ công --- #}
+                            {% set base_add_url = url_for('ui_add_project_get') %} {# Lấy path gốc #}
+                            {% set repo_id_str = repo.id | string %}
+                            {% set repo_name_encoded = repo.full_name | urlencode %}
+                            {% set main_branch_encoded = (repo.default_branch or 'main') | urlencode %}
+                            {% set final_add_url = base_add_url ~ "?gh_repo_id=" ~ repo_id_str ~ "&gh_repo_name=" ~ repo_name_encoded ~ "&gh_main_branch=" ~ main_branch_encoded %}
+                            <a href="{{ final_add_url }}"
+                               class="inline-block bg-nv-accent hover:bg-nv-accent-dark text-white font-semibold py-1.5 px-3 rounded text-sm transition duration-150">
                                 Add to NovaGuard
                             </a>
-
-                            
-                            {% if loop.first %} 
-                                {% set hardcoded_params = {
-                                    "gh_repo_id": "12345",
-                                    "gh_repo_name": "test/repo",
-                                    "gh_main_branch": "main"
-                                } %}
-                                <p style="font-size: 9px; color: blue;">
-                                    Trying hardcoded: 
-                                    <a href="{{ url_for('ui_add_project_get', **hardcoded_params) }}">Link with Hardcoded Params</a>
-                                </p>
-                        {% endif %}
-                        
-
                         </div>
                     </div>
                     {% endfor %}
                 </div>
             {% elif github_connected %} 
-                {# Trường hợp đã kết nối GitHub nhưng available_github_repos rỗng #}
                 <p class="text-gray-600">
                     All your accessible GitHub repositories appear to be already added to NovaGuard, or no new repositories were found for your account. You can <a href="{{ url_for('api_github_oauth_redirect') }}" class="text-nv-accent hover:underline">refresh your GitHub connection</a> or check your repositories on GitHub.
                 </p>
             {% endif %}
         </div>
-        {% endif %} {# End if github_connected #}
+        {% endif %}
 
-    {% else %} {# current_user is None #}
+    {% else %}
         <p>Please <a href="{{ url_for('ui_login_get') }}" class="text-nv-accent hover:underline">login</a> to view your dashboard.</p>
     {% endif %}
 </div>
 <style>
-    /* For better scrollbar visibility on description if needed */
-    .custom-scrollbar::-webkit-scrollbar {
-        width: 6px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-track {
-        background: #f1f1f1;
-        border-radius: 3px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-thumb {
-        background: #ccc;
-        border-radius: 3px;
-    }
-    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-        background: #aaa;
-    }
+    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #aaa; }
 </style>
 {% endblock %}
