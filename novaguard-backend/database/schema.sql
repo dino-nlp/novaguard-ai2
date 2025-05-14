@@ -1,5 +1,5 @@
--- Bảng Users: Lưu trữ thông tin người dùng
-CREATE TABLE IF NOT EXISTS Users (
+-- Bảng users: Lưu trữ thông tin người dùng
+CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
@@ -9,10 +9,10 @@ CREATE TABLE IF NOT EXISTS Users (
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
--- Bảng Projects: Lưu trữ thông tin các dự án người dùng thêm vào
-CREATE TABLE IF NOT EXISTS Projects (
+-- Bảng projects: Lưu trữ thông tin các dự án người dùng thêm vào
+CREATE TABLE IF NOT EXISTS projects (
     id SERIAL PRIMARY KEY,
-    user_id INT REFERENCES Users(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng Users
+    user_id INT REFERENCES users(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng users
     github_repo_id VARCHAR(255) NOT NULL, -- ID của repository trên GitHub
     repo_name VARCHAR(255) NOT NULL, -- Tên repository (ví dụ: 'owner/repo_name')
     main_branch VARCHAR(255) NOT NULL, -- Nhánh chính của dự án (ví dụ: 'main', 'master')
@@ -24,25 +24,25 @@ CREATE TABLE IF NOT EXISTS Projects (
     UNIQUE(user_id, github_repo_id) -- Đảm bảo mỗi người dùng chỉ thêm một repo GitHub một lần
 );
 
--- Bảng PRAnalysisRequests: Lưu trữ thông tin về các yêu cầu phân tích Pull Request
-CREATE TABLE IF NOT EXISTS PRAnalysisRequests (
+-- Bảng pranalysisrequests: Lưu trữ thông tin về các yêu cầu phân tích Pull Request
+CREATE TABLE IF NOT EXISTS pranalysisrequests (
     id SERIAL PRIMARY KEY,
-    project_id INT REFERENCES Projects(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng Projects
-    pr_number INT NOT NULL, -- Số của Pull Request trên GitHub
+    project_id INT REFERENCES projects(id) ON DELETE CASCADE NOT NULL,
+    pr_number INT NOT NULL,
     pr_title TEXT,
-    pr_github_url VARCHAR(2048), -- URL tới Pull Request trên GitHub
-    head_sha VARCHAR(40), -- SHA của commit mới nhất trong PR
-    status VARCHAR(20) CHECK (status IN ('pending', 'processing', 'data_fetched', 'completed', 'failed')) DEFAULT 'pending',
-    error_message TEXT, -- Thông báo lỗi nếu quá trình phân tích thất bại
-    requested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP, -- Thời điểm webhook được nhận hoặc yêu cầu được tạo
-    started_at TIMESTAMPTZ, -- Thời điểm worker bắt đầu xử lý
-    completed_at TIMESTAMPTZ -- Thời điểm worker hoàn thành xử lý
+    pr_github_url VARCHAR(2048),
+    head_sha VARCHAR(40),
+    status VARCHAR(20) CHECK (status IN ('pending', 'processing', 'data_fetched', 'completed', 'failed')) DEFAULT 'pending' NOT NULL, -- Thêm NOT NULL nếu status luôn phải có giá trị
+    error_message TEXT,
+    requested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
 );
 
--- Bảng AnalysisFindings: Lưu trữ các phát hiện/gợi ý từ quá trình phân tích code
-CREATE TABLE IF NOT EXISTS AnalysisFindings (
+-- Bảng analysisfindings: Lưu trữ các phát hiện/gợi ý từ quá trình phân tích code
+CREATE TABLE IF NOT EXISTS analysisfindings (
     id SERIAL PRIMARY KEY,
-    pr_analysis_request_id INT REFERENCES PRAnalysisRequests(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng PRAnalysisRequests
+    pr_analysis_request_id INT REFERENCES pranalysisrequests(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng pranalysisrequests
     file_path VARCHAR(1024) NOT NULL, -- Đường dẫn file liên quan đến phát hiện
     line_start INT, -- Dòng bắt đầu (nếu có)
     line_end INT, -- Dòng kết thúc (nếu có)
@@ -64,27 +64,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Áp dụng trigger cho bảng Users
-DROP TRIGGER IF EXISTS set_timestamp_users ON Users;
+-- Áp dụng trigger cho bảng users
+DROP TRIGGER IF EXISTS set_timestamp_users ON users;
 CREATE TRIGGER set_timestamp_users
-BEFORE UPDATE ON Users
+BEFORE UPDATE ON users
 FOR EACH ROW
 EXECUTE FUNCTION trigger_set_timestamp();
 
--- Áp dụng trigger cho bảng Projects
-DROP TRIGGER IF EXISTS set_timestamp_projects ON Projects;
+-- Áp dụng trigger cho bảng projects
+DROP TRIGGER IF EXISTS set_timestamp_projects ON projects;
 CREATE TRIGGER set_timestamp_projects
-BEFORE UPDATE ON Projects
+BEFORE UPDATE ON projects
 FOR EACH ROW
 EXECUTE FUNCTION trigger_set_timestamp();
 
--- (Không cần trigger updated_at cho PRAnalysisRequests và AnalysisFindings vì chúng thường không được cập nhật nhiều sau khi tạo)
+-- (Không cần trigger updated_at cho pranalysisrequests và analysisfindings vì chúng thường không được cập nhật nhiều sau khi tạo)
 
 -- Indexes (Cân nhắc thêm các index cần thiết để tăng tốc độ truy vấn)
-CREATE INDEX IF NOT EXISTS idx_projects_user_id ON Projects(user_id);
-CREATE INDEX IF NOT EXISTS idx_pranalysisrequests_project_id ON PRAnalysisRequests(project_id);
-CREATE INDEX IF NOT EXISTS idx_pranalysisrequests_status ON PRAnalysisRequests(status);
-CREATE INDEX IF NOT EXISTS idx_analysisfindings_pr_analysis_request_id ON AnalysisFindings(pr_analysis_request_id);
-CREATE INDEX IF NOT EXISTS idx_analysisfindings_severity ON AnalysisFindings(severity);
+CREATE INDEX IF NOT EXISTS idx_projects_user_id ON projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_pranalysisrequests_project_id ON pranalysisrequests(project_id);
+CREATE INDEX IF NOT EXISTS idx_pranalysisrequests_status ON pranalysisrequests(status);
+CREATE INDEX IF NOT EXISTS idx_analysisfindings_pr_analysis_request_id ON analysisfindings(pr_analysis_request_id);
+CREATE INDEX IF NOT EXISTS idx_analysisfindings_severity ON analysisfindings(severity);
 
 COMMIT; -- Hoặc bỏ qua nếu bạn chạy từng lệnh một

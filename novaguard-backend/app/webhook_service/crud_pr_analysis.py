@@ -6,16 +6,14 @@ from sqlalchemy import func
 from typing import List
 
 def create_pr_analysis_request(db: Session, request_in: PRAnalysisRequestCreate) -> PRAnalysisRequest:
-    """
-    Tạo một bản ghi PRAnalysisRequest mới trong DB.
-    """
     db_request = PRAnalysisRequest(
         project_id=request_in.project_id,
         pr_number=request_in.pr_number,
         pr_title=request_in.pr_title,
-        pr_github_url=str(request_in.pr_github_url) if request_in.pr_github_url else None, # Chuyển HttpUrl sang str
+        pr_github_url=str(request_in.pr_github_url) if request_in.pr_github_url else None,
         head_sha=request_in.head_sha,
-        status=request_in.status # Sẽ là PRAnalysisStatus.PENDING từ schema
+        status=request_in.status # request_in.status là PRAnalysisStatus.PENDING (Enum member)
+                                # SQLAlchemy sẽ tự lấy .value khi lưu vào DB
     )
     db.add(db_request)
     db.commit()
