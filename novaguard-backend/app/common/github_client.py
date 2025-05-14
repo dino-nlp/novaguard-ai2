@@ -13,128 +13,155 @@ class GitHubAPIClient:
         if not token:
             raise ValueError("GitHub token is required for APIClient.")
         self.token = token
-        self.headers = {
+        # Headers mặc định cho các request JSON
+        self.default_json_headers = {
             "Authorization": f"token {self.token}",
             "Accept": "application/vnd.github.v3+json",
             **GITHUB_API_VERSION_HEADER
         }
+        # Headers riêng cho việc lấy diff
         self.diff_headers = {
             "Authorization": f"token {self.token}",
-            "Accept": "application/vnd.github.v3.diff", # Yêu cầu định dạng diff
+            "Accept": "application/vnd.github.v3.diff",
             **GITHUB_API_VERSION_HEADER
         }
 
-    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+    async def _request(self, method: str, url: str, custom_headers: Optional[Dict[str, str]] = None, **kwargs) -> httpx.Response:
+        """
+        Helper function to make HTTP requests to the GitHub API.
+        Uses custom_headers if provided, otherwise defaults to self.default_json_headers.
+        Other kwargs are passed directly to httpx.AsyncClient.request().
+        """
         async with httpx.AsyncClient() as client:
+            # Xác định headers sẽ sử dụng
+            headers_to_use = custom_headers if custom_headers is not None else self.default_json_headers
+            
+            # Ghi log headers sẽ được sử dụng (có thể bỏ qua Authorization token để tránh lộ)
+            loggable_headers = {k: v for k, v in headers_to_use.items() if k.lower() != 'authorization'}
+            logger.debug(f"GitHub API Request: {method} {url} with headers: {loggable_headers}, other_kwargs: {kwargs}")
+            
             try:
-                logger.debug(f"GitHub API Request: {method} {url} with headers {kwargs.get('headers', self.headers)}")
-                response = await client.request(method, url, headers=kwargs.get('headers', self.headers), **kwargs)
+                # Không truyền `headers` trong **kwargs nữa, chỉ truyền `custom_headers` (đã được gộp vào `headers_to_use`)
+                response = await client.request(method, url, headers=headers_to_use, **kwargs)
                 response.raise_for_status()  # Raise HTTPStatusError cho 4xx/5xx
                 return response
             except httpx.HTTPStatusError as e:
-                logger.error(f"GitHub API Error: {e.response.status_code} - {e.request.url} - Response: {e.response.text}")
-                # Có thể throw một custom exception ở đây để xử lý cụ thể hơn ở nơi gọi
+                # Ghi log chi tiết hơn về lỗi từ GitHub
+                error_details = e.response.text[:500] # Lấy 500 ký tự đầu của response lỗi
+                try:
+                    json_error = e.response.json()
+                    error_details = json_error.get("message", error_details)
+                    if "errors" in json_error:
+                        error_details += f" Details: {json_error['errors']}"
+                except ValueError: # Nếu response không phải JSON
+                    pass
+                logger.error(
+                    f"GitHub API Error: {e.response.status_code} - {e.request.url} - Response: {error_details}"
+                )
+                raise # Re-throw để hàm gọi bên ngoài có thể xử lý hoặc trả về None
+            except httpx.RequestError as e: # Lỗi kết nối, timeout, DNS, etc.
+                logger.error(f"GitHub API Request Error (e.g., connection, timeout): {e.request.url} - {str(e)}")
                 raise
-            except httpx.RequestError as e:
-                logger.error(f"GitHub API Request Error: {e.request.url} - {e}")
-                raise
-            except Exception as e:
+            except Exception as e: # Các lỗi không mong muốn khác
                 logger.exception(f"Unexpected error during GitHub API request to {url}")
                 raise
-
 
     async def get_pull_request_details(self, owner: str, repo: str, pr_number: int) -> Optional[Dict[str, Any]]:
         """Lấy thông tin chi tiết của một Pull Request."""
         url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}"
         try:
-            response = await self._request("GET", url)
+            # Sử dụng headers mặc định (default_json_headers)
+            response = await self._request("GET", url) 
             return response.json()
         except Exception:
+            # _request đã log lỗi, hàm này chỉ trả về None để báo hiệu thất bại
             return None
 
     async def get_pull_request_diff(self, owner: str, repo: str, pr_number: int) -> Optional[str]:
         """Lấy nội dung diff của một Pull Request."""
-        # Có thể lấy từ diff_url của PR details, hoặc gọi API này
         url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}"
         try:
-            response = await self._request("GET", url, headers=self.diff_headers)
-            return response.text # Diff thường là text
+            # Truyền self.diff_headers làm custom_headers
+            response = await self._request("GET", url, custom_headers=self.diff_headers)
+            return response.text
         except Exception:
             return None
 
     async def get_pull_request_files(self, owner: str, repo: str, pr_number: int) -> Optional[List[Dict[str, Any]]]:
         """Lấy danh sách các file thay đổi trong một Pull Request."""
-        url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100" # Tối đa 100 file/page
+        # URL ban đầu không có &page=1, để _request tự xử lý params nếu có
+        base_url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}/files"
         all_files = []
         page = 1
+        params = {"per_page": 100, "page": page} # Bắt đầu với page 1
+
         while True:
-            paginated_url = f"{url}&page={page}"
             try:
-                response = await self._request("GET", paginated_url)
+                # logger.debug(f"Fetching PR files page {page} with params: {params}")
+                # Sử dụng headers mặc định, truyền params cho request
+                response = await self._request("GET", base_url, params=params)
                 files_page = response.json()
+                
                 if not files_page: # Không có file nào nữa hoặc trang trống
                     break
                 all_files.extend(files_page)
-                if len(files_page) < 100: # Đã lấy hết file (GitHub trả về ít hơn per_page)
+                
+                # Kiểm tra Link header để phân trang
+                link_header = response.headers.get("Link")
+                if link_header and 'rel="next"' in link_header:
+                    page += 1
+                    params["page"] = page # Cập nhật page cho lần lặp tiếp theo
+                else: # Không có trang tiếp theo
                     break
-                page += 1
-            except Exception:
-                return None # Hoặc trả về những gì đã lấy được: return all_files if all_files else None
+            except Exception as e:
+                logger.error(f"Error fetching page {page} of PR files: {e}")
+                # Trả về những gì đã lấy được nếu có lỗi giữa chừng, hoặc None nếu lỗi ngay từ đầu
+                return all_files if all_files else None
         return all_files
 
 
     async def get_file_content(self, owner: str, repo: str, file_path: str, ref: Optional[str] = None) -> Optional[str]:
         """
         Lấy nội dung của một file cụ thể từ repository tại một ref (commit SHA, branch, tag).
-        Nội dung trả về là base64 encoded nếu file không phải text.
-        Hàm này sẽ cố gắng decode nếu là text.
         """
         url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/contents/{file_path}"
-        params = {}
+        params_for_request = {} # Đổi tên để tránh nhầm với biến params của _request
         if ref:
-            params["ref"] = ref
+            params_for_request["ref"] = ref
         
         try:
-            response = await self._request("GET", url, params=params)
+            # Sử dụng headers mặc định, truyền params_for_request
+            response = await self._request("GET", url, params=params_for_request)
             data = response.json()
             if data.get("encoding") == "base64" and data.get("content"):
                 import base64
                 try:
-                    # Cố gắng decode UTF-8, nếu lỗi thì có thể là file binary
                     return base64.b64decode(data["content"]).decode('utf-8')
                 except UnicodeDecodeError:
-                    logger.warning(f"Could not decode base64 content as UTF-8 for {file_path}. It might be a binary file.")
-                    return "[Binary Content - Not Decoded]" # Hoặc trả về None/data["content"] (base64 string)
-            elif data.get("content"): # Trường hợp không phải base64 (hiếm gặp cho file content)
-                 return data.get("content")
-            elif data.get("download_url"): # Nếu là file lớn, có thể cần fetch download_url
-                logger.info(f"File {file_path} has download_url, fetching content from there.")
-                download_response = await self._request("GET", data["download_url"])
-                return download_response.text # Thường là raw content
-            return None # Không có content hoặc encoding không hỗ trợ
+                    logger.warning(f"Could not decode base64 content as UTF-8 for {file_path} at ref {ref}. It might be a binary file.")
+                    return "[Binary Content - Not Decoded]"
+            elif data.get("content"):
+                return data.get("content")
+            elif data.get("download_url"):
+                logger.info(f"File {file_path} (ref: {ref}) has download_url, fetching content from there.")
+                # Khi gọi download_url, không cần truyền headers mặc định của GitHub API (vì nó có thể là S3 URL chẳng hạn)
+                # và cũng không cần Authorization token nếu URL đã signed.
+                # Tuy nhiên, để đơn giản, chúng ta vẫn có thể dùng _request với custom_headers rỗng hoặc headers mặc định
+                # nếu download_url vẫn là của GitHub.
+                # Nếu download_url là một URL công khai, không cần token.
+                # Với trường hợp này, ta vẫn dùng _request nhưng có thể truyền custom_headers=None để nó không dùng default_json_headers,
+                # hoặc một bộ headers tối thiểu.
+                # Tuy nhiên, nếu download_url là của githubusercontent.com, nó thường không cần token.
+                #
+                # Cách an toàn: tạo một client httpx mới cho download_url nếu nó không phải domain GitHub API
+                if "api.github.com" not in data["download_url"]:
+                    async with httpx.AsyncClient() as direct_client:
+                        download_response = await direct_client.get(data["download_url"], timeout=30.0)
+                        download_response.raise_for_status()
+                        return download_response.text
+                else: # Nếu vẫn là domain api.github.com (ít khả năng cho download_url)
+                    download_response = await self._request("GET", data["download_url"]) # Sẽ dùng default headers
+                    return download_response.text
+            return None
         except Exception:
             return None
-
-# Ví dụ sử dụng (sẽ được gọi từ worker)
-# async def main_example():
-#     # Cần token thật và repo/pr thật để test
-#     # token = "your_github_token"
-#     # if not token: return
-#     # client = GitHubAPIClient(token=token)
-#     # owner, repo, pr_number = "octocat", "Spoon-Knife", 1 
-#     # details = await client.get_pull_request_details(owner, repo, pr_number)
-#     # if details: print(f"PR Details: {details.get('title')}")
-#     # files = await client.get_pull_request_files(owner, repo, pr_number)
-#     # if files:
-#     #     print(f"Files changed: {len(files)}")
-#     #     for f in files:
-#     #         print(f" - {f['filename']} (Status: {f['status']})")
-#     #         if f['status'] != 'removed':
-#     #             content = await client.get_file_content(owner, repo, f['filename'], ref=details['head']['sha'])
-#     #             print(f"   Content (first 100 chars): {content[:100] if content else 'N/A'}")
-#     # diff = await client.get_pull_request_diff(owner, repo, pr_number)
-#     # if diff: print(f"PR Diff (first 200 chars): {diff[:200]}")
-
-# if __name__ == "__main__":
-#     import asyncio
-#     # asyncio.run(main_example())
