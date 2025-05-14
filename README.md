@@ -1,7 +1,7 @@
 # NovaGuard-AI: Intelligent Code Analysis Platform
 
-**Version:** 2.0 (MVP1 In Progress)
-**Last Updated:** May 14, 2025
+- **Version:** 2.0 (MVP1 In Progress)
+- **Last Updated:** May 14, 2025
 
 NovaGuard-AI is a web-based platform designed to provide intelligent and in-depth automated code analysis. It integrates with GitHub to analyze pull requests, leveraging Large Language Models (LLMs) via Ollama to offer insights beyond traditional static analysis tools. The goal is to help development teams improve code quality, identify potential issues early, and enhance overall development efficiency.
 
@@ -321,4 +321,4 @@ Details on contributing will be added here. (Standard contribution guidelines: f
 
 ## License
 
-Specify your project's license here (e.g., MIT, Apache 2.0). If not yet decided, state "License TBD".
+MIT
