@@ -9,13 +9,13 @@ from pathlib import Path
 from sqlalchemy.orm import Session, sessionmaker  # Đảm bảo import Session
 # from kafka import KafkaConsumer, KafkaError # KafkaConsumer, KafkaError được dùng trong hàm main_worker
 
-# Langchain imports
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
-from langchain.output_parsers import OutputFixingParser
-from langchain_ollama import ChatOllama
+from app.llm_service import (
+    invoke_llm_analysis_chain,
+    LLMProviderConfig,
+    LLMServiceError
+)
 
-from app.core.config import get_settings
+from app.core.config import get_settings, Settings
 from app.core.db import SessionLocal as AppSessionLocal
 from app.core.security import decrypt_data
 from app.models import User, Project, PRAnalysisRequest, PRAnalysisStatus, AnalysisFinding
@@ -24,7 +24,7 @@ from app.analysis_module import crud_finding, schemas_finding as am_schemas
 from app.common.github_client import GitHubAPIClient
 
 # Import Pydantic models cho LLM output
-from .llm_schemas import LLMSingleFinding, LLMStructuredOutput
+from .llm_schemas import  LLMStructuredOutput
 
 # --- Logging Setup ---
 # logger đã được định nghĩa và cấu hình ở phần trước, sử dụng tên "AnalysisWorker"
@@ -63,8 +63,8 @@ def get_db_session_for_worker() -> Optional[Session]:
         logger.warning("Worker DB Session factory was not pre-initialized by main_worker. Attempting now.")
         initialize_worker_db_session_factory_if_needed()
         if _worker_db_session_factory is None:
-             logger.error("Failed to initialize DB factory on demand for worker.")
-             return None
+            logger.error("Failed to initialize DB factory on demand for worker.")
+            return None
     db: Optional[Session] = None
     try:
         db = _worker_db_session_factory()
@@ -176,7 +176,8 @@ def create_dynamic_project_context(
         "pr_diff_content": (raw_pr_data.get("pr_diff", "") or "")[:8000], # Giới hạn tổng diff
         "formatted_changed_files_with_content": "\n".join(formatted_changed_files_str_list) if formatted_changed_files_str_list else "No relevant file content available for analysis.",
         "project_language": project_model.language or "Undefined",
-        "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided."
+        "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided.",
+        "raw_pr_data_changed_files": raw_pr_data.get("changed_files", [])
     }
     logger.debug(f"Dynamic context created for PR ID {pr_model.id}. Title: {context['pr_title']}")
     return context
@@ -191,210 +192,145 @@ def load_prompt_template_str(template_name: str) -> str: # Đổi tên hàm đ�
 
 async def run_code_analysis_agent_v1(
     dynamic_context: Dict[str, Any], # dynamic_context chứa tất cả các giá trị cần cho prompt
-    settings_obj: Any # settings object từ get_settings()
-) -> List[am_schemas.AnalysisFindingCreate]: # Trả về list các schema để tạo finding trong DB
-    """
-    Runs the Code Analysis Agent using Langchain with ChatOllama.
-    It loads a prompt, formats it with dynamic_context, invokes the LLM,
-    parses the output, and extracts code snippets for each finding.
-    """
+    settings_obj: Settings # settings object từ get_settings()
+) -> List[am_schemas.AnalysisFindingCreate]:
     pr_title_for_log = dynamic_context.get('pr_title', 'N/A')
-    logger.info(f"Running Langchain-based Code Analysis Agent for PR: {pr_title_for_log}")
+    logger.info(f"Worker: Running Code Analysis Agent for PR: {pr_title_for_log} using centralized LLMService.")
 
     try:
-        # 1. Load Prompt Template String (ví dụ: từ file deep_logic_bug_hunter_v1.md)
+        # 1. Load Prompt Template String (giữ nguyên)
         prompt_template_str = load_prompt_template_str("deep_logic_bug_hunter_v1.md")
 
-        # 2. Initialize LLM (sử dụng ChatOllama)
-        llm = ChatOllama(
-            model=settings_obj.OLLAMA_DEFAULT_MODEL,
-            base_url=settings_obj.OLLAMA_BASE_URL,
-            temperature=0.1, # Giảm nhiệt độ để kết quả ổn định hơn
-            # request_timeout=120.0 # (Optional) Tăng timeout nếu LLM xử lý lâu
-        )
-
-        # 3. Setup Output Parser
-        # Parser sẽ cố gắng parse output của LLM thành LLMStructuredOutput Pydantic model.
-        pydantic_parser = PydanticOutputParser(pydantic_object=LLMStructuredOutput)
-        
-        # (Tùy chọn) OutputFixingParser để thử sửa lỗi JSON nếu LLM trả về không hoàn hảo.
-        # Tạm thời bỏ qua để đơn giản hóa gỡ lỗi ban đầu.
-        # from langchain.output_parsers import OutputFixingParser
-        output_fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
-
-        # 4. Create ChatPromptTemplate
-        # Sử dụng from_template, Langchain sẽ tự động nhận diện các input_variables từ template string.
-        # Placeholder {format_instructions} sẽ được điền bởi parser.
-        chat_prompt_template_obj = ChatPromptTemplate.from_template(template=prompt_template_str)
-        
-        # Sử dụng .partial() để cung cấp giá trị cho 'format_instructions'
-        # Các biến khác trong 'dynamic_context' sẽ được truyền vào khi gọi .ainvoke()
-        final_chat_prompt_for_chain = chat_prompt_template_obj.partial(
-            format_instructions=pydantic_parser.get_format_instructions()
-        )
-
-        # Logging để kiểm tra template và các biến đầu vào dự kiến
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"--- CHAT PROMPT TEMPLATE (PR: {pr_title_for_log}) ---")
-            logger.debug(f"Expected input variables by template: {final_chat_prompt_for_chain.input_variables}")
-            
-            # Tạo một dict các giá trị giả để xem template đã format một phần
-            dummy_format_args = {
-                var: f"{{{var}}}" for var in final_chat_prompt_for_chain.input_variables 
-                if var not in dynamic_context and var != "format_instructions"
-            }
-            # Thêm các giá trị thực từ dynamic_context (chỉ một phần để log)
-            for var in final_chat_prompt_for_chain.input_variables:
-                if var in dynamic_context:
-                    val_to_log = str(dynamic_context[var])
-                    dummy_format_args[var] = (val_to_log[:100] + "..." if len(val_to_log) > 100 else val_to_log)
-                elif var == "format_instructions": # Đã được partial
-                    pass # không cần thêm vào dummy_format_args nữa
-                elif var not in dummy_format_args : # Nếu biến không có trong dynamic_context và cũng không phải format_instructions
-                    dummy_format_args[var] = f"[MISSING_IN_DYNAMIC_CONTEXT: {{{var}}}]"
-
-
-            try:
-                # Format prompt với các giá trị dummy (và một phần giá trị thật) để log
-                # Truyền tất cả các key mà template này mong đợi
-                # (trừ format_instructions đã được partial)
-                keys_for_dummy_format = list(set(final_chat_prompt_for_chain.input_variables) - {"format_instructions"})
-                final_dummy_args = {k: dynamic_context.get(k, f"DUMMY_VALUE_FOR_{k}") for k in keys_for_dummy_format}
-                # Log một phần của prompt đã được format
-                prompt_preview_obj = await final_chat_prompt_for_chain.aformat_prompt(**final_dummy_args)
-                logger.debug(f"Prompt preview (with some values filled, format_instructions from parser):\n{prompt_preview_obj.to_string()[:1000]}...")
-            except Exception as e_log_preview:
-                logger.warning(f"Could not generate full prompt preview for logging: {e_log_preview}")
-
-
-        # 5. Create Langchain Chain (LCEL)
-        # Sử dụng pydantic_parser trực tiếp. Nếu LLM trả về JSON không đúng, nó sẽ raise lỗi.
-        # analysis_chain = final_chat_prompt_for_chain | llm | pydantic_parser
-        analysis_chain = final_chat_prompt_for_chain | llm | output_fixing_parser # Nếu muốn dùng OutputFixingParser
-
-        # 6. Invoke Chain
-        logger.info(f"Invoking Langchain analysis chain for PR: {pr_title_for_log}")
-
-        # Log các biến sẽ được truyền vào chain (các key phải khớp với input_variables của final_chat_prompt_for_chain)
-        # (trừ format_instructions đã được partial)
+        # 2. Chuẩn bị payload cho prompt (dynamic_context đã chứa các giá trị này)
+        #    `invoke_payload` là `dynamic_context` đã được chuẩn bị
+        #    (Kiểm tra các key cần thiết đã có trong `dynamic_context` trước khi gọi)
         invoke_payload = {
             key: dynamic_context[key]
-            for key in final_chat_prompt_for_chain.input_variables
-            if key in dynamic_context and key != "format_instructions"
+            for key in dynamic_context # Lọc ra các key cần thiết cho prompt nếu cần
+            # Ví dụ: nếu prompt chỉ cần một subset các key từ dynamic_context
         }
-        
-        missing_vars_for_invoke = set(final_chat_prompt_for_chain.input_variables) - set(invoke_payload.keys()) - {"format_instructions"}
-        if missing_vars_for_invoke:
-            logger.error(f"FATAL: Payload for chain.ainvoke is missing variables: {missing_vars_for_invoke}. "
-                        f"Prompt expects: {final_chat_prompt_for_chain.input_variables}. "
-                        f"Dynamic_context has keys: {list(dynamic_context.keys())}")
-            # Đây là lỗi nghiêm trọng, nên raise hoặc trả về rỗng
-            raise ValueError(f"Invoke payload missing variables: {missing_vars_for_invoke}")
+        # IMPORTANT: dynamic_context cần phải chứa tất cả các placeholder mà prompt template mong đợi,
+        # ngoại trừ `format_instructions` sẽ được llm_service xử lý.
+        # Kiểm tra này có thể thực hiện ở đây hoặc trong llm_service.
 
-        if logger.isEnabledFor(logging.DEBUG):
-            loggable_invoke_payload = {
-                k: (str(v)[:200] + "..." if isinstance(v, str) and len(v) > 200 else v) 
-                for k,v in invoke_payload.items()
-            }
-            # Loại bỏ các trường lớn để log không bị quá tải
-            for large_key in ["formatted_changed_files_with_content", "pr_diff_content"]:
-                if large_key in loggable_invoke_payload:
-                    del loggable_invoke_payload[large_key]
-            logger.debug(f"Actual payload for chain.ainvoke (partial, excluding large content fields): {loggable_invoke_payload}")
-            if "formatted_changed_files_with_content" in invoke_payload and invoke_payload["formatted_changed_files_with_content"]:
-                logger.debug(f"formatted_changed_files_with_content (first 200 chars): {invoke_payload['formatted_changed_files_with_content'][:200]}...")
-            if "pr_diff_content" in invoke_payload and invoke_payload["pr_diff_content"]:
-                logger.debug(f"pr_diff_content (first 200 chars): {invoke_payload['pr_diff_content'][:200]}...")
+        # 3. Tạo cấu hình LLM cho llm_service
+        # Lấy provider và model mặc định từ settings
+        # Trong tương lai, có thể lấy từ project-specific config
+        current_llm_provider_config = LLMProviderConfig(
+            provider_name=settings_obj.DEFAULT_LLM_PROVIDER,
+            # model_name sẽ được llm_service xác định dựa trên provider và settings_obj.OPENAI_DEFAULT_MODEL etc.
+            # Hoặc bạn có thể xác định model_name ở đây nếu muốn logic đó nằm trong worker:
+            # model_name = (
+            #     settings_obj.OPENAI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "openai"
+            #     else settings_obj.GEMINI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "gemini"
+            #     else settings_obj.OLLAMA_DEFAULT_MODEL
+            # ),
+            temperature=0.1, # Hoặc lấy từ settings_obj
+            # api_key không cần truyền ở đây, llm_service sẽ tự lấy từ settings_obj
+        )
 
+        logger.info(f"Worker: Invoking LLMService with provider config: {current_llm_provider_config.provider_name}")
 
-        # Thực thi chain
-        llm_response_structured: LLMStructuredOutput = await analysis_chain.ainvoke(invoke_payload)
-        
-        # Để log raw output từ LLM (nếu cần và parser không làm việc này)
-        # Bạn có thể tách chain:
-        # messages_for_llm = await final_chat_prompt_for_chain.ainvoke(invoke_payload)
-        # if logger.isEnabledFor(logging.DEBUG):
-        #    logger.debug(f"--- MESSAGES SENT TO LLM (PR: {pr_title_for_log}) ---\n{messages_for_llm.to_json(indent=2)}")
-        # llm_aimessage_output = await llm.ainvoke(messages_for_llm)
-        # if logger.isEnabledFor(logging.DEBUG):
-        #    logger.debug(f"--- RAW LLM AIMessage OUTPUT (PR: {pr_title_for_log}) ---\n{llm_aimessage_output}")
-        #    logger.debug(f"--- RAW LLM CONTENT (PR: {pr_title_for_log}) ---\n{llm_aimessage_output.content}")
-        # llm_response_structured = pydantic_parser.parse(llm_aimessage_output.content)
+        # 4. Gọi LLM Service
+        structured_llm_output: LLMStructuredOutput = await invoke_llm_analysis_chain(
+            prompt_template_str=prompt_template_str,
+            dynamic_context_values=invoke_payload, # Đây là dict các giá trị để điền vào prompt
+            output_pydantic_model_class=LLMStructuredOutput, # Schema Pydantic cho output
+            llm_provider_config=current_llm_provider_config,
+            settings_obj=settings_obj # llm_service dùng để lấy API keys, default models
+        )
 
+        num_findings_from_llm = len(structured_llm_output.findings) if structured_llm_output and structured_llm_output.findings else 0
+        logger.info(f"Worker: Received structured response from LLMService for PR: {pr_title_for_log}. Number of raw findings: {num_findings_from_llm}")
 
-        num_findings_from_llm = len(llm_response_structured.findings) if llm_response_structured and llm_response_structured.findings else 0
-        logger.info(f"Received structured response from Langchain chain for PR: {pr_title_for_log}. Number of raw findings from LLM: {num_findings_from_llm}")
-        
-        if logger.isEnabledFor(logging.DEBUG) and llm_response_structured:
-            try:
-                # Log JSON đã được parse cẩn thận hơn
-                parsed_json_output = llm_response_structured.model_dump_json(indent=2)
-                logger.debug(f"Parsed LLM Output (JSON for PR {pr_title_for_log}):\n{parsed_json_output}")
-            except Exception as e_json_dump:
-                logger.warning(f"Could not serialize parsed LLM output to JSON for logging: {e_json_dump}")
-
-
-        # 7. Convert LLM findings to AnalysisFindingCreate schemas
+        # 5. Convert LLM findings to AnalysisFindingCreate schemas (logic này giữ nguyên)
         analysis_findings_to_create: List[am_schemas.AnalysisFindingCreate] = []
-        if llm_response_structured and llm_response_structured.findings:
-            for llm_finding in llm_response_structured.findings:
+        if structured_llm_output and structured_llm_output.findings:
+            for llm_finding in structured_llm_output.findings:
+                # ... (logic trích xuất code snippet và tạo finding_for_db như cũ) ...
+                # Ví dụ:
                 code_snippet_text = None
                 if llm_finding.file_path and llm_finding.line_start is not None:
                     original_file_content = None
-                    # dynamic_context phải chứa 'raw_pr_data_changed_files' là list of dicts
-                    # mỗi dict có 'filename' và 'content'
-                    raw_changed_files = dynamic_context.get("raw_pr_data_changed_files", [])
+                    raw_changed_files = dynamic_context.get("raw_pr_data_changed_files", []) # Đảm bảo key này có trong dynamic_context
                     for file_detail in raw_changed_files:
                         if file_detail.get("filename") == llm_finding.file_path:
                             original_file_content = file_detail.get("content")
                             break
-                    
                     if original_file_content:
                         lines = original_file_content.splitlines()
-                        actual_end_line = llm_finding.line_end if llm_finding.line_end is not None else llm_finding.line_start
-                        # Line numbers từ LLM là 1-based.
-                        # Python list slicing là 0-based và [start:end] không bao gồm 'end'.
-                        start_idx = max(0, llm_finding.line_start - 1)
-                        # end_idx để slice phải là actual_end_line (vì slice không bao gồm phần tử cuối)
-                        end_idx = min(len(lines), actual_end_line) 
 
-                        if start_idx < end_idx:
-                            snippet_lines = lines[start_idx:end_idx]
-                            code_snippet_text = "\n".join(snippet_lines)
+                        CONTEXT_LINES_BEFORE_AFTER = 5 # Số dòng ngữ cảnh trước và sau
+
+                        # Xác định dòng bắt đầu và kết thúc của lỗi (1-based từ LLM)
+                        error_line_start_1based = llm_finding.line_start
+                        error_line_end_1based = llm_finding.line_end if llm_finding.line_end is not None and llm_finding.line_end >= error_line_start_1based else error_line_start_1based
+
+                        # Tính toán phạm vi snippet bao gồm cả context (0-based cho slicing)
+                        snippet_start_idx_0based = max(0, error_line_start_1based - 1 - CONTEXT_LINES_BEFORE_AFTER)
+                        snippet_end_idx_0based = min(len(lines), error_line_end_1based + CONTEXT_LINES_BEFORE_AFTER) # slice sẽ không bao gồm dòng này, nên + CONTEXT_LINES_BEFORE_AFTER là đúng
+        
+                        if snippet_start_idx_0based < snippet_end_idx_0based:
+                            snippet_lines_with_context = lines[snippet_start_idx_0based:snippet_end_idx_0based]
+
+                            # Đánh dấu các dòng lỗi thực sự (tùy chọn, nếu muốn highlight trong frontend)
+                            # Dòng lỗi bắt đầu trong snippet (0-based relative to snippet_lines_with_context)
+                            error_start_in_snippet_0based = (error_line_start_1based - 1) - snippet_start_idx_0based
+                            # Dòng lỗi kết thúc trong snippet (0-based relative to snippet_lines_with_context)
+                            error_end_in_snippet_0based = (error_line_end_1based - 1) - snippet_start_idx_0based
+
+                            # Thêm tiền tố hoặc class để frontend có thể highlight 
+                            formatted_snippet_lines = []
+                            for i, line_text in enumerate(snippet_lines_with_context):
+                                actual_line_number = snippet_start_idx_0based + 1 + i
+                                prefix = f"{actual_line_number:>{len(str(snippet_end_idx_0based))}} | " # Căn chỉnh số dòng
+                                if error_start_in_snippet_0based <= i <= error_end_in_snippet_0based:
+                                    prefix = f">{prefix}" # Đánh dấu dòng lỗi
+                                else:
+                                    prefix = f" {prefix}"
+                                formatted_snippet_lines.append(prefix + line_text)
+                            code_snippet_text = "\n".join(formatted_snippet_lines)
+
+                            # Cách đơn giản hơn là chỉ join các dòng, frontend tự xử lý highlight nếu cần
+                            # code_snippet_text = "\n".join(snippet_lines_with_context)
+
                         else:
-                            logger.warning(f"Invalid line range for snippet extraction: file '{llm_finding.file_path}', "
-                                        f"LLM lines L{llm_finding.line_start}-L{actual_end_line}, "
-                                        f"calculated slice [{start_idx}:{end_idx}] for {len(lines)} actual lines. PR: {pr_title_for_log}")
-                    else:
-                        logger.warning(f"Could not find content for file '{llm_finding.file_path}' to extract snippet in PR {pr_title_for_log}.")
-                
-                # Tạo schema để lưu vào DB
+                            logger.warning(f"Invalid line range for snippet extraction (with context): file '{llm_finding.file_path}', "
+                                            f"LLM lines L{error_line_start_1based}-L{error_line_end_1based}, "
+                                            f"calculated snippet slice [{snippet_start_idx_0based}:{snippet_end_idx_0based}] for {len(lines)} actual lines. PR: {pr_title_for_log}")
+                            # Fallback về snippet gốc nếu có lỗi logic
+                            start_idx_orig = max(0, error_line_start_1based - 1)
+                            end_idx_orig = min(len(lines), error_line_end_1based)
+                            if start_idx_orig < end_idx_orig :
+                                code_snippet_text = "\n".join(lines[start_idx_orig:end_idx_orig])
+
+
                 finding_for_db = am_schemas.AnalysisFindingCreate(
                     file_path=llm_finding.file_path,
                     line_start=llm_finding.line_start,
                     line_end=llm_finding.line_end,
-                    severity=llm_finding.severity, # Giữ là string nếu schema DB là string
+                    severity=llm_finding.severity,
                     message=llm_finding.message,
                     suggestion=llm_finding.suggestion,
-                    agent_name="DeepLogicBugHunterAI_AgentV1_LC_Chat", # Cập nhật tên agent
+                    agent_name=f"NovaGuardAgent_v1_{current_llm_provider_config.provider_name}", # Tên agent có thể kèm provider
                     code_snippet=code_snippet_text
                 )
                 analysis_findings_to_create.append(finding_for_db)
         
         return analysis_findings_to_create
 
-    except FileNotFoundError as e_fnf:
-        logger.error(f"Prompt file error for PR {pr_title_for_log}: {e_fnf}")
+    except LLMServiceError as e_llm_service:
+        logger.error(f"Worker: LLMServiceError during analysis for PR '{pr_title_for_log}': {e_llm_service}")
+        # Lỗi này đã được log chi tiết bởi llm_service. Worker có thể chỉ cần ghi nhận và trả về rỗng.
+        return [] # Trả về list rỗng nếu có lỗi từ LLM service
+    except FileNotFoundError as e_fnf: # Lỗi không tìm thấy file prompt
+        logger.error(f"Worker: Prompt file error for PR '{pr_title_for_log}': {e_fnf}")
         return []
-    except KeyError as e_key:
-        logger.error(f"KeyError related to prompt input variables for PR {pr_title_for_log}: {e_key}. "
-                    f"This usually means a variable in the prompt template was not found in the input dictionary.")
+    except KeyError as e_key: # Lỗi thiếu key trong dynamic_context cho prompt
+        logger.error(f"Worker: KeyError formatting prompt for PR '{pr_title_for_log}': {e_key}. Check dynamic_context and prompt template.")
         return []
-    except ValueError as e_val: # Bắt lỗi từ việc check missing_vars_for_invoke
-        logger.error(f"ValueError during agent execution for PR {pr_title_for_log}: {e_val}")
-        return []
-    except Exception as e:
-        logger.exception(f"Unexpected error during Langchain code analysis for PR {pr_title_for_log}: {type(e).__name__} - {e}")
+    except Exception as e: # Các lỗi không mong muốn khác trong worker
+        logger.exception(f"Worker: Unexpected error during code analysis agent execution for PR '{pr_title_for_log}': {type(e).__name__} - {e}")
         return []
 
 async def process_message_logic(message_value: dict, db: Session, settings_obj):
@@ -481,7 +417,7 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj):
         # QUAN TRỌNG: Thêm raw_pr_data['changed_files'] vào context để agent có thể dùng để trích xuất snippet
         dynamic_context["raw_pr_data_changed_files"] = raw_pr_data.get("changed_files", [])
         
-        logger.info(f"PML: Invoking Langchain-based analysis agent for PR ID {pr_analysis_request_id}...")
+        logger.info(f"PML: Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
         
         # Gọi agent mới thay vì run_deep_logic_bug_hunter_mvp1 cũ
         analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
@@ -504,7 +440,7 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj):
         logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
 
     except Exception as e:
-        error_msg_detail = f"Error in process_message_logic (Langchain) for PR ID {pr_analysis_request_id}: {type(e).__name__} - {str(e)}"
+        error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id} (Provider: {settings_obj.DEFAULT_LLM_PROVIDER}): {type(e).__name__} - {str(e)}"
         logger.exception(error_msg_detail)
         try:
             crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020])

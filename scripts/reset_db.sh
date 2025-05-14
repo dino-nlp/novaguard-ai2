@@ -6,15 +6,15 @@
 # Assumes this script is run from the project root (novaguard-ai2/).
 
 SCHEMA_FILE="novaguard-backend/database/schema.sql"
-DB_SERVICE_NAME="postgres_db" # Tên service trong docker-compose.yml
+DB_SERVICE_NAME="postgres_db" # Tên service trong docker compose.yml
 DB_USER="novaguard_user"      # User của database
 DB_NAME="novaguard_db"        # Tên database
 
-# --- Function to check if docker-compose service is running ---
+# --- Function to check if docker compose service is running ---
 is_db_service_running() {
     # Versuche, den Container-Namen auf verschiedene Arten zu finden
     local container_name
-    container_name=$(docker-compose ps -q "${DB_SERVICE_NAME}" 2>/dev/null)
+    container_name=$(docker compose ps -q "${DB_SERVICE_NAME}" 2>/dev/null)
 
     if [ -z "$container_name" ]; then
         # Fallback, falls COMPOSE_PROJECT_NAME nicht standardmäßig ist oder -p verwendet wird
@@ -28,10 +28,10 @@ is_db_service_running() {
     fi
 }
 
-# Check if docker-compose is running the db service
+# Check if docker compose is running the db service
 if ! is_db_service_running; then
     echo "PostgreSQL service ('${DB_SERVICE_NAME}') is not running or not found."
-    echo "Please ensure it's up, e.g., via 'docker-compose up -d ${DB_SERVICE_NAME}'."
+    echo "Please ensure it's up, e.g., via 'docker compose up -d ${DB_SERVICE_NAME}'."
     exit 1
 fi
 
@@ -74,8 +74,8 @@ DROP TABLE IF EXISTS "users" CASCADE;
 
 -- Drop custom ENUM types created by SQLAlchemy or defined in schema.sql
 -- The name of the enum type is 'pr_analysis_status_enum' as defined in your model
--- and `status VARCHAR(20) CHECK (status IN (...))` in schema.sql is a CHECK constraint, not a named ENUM type.
--- If SQLAlchemy's `SQLAlchemyEnum(..., name="pr_analysis_status_enum", create_type=True)`
+-- and `status VARCHAR(20) CHECK \(status IN (...)\)` in schema.sql is a CHECK constraint, not a named ENUM type.
+-- If SQLAlchemy's SQLAlchemyEnum(..., name='pr_analysis_status_enum', create_type=True)
 -- actually created a PostgreSQL ENUM type, you'd drop it like this:
 DROP TYPE IF EXISTS pr_analysis_status_enum CASCADE;
 -- Add other custom ENUM types here if you have them.
@@ -91,7 +91,7 @@ EOF
 )
 
 echo "Dropping existing database objects..."
-echo "$DROP_COMMANDS" | docker-compose exec -T "${DB_SERVICE_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1
+echo "$DROP_COMMANDS" | docker compose exec -T "${DB_SERVICE_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1
 
 if [ $? -ne 0 ]; then
     echo "Error occurred while dropping database objects. Check the output above."
@@ -100,7 +100,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Applying schema from $SCHEMA_FILE..."
-cat "$SCHEMA_FILE" | docker-compose exec -T "${DB_SERVICE_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1
+cat "$SCHEMA_FILE" | docker compose exec -T "${DB_SERVICE_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1
 
 if [ $? -eq 0 ]; then
     echo "Database '${DB_NAME}' has been successfully reset and schema applied."

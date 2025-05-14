@@ -91,7 +91,7 @@ novaguard-ai2/
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── scripts/                    \# Utility scripts (DB init, reset)
-├── docker-compose.yml
+├── docker compose.yml
 └── README.md                   \# This file
 
 ````
@@ -133,24 +133,24 @@ Edit `novaguard-backend/.env` with your specific configurations. See the [Enviro
 
 ### 3\. Build and Run Docker Services
 
-This command will build the necessary images (if not already built) and start all services defined in `docker-compose.yml` (PostgreSQL, Kafka, Zookeeper, Ollama, and the NovaGuard backend API & Worker).
+This command will build the necessary images (if not already built) and start all services defined in `docker compose.yml` (PostgreSQL, Kafka, Zookeeper, Ollama, and the NovaGuard backend API & Worker).
 
 ```bash
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
 To check the status of running containers:
 
 ```bash
-docker-compose ps
+docker compose ps
 ```
 
 To view logs for a specific service (e.g., the API or worker):
 
 ```bash
-docker-compose logs -f novaguard_backend_api
-docker-compose logs -f novaguard_analysis_worker
-docker-compose logs -f ollama
+docker compose logs -f novaguard_backend_api
+docker compose logs -f novaguard_analysis_worker
+docker compose logs -f ollama
 ```
 
 ### 4\. Initialize Ollama Model
@@ -158,7 +158,7 @@ docker-compose logs -f ollama
 If you haven't pulled the LLM model for Ollama yet, or want to ensure it's available inside the Ollama container:
 
 ```bash
-docker-compose exec ollama ollama pull codellama:7b-instruct-q4_K_M
+docker compose exec ollama ollama pull codellama:7b-instruct-q4_K_M
 ```
 
 (Replace `codellama:7b-instruct-q4_K_M` with your desired default model if different, and ensure `OLLAMA_DEFAULT_MODEL` in `.env` matches.)
@@ -174,7 +174,7 @@ This script will apply the SQL schema to your PostgreSQL database.
 Alternatively, you can run the command manually (ensure services are up):
 
 ```bash
-cat novaguard-backend/database/schema.sql | docker-compose exec -T postgres_db psql -U novaguard_user -d novaguard_db
+cat novaguard-backend/database/schema.sql | docker compose exec -T postgres_db psql -U novaguard_user -d novaguard_db
 ```
 
 ### 6\. (Optional) Reset Database
@@ -192,7 +192,7 @@ If you need to wipe all data and re-apply the schema (e.g., after schema changes
 If all services are not yet running from the setup step:
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 The backend API will typically be available at `http://localhost:8000`.

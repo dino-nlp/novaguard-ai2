@@ -125,7 +125,7 @@
                     <p class="font-semibold text-gray-700 mb-1">Relevant Code Snippet:</p>
                     {# Thêm class cho ngôn ngữ nếu có, ví dụ 'language-python' #}
                     {% set lang = finding.file_path.split('.')[-1] if '.' in finding.file_path else 'plaintext' %}
-                    <pre class="rounded-md"><code class="language-{{ lang }} hljs">{{- finding.code_snippet -}}</code></pre>
+                    <pre><code class="language-{{ lang }} hljs">{{- finding.code_snippet -}}</code></pre>
                 </div>
                 {% endif %}
             </div>
