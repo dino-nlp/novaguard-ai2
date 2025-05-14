@@ -1,141 +1,324 @@
-# NovaGuard AI
+# NovaGuard-AI: Intelligent Code Analysis Platform
 
-### Setup env
+**Version:** 2.0 (MVP1 In Progress)
+**Last Updated:** May 14, 2025
 
-- Cài đặt các docker image cần thiết
+NovaGuard-AI is a web-based platform designed to provide intelligent and in-depth automated code analysis. It integrates with GitHub to analyze pull requests, leveraging Large Language Models (LLMs) via Ollama to offer insights beyond traditional static analysis tools. The goal is to help development teams improve code quality, identify potential issues early, and enhance overall development efficiency.
 
-```bash
-docker-compose up -d postgres_db zookeeper kafka ollama
+## Table of Contents
+
+- [NovaGuard-AI: Intelligent Code Analysis Platform](#novaguard-ai-intelligent-code-analysis-platform)
+  - [Table of Contents](#table-of-contents)
+  - [Core Features (MVP1)](#core-features-mvp1)
+  - [Technology Stack](#technology-stack)
+  - [Project Structure](#project-structure)
+  - [Prerequisites](#prerequisites)
+  - [Setup and Installation](#setup-and-installation)
+    - [1. Clone the Repository](#1-clone-the-repository)
+    - [2. Environment Variables](#2-environment-variables)
+    - [3. Build and Run Docker Services](#3-build-and-run-docker-services)
+    - [4. Initialize Ollama Model](#4-initialize-ollama-model)
+    - [5. Initialize Database Schema](#5-initialize-database-schema)
+    - [6. (Optional) Reset Database](#6-optional-reset-database)
+  - [Running the Application](#running-the-application)
+  - [Accessing the Application](#accessing-the-application)
+  - [Usage Guide](#usage-guide)
+    - [1. Register and Login](#1-register-and-login)
+    - [2. Connect GitHub Account](#2-connect-github-account)
+    - [3. Add a Project](#3-add-a-project)
+    - [4. Automatic PR Analysis](#4-automatic-pr-analysis)
+    - [5. View Analysis Reports](#5-view-analysis-reports)
+    - [6. Delete a Project](#6-delete-a-project)
+  - [Environment Variables Details](#environment-variables-details)
+  - [Development](#development)
+    - [Running Tests](#running-tests)
+    - [Prompts](#prompts)
+  - [Future Roadmap (Post-MVP1 Highlights)](#future-roadmap-post-mvp1-highlights)
+  - [Contributing](#contributing)
+  - [License](#license)
+
+## Core Features (MVP1)
+
+* **User Authentication:** Secure user registration and login (email/password & GitHub OAuth).
+* **GitHub Integration:** Connect your GitHub account to list and add repositories.
+* **Project Management:** Add, view, and manage projects for analysis.
+* **Automated Pull Request Analysis:**
+    * Triggered by GitHub webhooks for new/updated PRs.
+    * Fetches PR details, diffs, and changed file content.
+    * Uses an LLM (via Ollama and Langchain) to analyze code for potential issues (logic errors, basic vulnerabilities).
+    * Stores analysis findings, including relevant code snippets.
+* **Web-Based Reporting:** View detailed analysis reports for each PR.
+* **Project Deletion:** Ability to remove projects and attempt to clean up associated GitHub webhooks.
+
+## Technology Stack
+
+* **Backend:** Python, FastAPI
+* **LLM Orchestration:** Langchain
+* **LLM Runtime:** Ollama (e.g., `codellama:7b-instruct-q4_K_M`)
+* **Database:** PostgreSQL
+* **Message Queue:** Apache Kafka
+* **ORM:** SQLAlchemy
+* **Frontend (MVP):** Server-side rendered HTML with Jinja2 templates, Tailwind CSS.
+* **Containerization:** Docker, Docker Compose
+
+## Project Structure
+
+The project is primarily composed of the `novaguard-backend` application:
+
 ```
 
-- Kiểm tra logs của chúng để đảm bảo không có lỗi:
+novaguard-ai2/
+├── novaguard-backend/
+│   ├── app/
+│   │   ├── analysis\_module/    \# Logic for findings
+│   │   ├── analysis\_worker/    \# Kafka consumer, LLM analysis logic
+│   │   │   └── llm\_schemas.py  \# Pydantic models for LLM output
+│   │   ├── auth\_service/       \# Authentication (API, CRUD, schemas)
+│   │   ├── common/             \# Shared utilities (GitHub client, Kafka producer)
+│   │   ├── core/               \# Core config, DB, security
+│   │   ├── llm\_service/        \# (Currently bypassed by direct Langchain use)
+│   │   ├── models/             \# SQLAlchemy ORM models
+│   │   ├── project\_service/    \# Project management (API, CRUD, schemas)
+│   │   ├── prompts/            \# LLM Prompt templates (e.g., .md files)
+│   │   ├── static/             \# Static files (CSS, JS)
+│   │   ├── templates/          \# Jinja2 HTML templates
+│   │   ├── webhook\_service/    \# GitHub webhook handling (API, CRUD, schemas)
+│   │   └── main.py             \# FastAPI app entrypoint, UI routes
+│   ├── database/
+│   │   └── schema.sql          \# PostgreSQL schema definition
+│   ├── tests/                  \# Unit and integration tests
+│   ├── .env.example            \# Example environment file
+│   ├── Dockerfile
+│   └── requirements.txt
+├── scripts/                    \# Utility scripts (DB init, reset)
+├── docker-compose.yml
+└── README.md                   \# This file
+
+````
+
+## Prerequisites
+
+* Docker and Docker Compose installed.
+* Git installed.
+* A GitHub account (and potentially a repository to test with).
+* An Ollama-compatible LLM pulled (e.g., `codellama:7b-instruct-q4_K_M`).
+
+## Setup and Installation
+
+### 1. Clone the Repository
 
 ```bash
-docker-compose logs postgres_db
-docker-compose logs kafka
-docker-compose logs ollama
+git clone https://github.com/dino-nlp/novaguard-ai2.git
+cd novaguard-ai2
+````
+
+### 2\. Environment Variables
+
+Copy the example environment file and customize it:
+
+```bash
+cp novaguard-backend/.env.example novaguard-backend/.env
 ```
 
-- Tải ollama model
+Edit `novaguard-backend/.env` with your specific configurations. See the [Environment Variables Details](https://www.google.com/search?q=%23environment-variables-details) section below for more information on each variable.
+**Crucial variables to set:**
+
+  * `SECRET_KEY` (for JWT)
+  * `FERNET_ENCRYPTION_KEY` (for encrypting GitHub tokens)
+  * `SESSION_SECRET_KEY` (for UI sessions)
+  * `GITHUB_CLIENT_ID` (for GitHub OAuth)
+  * `GITHUB_CLIENT_SECRET` (for GitHub OAuth)
+  * `GITHUB_WEBHOOK_SECRET` (for verifying GitHub webhooks)
+  * `NOVAGUARD_PUBLIC_URL` (Publicly accessible URL for GitHub webhooks, e.g., ngrok URL during development)
+
+### 3\. Build and Run Docker Services
+
+This command will build the necessary images (if not already built) and start all services defined in `docker-compose.yml` (PostgreSQL, Kafka, Zookeeper, Ollama, and the NovaGuard backend API & Worker).
+
+```bash
+docker-compose up -d --build
+```
+
+To check the status of running containers:
+
+```bash
+docker-compose ps
+```
+
+To view logs for a specific service (e.g., the API or worker):
+
+```bash
+docker-compose logs -f novaguard_backend_api
+docker-compose logs -f novaguard_analysis_worker
+docker-compose logs -f ollama
+```
+
+### 4\. Initialize Ollama Model
+
+If you haven't pulled the LLM model for Ollama yet, or want to ensure it's available inside the Ollama container:
 
 ```bash
 docker-compose exec ollama ollama pull codellama:7b-instruct-q4_K_M
 ```
 
-- Khởi tạo database
+(Replace `codellama:7b-instruct-q4_K_M` with your desired default model if different, and ensure `OLLAMA_DEFAULT_MODEL` in `.env` matches.)
+
+### 5\. Initialize Database Schema
+
+This script will apply the SQL schema to your PostgreSQL database.
+
+```bash
+./scripts/init_db.sh
+```
+
+Alternatively, you can run the command manually (ensure services are up):
 
 ```bash
 cat novaguard-backend/database/schema.sql | docker-compose exec -T postgres_db psql -U novaguard_user -d novaguard_db
 ```
 
-- Run backend
+### 6\. (Optional) Reset Database
+
+If you need to wipe all data and re-apply the schema (e.g., after schema changes):
 
 ```bash
-docker-compose up -d --build novaguard_backend_api
-# Hoặc nếu muốn rebuild tất cả và chạy:
-# docker-compose up -d --build
+./scripts/reset_db.sh
 ```
 
-- Theo dõi log của 1 container:
+**Warning:** This will delete all data in your NovaGuard database.
+
+## Running the Application
+
+If all services are not yet running from the setup step:
 
 ```bash
-docker-compose logs -f novaguard_backend_api
+docker-compose up -d
 ```
 
-Test APIs tại: http://localhost:8000/docs
+The backend API will typically be available at `http://localhost:8000`.
 
-- Xóa DB cũ để chạy lại sau khi có thay đổi
+## Accessing the Application
+
+  * **Web UI:** `http://localhost:8000/`
+  * **API Documentation (Swagger UI):** `http://localhost:8000/docs`
+  * **API Documentation (ReDoc):** `http://localhost:8000/redoc`
+
+## Usage Guide
+
+### 1\. Register and Login
+
+  * Navigate to `http://localhost:8000/`.
+  * Click "Register" to create a new account using email and password.
+  * Alternatively, click "Login" and then "Sign in with GitHub" for OAuth-based login/registration.
+
+### 2\. Connect GitHub Account
+
+  * After logging in, go to the Dashboard (`http://localhost:8000/dashboard`).
+  * If your GitHub account is not yet connected, click "Connect GitHub Account". This will redirect you to GitHub for authorization.
+  * Authorize NovaGuard-AI to access your repositories (permissions requested: `repo`, `read:user`, `user:email`).
+
+### 3\. Add a Project
+
+  * On the Dashboard, you will see a list of your available GitHub repositories (if your GitHub account is connected).
+  * Click "Add to NovaGuard" next to a repository. This will prefill the project details.
+  * Alternatively, click "Add New Project Manually" and fill in:
+      * **Repository Name:** Full name (e.g., `owner/repo-name`).
+      * **GitHub Repository ID:** The numerical ID from GitHub (can be found via GitHub API or sometimes in the repo URL).
+      * **Main Branch:** The primary branch to analyze (e.g., `main`, `master`).
+      * (Optional) Primary Language, Custom Project Notes.
+  * Clicking "Add Project & Setup Webhook" will add the project to NovaGuard and attempt to automatically create a webhook on the GitHub repository for PR events.
+      * **Note:** For automatic webhook creation to succeed, your `NOVAGUARD_PUBLIC_URL` environment variable must be correctly set to a URL reachable by GitHub.com (e.g., an ngrok tunnel URL during local development).
+
+### 4\. Automatic PR Analysis
+
+  * Once a project is added and the webhook is active on GitHub:
+      * When a Pull Request is opened, reopened, or synchronized (new commits pushed) in the linked GitHub repository, GitHub will send an event to NovaGuard-AI.
+      * NovaGuard-AI will queue an analysis task.
+      * The `novaguard_analysis_worker` will pick up the task, fetch PR data, invoke the LLM for analysis, and save the findings.
+
+### 5\. View Analysis Reports
+
+  * From the Dashboard, click on a project name to go to its "Project Detail" page.
+  * This page lists the history of Pull Request analyses for that project.
+  * Click "View Report" next to a specific PR analysis to see the detailed findings, including descriptions, suggestions, and relevant code snippets.
+
+### 6\. Delete a Project
+
+  * Navigate to the "Project Settings" page for the project you wish to delete.
+  * In the "Danger Zone" section, click "Delete This Project". You will be asked for confirmation.
+  * This action removes the project and its analysis history from NovaGuard and attempts to delete the associated webhook from GitHub.
+
+## Environment Variables Details
+
+The following environment variables are configured in `novaguard-backend/.env` (copied from `.env.example`):
+
+  * **`DATABASE_URL`**: PostgreSQL connection string.
+      * Default for Docker: `postgresql://novaguard_user:novaguard_password@postgres_db:5432/novaguard_db`
+  * **`SECRET_KEY`**: A strong secret key for signing JWTs. **Generate a secure random key for this.**
+      * Example generation: `openssl rand -hex 32`
+  * **`ALGORITHM`**: JWT signing algorithm (default: `HS256`).
+  * **`ACCESS_TOKEN_EXPIRE_MINUTES`**: JWT access token lifetime in minutes (default: `1440` for 1 day).
+  * **`FERNET_ENCRYPTION_KEY`**: A Fernet key for encrypting sensitive data like GitHub access tokens. **Generate a secure key.**
+      * Example generation (Python): `from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())`
+  * **`GITHUB_CLIENT_ID`**: Your GitHub OAuth App's Client ID.
+  * **`GITHUB_CLIENT_SECRET`**: Your GitHub OAuth App's Client Secret.
+  * **`GITHUB_REDIRECT_URI`**: The callback URL for your GitHub OAuth App.
+      * Default for local dev: `http://localhost:8000/api/auth/github/callback` (Ensure this matches your GitHub OAuth App config).
+  * **`GITHUB_WEBHOOK_SECRET`**: A strong secret string used to secure and verify payloads from GitHub webhooks. **Generate a secure random string.**
+  * **`SESSION_SECRET_KEY`**: A secret key for signing user session cookies (FastAPI's `SessionMiddleware`). **Generate a secure random key.**
+  * **`KAFKA_BOOTSTRAP_SERVERS`**: Comma-separated list of Kafka brokers.
+      * Default for Docker: `kafka:29092`
+  * **`KAFKA_PR_ANALYSIS_TOPIC`**: Kafka topic name for PR analysis tasks (default: `pr_analysis_tasks`).
+  * **`OLLAMA_BASE_URL`**: Base URL for the Ollama API service.
+      * Default for Docker: `http://ollama:11434`
+  * **`OLLAMA_DEFAULT_MODEL`**: Default LLM model to use with Ollama (e.g., `codellama:7b-instruct-q4_K_M`).
+  * **`NOVAGUARD_PUBLIC_URL`**: The publicly accessible base URL of your NovaGuard-AI instance. This is crucial for GitHub webhooks to reach your application, especially during local development (use ngrok or similar).
+      * Example: `https://your-ngrok-subdomain.ngrok-free.app` or `https://novaguard.yourcompany.com`
+  * **`DEBUG`**: Set to `True` for development mode (more verbose logging, debug features), `False` for production (default: `False`).
+
+## Development
+
+### Running Tests
+
+Tests are located in the `novaguard-backend/tests/` directory.
+Ensure your Python environment is set up with all dependencies from `requirements.txt`.
+From the `novaguard-backend` directory:
 
 ```bash
-# Kết nối vào psql trong container
-docker-compose exec postgres_db psql -U novaguard_user -d novaguard_db
-# Bên trong psql:
-DROP TABLE IF EXISTS "AnalysisFindings" CASCADE;
-DROP TABLE IF EXISTS "PRAnalysisRequests" CASCADE;
-DROP TABLE IF EXISTS "Projects" CASCADE;
-DROP TABLE IF EXISTS "Users" CASCADE;
-\q 
-# Sau đó, áp dụng lại schema
-cat novaguard-backend/database/schema.sql | docker-compose exec -T postgres_db psql -U novaguard_user -d novaguard_db
+# Ensure PYTHONPATH includes the app directory if needed
+# export PYTHONPATH=$(pwd):$PYTHONPATH 
+
+# Discover and run all tests
+python -m unittest discover -s tests
+
+# Run tests for a specific module
+python -m unittest tests.core.test_config
 ```
 
-## Thiết lập Webhook GitHub cho Môi trường Nội bộ
+### Prompts
 
-Để NovaGuard-AI có thể tự động phân tích Pull Request, bạn cần cấu hình webhook trên repository GitHub (hoặc GitHub Enterprise Server - GHES) của bạn để gửi sự kiện đến NovaGuard-AI.
+LLM prompts are stored as Markdown files in `novaguard-backend/app/prompts/`. Currently, `deep_logic_bug_hunter_v1.md` is used for the primary code analysis agent. These prompts utilize placeholders (e.g., `{pr_title}`, `{format_instructions}`) that are filled in by the `analysis_worker` using Langchain's `ChatPromptTemplate`.
 
-### 1. Chuẩn bị NovaGuard-AI Backend
+## Future Roadmap (Post-MVP1 Highlights)
 
-* Đảm bảo NovaGuard-AI backend (cụ thể là service `novaguard_backend_api`) đang chạy và có thể tiếp nhận request tại endpoint `/webhooks/github`.
-* **Tạo Webhook Secret:**
-    1.  Tạo một chuỗi bí mật (secret) mạnh mẽ và ngẫu nhiên. Ví dụ sử dụng `openssl rand -hex 32` hoặc một trình quản lý mật khẩu.
-    2.  Cấu hình secret này trong môi trường của NovaGuard-AI backend. Nếu sử dụng Docker Compose, bạn có thể đặt biến môi trường `GITHUB_WEBHOOK_SECRET` trong file `.env` (đã được gitignore):
-        ```env
-        # Trong file .env ở thư mục gốc của dự án
-        GITHUB_WEBHOOK_SECRET="your_generated_strong_secret_here"
-        ```
-        Và đảm bảo `docker-compose.yml` nạp biến này cho service `novaguard_backend_api`.
+(Based on `DESIGN.MD`)
 
-### 2. Xác định Payload URL cho Webhook
+  * **Full Project Scans:** Analyze entire codebases, not just PRs.
+  * **Code Knowledge Graph (CKG):** Build and utilize a CKG (e.g., with Neo4j, tree-sitter) for deeper contextual understanding and more advanced architectural analysis.
+  * **Additional Specialized Agents:**
+      * `ArchitecturalAnalystAI` (more advanced)
+      * `SecuritySentinelAI`
+      * `PerformanceProfilerAI`
+  * **Enhanced Project Configuration:** Allow users to select LLM models per agent, define custom coding conventions and architectural rules.
+  * **Technical Debt Tracking.**
+  * **Project-Specific Knowledge Base.**
+  * **Frontend SPA:** Potential migration to a Single Page Application (React/Vue/Angular) for a richer user experience.
+  * **Support for other Git platforms** (GitLab, Bitbucket).
 
-Đây là URL mà GitHub sẽ gửi các sự kiện đến. Endpoint của NovaGuard-AI là `/webhooks/github`.
+## Contributing
 
-* **Nếu sử dụng GitHub Enterprise Server (GHES) nội bộ:**
-    * Payload URL sẽ là địa chỉ nội bộ của máy chủ đang chạy NovaGuard-AI.
-    * Ví dụ: `http://<ip-may-chu-novaguard>:8000/webhooks/github` hoặc `http://novaguard.your-internal-domain.com/webhooks/github`.
-    * Đảm bảo GHES có thể truy cập được địa chỉ này.
+Details on contributing will be added here. (Standard contribution guidelines: forking, branching, PRs, code style, tests).
 
-* **Nếu sử dụng GitHub.com và NovaGuard-AI chạy nội bộ (không có IP public trực tiếp):**
-    Bạn cần một cách để GitHub.com có thể gửi request đến server nội bộ của bạn.
-    * **Lựa chọn A: Sử dụng Reverse Proxy (Khuyến nghị cho môi trường شبه-production nội bộ)**
-        * Nếu công ty bạn có một reverse proxy (Nginx, Traefik, Caddy, F5, ...) được cấu hình để có thể truy cập từ internet và có thể trỏ đến các dịch vụ nội bộ, hãy cấu hình nó.
-        * Ví dụ: Cấu hình một tên miền con như `novaguard-webhook.yourcompany.com` để trỏ đến địa chỉ nội bộ của NovaGuard-AI, ví dụ `http://<ip-may-chu-novaguard-noi-bo>:8000`.
-        * Payload URL trên GitHub sẽ là: `https://novaguard-webhook.yourcompany.com/webhooks/github` (ưu tiên HTTPS).
-        * **Quan trọng:** Trên reverse proxy, hãy cân nhắc chỉ cho phép các request đến từ dải IP của GitHub (tham khảo API `GET /meta` của GitHub để lấy danh sách IP) và đảm bảo HTTPS được cấu hình.
+## License
 
-    * **Lựa chọn B: Sử dụng ngrok (Cho Phát triển/Thử nghiệm)**
-        1.  [Tải và cài đặt ngrok](https://ngrok.com/download).
-        2.  Xác thực ngrok (nếu cần).
-        3.  Nếu NovaGuard-AI backend đang chạy trên máy local của bạn ở port 8000, chạy lệnh:
-            ```bash
-            ngrok http 8000
-            ```
-        4.  Ngrok sẽ cung cấp một URL "Forwarding" dạng `https_//<random-string>.ngrok-free.app` (hoặc tương tự tùy phiên bản ngrok).
-        5.  Payload URL trên GitHub sẽ là: `https_//<random-string>.ngrok-free.app/webhooks/github`.
-        *Lưu ý: URL của ngrok (phiên bản miễn phí) sẽ thay đổi mỗi khi bạn khởi động lại ngrok. Điều này phù hợp cho dev, nhưng không ổn định cho production.*
-
-### 3. Cấu hình Webhook trên GitHub/GHES Repository
-
-1.  Truy cập repository của bạn trên GitHub hoặc GHES.
-2.  Đi đến **Settings** > **Webhooks** (trong mục "Code and automation").
-3.  Nhấp vào **"Add webhook"**.
-4.  **Payload URL:** Nhập URL bạn đã xác định ở Bước 2.
-5.  **Content type:** Chọn `application/json`.
-6.  **Secret:** Nhập **chính xác** chuỗi `GITHUB_WEBHOOK_SECRET` mà bạn đã tạo và cấu hình cho NovaGuard-AI ở Bước 1.
-7.  **Which events would you like to trigger this webhook?**
-    * Chọn **"Let me select individual events."**
-    * Bỏ chọn "Pushes".
-    * **Chọn "Pull requests"**. Các sự kiện quan trọng cần được chọn là:
-        * `opened` (khi PR được tạo)
-        * `reopened` (khi PR được mở lại)
-        * `synchronize` (khi có commit mới được push lên PR)
-8.  Đảm bảo checkbox **"Active"** được chọn.
-9.  Nhấp vào **"Add webhook"**.
-
-### 4. Kiểm tra Webhook
-
-* Sau khi thêm, GitHub/GHES sẽ gửi một "ping" event. Kiểm tra tab "Recent Deliveries" trong cài đặt webhook để xem trạng thái (response code 202 là thành công cho ping nếu endpoint của bạn xử lý nó, hoặc có thể là một response khác tùy logic ping của bạn). Endpoint `/webhooks/github` hiện tại của chúng ta sẽ trả về "Event type ignored" cho ping, nhưng vẫn là dấu hiệu kết nối thành công.
-* Tạo một Pull Request mới, hoặc push một commit mới vào một Pull Request hiện có trong repository.
-* Kiểm tra log của `novaguard_backend_api` và `novaguard_analysis_worker` để xem:
-    * `novaguard_backend_api`: Có nhận được webhook, xác thực signature thành công, và gửi task vào Kafka không.
-    * `novaguard_analysis_worker`: Có nhận được task từ Kafka không.
-
----
-
-## Cách lấy thông tin Github repository
-
-```bash
-curl -L \
-  -H "Accept: application/vnd.github+json" \
-  -H "X-GitHub-Api-Version: 2022-11-28" \
-  https://api.github.com/repos/dino-nlp/novaguard-test-project
-```
+Specify your project's license here (e.g., MIT, Apache 2.0). If not yet decided, state "License TBD".

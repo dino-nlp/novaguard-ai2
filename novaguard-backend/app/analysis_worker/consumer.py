@@ -220,7 +220,7 @@ async def run_code_analysis_agent_v1(
         # (Tùy chọn) OutputFixingParser để thử sửa lỗi JSON nếu LLM trả về không hoàn hảo.
         # Tạm thời bỏ qua để đơn giản hóa gỡ lỗi ban đầu.
         # from langchain.output_parsers import OutputFixingParser
-        # output_fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
+        output_fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
 
         # 4. Create ChatPromptTemplate
         # Sử dụng from_template, Langchain sẽ tự động nhận diện các input_variables từ template string.
@@ -269,8 +269,8 @@ async def run_code_analysis_agent_v1(
 
         # 5. Create Langchain Chain (LCEL)
         # Sử dụng pydantic_parser trực tiếp. Nếu LLM trả về JSON không đúng, nó sẽ raise lỗi.
-        analysis_chain = final_chat_prompt_for_chain | llm | pydantic_parser
-        # analysis_chain = final_chat_prompt_for_chain | llm | output_fixing_parser # Nếu muốn dùng OutputFixingParser
+        # analysis_chain = final_chat_prompt_for_chain | llm | pydantic_parser
+        analysis_chain = final_chat_prompt_for_chain | llm | output_fixing_parser # Nếu muốn dùng OutputFixingParser
 
         # 6. Invoke Chain
         logger.info(f"Invoking Langchain analysis chain for PR: {pr_title_for_log}")
