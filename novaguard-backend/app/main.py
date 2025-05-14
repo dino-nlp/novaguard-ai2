@@ -549,6 +549,142 @@ async def project_settings_page_ui_post(
     # Redirect về trang chi tiết dự án sau khi cập nhật
     return RedirectResponse(url=request.url_for("ui_project_detail_get", project_id_path=project_id), status_code=status.HTTP_302_FOUND)
 
+@ui_report_router.get("/pr-analysis/{request_id_param}/report", response_class=HTMLResponse, name="ui_pr_report_get")
+async def ui_pr_analysis_report_page(
+    request: Request,
+    request_id_param: int,
+    db: Session = Depends(get_db), # Sử dụng Session đồng bộ nếu CRUD functions của bạn đồng bộ
+    current_user: auth_schemas.UserPublic = Depends(get_current_ui_user) # Đảm bảo dependency này đúng
+):
+    if not current_user:
+        # ... (xử lý redirect nếu chưa login)
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "warning", "message": "Please login to view reports."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
+
+    # Lấy PRAnalysisRequest từ DB
+    # pr_crud.get_pr_analysis_request_by_id là hàm bạn đã có trong app/webhook_service/crud_pr_analysis.py
+    pr_analysis_db_obj = pr_crud.get_pr_analysis_request_by_id(db, request_id=request_id_param)
+    
+    if not pr_analysis_db_obj:
+        # ... (xử lý nếu không tìm thấy PR Analysis Request)
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "PR Analysis Request not found."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    # Kiểm tra quyền sở hữu project
+    # project_crud.get_project_by_id là hàm bạn đã có trong app/project_service/crud_project.py
+    project_of_pr = project_crud.get_project_by_id(db, project_id=pr_analysis_db_obj.project_id, user_id=current_user.id)
+    if not project_of_pr:
+        # ... (xử lý nếu không có quyền)
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "You do not have permission to view this project's report."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    # Lấy danh sách findings cho PR Analysis Request này
+    # finding_crud.get_findings_by_request_id là hàm bạn đã có trong app/analysis_module/crud_finding.py
+    findings_db_list = finding_crud.get_findings_by_request_id(db, pr_analysis_request_id=request_id_param)
+    
+    # Truyền trực tiếp các model objects (SQLAlchemy) vào template.
+    # Jinja2 có thể truy cập các thuộc tính của chúng.
+    return templates.TemplateResponse(
+        "pages/reports/pr_analysis_report.html", # Đảm bảo đường dẫn này đúng
+        {
+            "request": request,
+            "page_title": f"PR Analysis: {pr_analysis_db_obj.pr_title or f'PR #{pr_analysis_db_obj.pr_number}'}",
+            "current_user": current_user,
+            "project": project_of_pr, 
+            "pr_request_details": pr_analysis_db_obj, 
+            "findings": findings_db_list, 
+            "current_year": datetime.now().year 
+            # "SeverityLevel": SeverityLevel, # Nếu bạn muốn dùng Enum SeverityLevel trong template cho CSS class chẳng hạn
+        }
+    )
+
+@ui_project_router.post("/{project_id_path}/delete", name="ui_delete_project_post")
+async def delete_project_ui_post(
+    request: Request,
+    project_id_path: int,
+    db: Session = Depends(get_db),
+    current_user: auth_schemas.UserPublic = Depends(get_current_ui_user)
+):
+    if not current_user:
+        # ... (redirect về login) ...
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "warning", "message": "Please login to delete projects."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
+
+    logger.info(f"UI: User {current_user.email} attempting to delete project ID: {project_id_path}")
+    
+    # Gọi logic xóa project (bao gồm cả xóa webhook trên GitHub)
+    # Đây là nơi chúng ta có thể gọi API endpoint DELETE /api/projects/{project_id}
+    # Hoặc tái sử dụng logic xóa tương tự như trong API endpoint đó.
+    # Để đơn giản và tránh lặp code, chúng ta có thể gọi API bằng HTTP client nội bộ.
+    # Tuy nhiên, để giữ logic tập trung, có thể tạo một "service function" để cả API và UI route cùng gọi.
+
+    # Tạm thời, tái sử dụng logic tương tự như API endpoint:
+    project_to_delete_info = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
+
+    flash_messages = request.session.get("_flash_messages", [])
+
+    if not project_to_delete_info:
+        logger.warning(f"UI: Project ID {project_id_path} for deletion not found or not owned by user {current_user.email}.")
+        flash_messages.append({"category": "error", "message": "Project not found or you do not have permission."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    repo_name_hook_del = project_to_delete_info.repo_name
+    gh_webhook_id_hook_del = project_to_delete_info.github_webhook_id
+    user_gh_token: Optional[str] = None
+
+    if gh_webhook_id_hook_del:
+        user_db_for_token = db.query(User).filter(User.id == current_user.id).first()
+        if user_db_for_token and user_db_for_token.github_access_token_encrypted:
+            user_gh_token = decrypt_data(user_db_for_token.github_access_token_encrypted)
+        
+        if user_gh_token and repo_name_hook_del:
+            delete_gh_hook_url = f"https://api.github.com/repos/{repo_name_hook_del}/hooks/{gh_webhook_id_hook_del}"
+            gh_headers = {
+                "Authorization": f"token {user_gh_token}", 
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.delete(delete_gh_hook_url, headers=gh_headers)
+                    if response.status_code == 204:
+                        logger.info(f"UI: Successfully deleted GitHub webhook {gh_webhook_id_hook_del} for project '{repo_name_hook_del}'.")
+                    elif response.status_code == 404:
+                        logger.warning(f"UI: GitHub webhook {gh_webhook_id_hook_del} not found for project '{repo_name_hook_del}'.")
+                    else:
+                        logger.error(f"UI: Error deleting GitHub webhook {gh_webhook_id_hook_del} for '{repo_name_hook_del}': {response.status_code} - {response.text[:100]}")
+                        flash_messages.append({"category": "warning", "message": f"Could not delete webhook from GitHub (Code: {response.status_code}). Project deleted from NovaGuard."})
+            except Exception as e_ui_hook_del:
+                logger.exception(f"UI: Unexpected error deleting GitHub webhook for '{repo_name_hook_del}'.")
+                flash_messages.append({"category": "warning", "message": "Error contacting GitHub to delete webhook. Project deleted from NovaGuard."})
+        elif gh_webhook_id_hook_del:
+             flash_messages.append({"category": "info", "message": "Could not retrieve GitHub token to delete webhook. Project deleted from NovaGuard."})
+
+
+    # Xóa project khỏi DB NovaGuard
+    deleted_project = project_crud.delete_project(db=db, project_id=project_id_path, user_id=current_user.id)
+
+    if deleted_project:
+        logger.info(f"UI: Project ID {project_id_path} ('{deleted_project.repo_name}') deleted from DB by user {current_user.email}.")
+        # Chỉ thêm success message nếu không có warning nào về webhook được thêm trước đó
+        if not any(fm["category"] == "warning" for fm in flash_messages) and \
+           not any(fm["category"] == "error" for fm in flash_messages):
+            flash_messages.append({"category": "success", "message": f"Project '{deleted_project.repo_name}' and its associated data have been successfully deleted."})
+    else:
+        # Lỗi này không nên xảy ra nếu get_project_by_id ở trên thành công
+        flash_messages.append({"category": "error", "message": "An error occurred while trying to delete the project from NovaGuard."})
+    
+    request.session["_flash_messages"] = flash_messages
+    return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
 
 app.include_router(ui_pages_router)
 app.include_router(ui_auth_router)

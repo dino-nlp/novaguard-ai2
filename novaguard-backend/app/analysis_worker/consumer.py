@@ -1,20 +1,29 @@
 import json
 import logging
 import time
+import re
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker  # Đảm bảo import Session
 # from kafka import KafkaConsumer, KafkaError # KafkaConsumer, KafkaError được dùng trong hàm main_worker
+
+# Langchain imports
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser, OutputFixingParser # Thêm OutputFixingParser
+from langchain_ollama import ChatOllama
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal as AppSessionLocal
 from app.core.security import decrypt_data
 from app.models import User, Project, PRAnalysisRequest, PRAnalysisStatus, AnalysisFinding
-from app.webhook_service import crud_pr_analysis # Để update status PRAnalysisRequest
-from app.analysis_module import crud_finding, schemas_finding # CRUD và Schema cho Findings
+from app.webhook_service import crud_pr_analysis
+from app.analysis_module import crud_finding, schemas_finding as am_schemas 
 from app.common.github_client import GitHubAPIClient
-from app.llm_service import invoke_ollama, LLMServiceError
+
+# Import Pydantic models cho LLM output
+from .llm_schemas import LLMSingleFinding, LLMStructuredOutput
 
 # --- Logging Setup ---
 # logger đã được định nghĩa và cấu hình ở phần trước, sử dụng tên "AnalysisWorker"
@@ -27,6 +36,9 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO) # Hoặc DEBUG nếu cần chi tiết hơn
 # ---
+
+# Đường dẫn đến thư mục prompts
+PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # --- Database Session Management for Worker ---
 _worker_db_session_factory: Optional[sessionmaker] = None
@@ -164,112 +176,132 @@ def create_dynamic_project_context(
     logger.debug(f"Dynamic context created for PR ID {pr_model.id}. Title: {context['pr_title']}")
     return context
 
-async def run_deep_logic_bug_hunter_mvp1(context: Dict[str, Any], settings_obj) -> List[Dict[str, Any]]:
-    logger.info("Running DeepLogicBugHunterAI_MVP1 agent...")
-    
-    # --- Updated English Prompt ---
-    prompt_template = f"""
-You are an expert code reviewer focused on identifying potential logic errors, security vulnerabilities, and subtle issues in code.
-Project Language: {context.get("project_language", "Undefined")}
-Project-specific coding conventions or architectural notes (if any): {context.get("project_custom_notes", "None provided")}
+def load_prompt_template(template_name: str) -> str:
+    """Loads a prompt template from the prompts directory."""
+    prompt_file = PROMPT_DIR / template_name
+    if not prompt_file.exists():
+        logger.error(f"Prompt template file not found: {prompt_file}")
+        raise FileNotFoundError(f"Prompt template {template_name} not found.")
+    return prompt_file.read_text(encoding="utf-8")
 
-Pull Request Information:
-- Title: {context.get("pr_title", "N/A")}
-- Description: {context.get("pr_description", "N/A")}
-- Author: {context.get("pr_author", "N/A")}
-- Branch: {context.get("head_branch", "N/A")} -> {context.get("base_branch", "N/A")}
-
-Overall PR Diff (partial, if available):
-```diff
-{context.get("pr_diff_content", "No overall diff provided")}
-```
-
-Changed files and their content (or snippets):
-{context.get("formatted_changed_files_with_content", "No changed file content available.")}
-
-Based on ALL the provided information (PR description, overall diff, and full content of changed files), please perform a thorough analysis.
-Your main goal is to find:
-1. Potential logical errors (e.g., null pointer exceptions, incorrect condition handling, simple race conditions).
-2. Edge cases that might lead to errors.
-3. Code segments that could be improved in terms of logic, performance, or readability.
-4. Basic data safety issues (e.g., leaking sensitive information in logs).
-
-DO NOT comment on code style or minor issues that a linter can catch. Focus on MORE SIGNIFICANT and SUBTLE problems.
-
-For EACH distinct issue you identify, provide the information STRICTLY as a JSON OBJECT within a JSON LIST.
-Each JSON object MUST have the following fields:
-- "file_path": (string) The full path of the relevant file.
-- "line_start": (integer, optional) The starting line number of the relevant code segment in the file.
-- "line_end": (integer, optional) The ending line number of the relevant code segment.
-- "severity": (string) MUST be one of: "Error", "Warning", or "Note".
-- "message": (string) A clear, detailed description of the issue.
-- "suggestion": (string, optional) A suggestion on how to fix or improve the code.
-
-Example of the desired JSON output format:
-[
-  {{"file_path": "src/moduleA.py", "line_start": 25, "line_end": 28, "severity": "Warning", "message": "The variable 'x' might be None at line 27, potentially leading to a NullPointerException if its 'value' attribute is accessed without a prior check.", "suggestion": "Consider adding an 'if x is not None:' check before accessing x.value."}},
-  {{"file_path": "src/utils/calculator.js", "line_start": 102, "severity": "Error", "message": "The 'while(true)' loop at this location does not have a clear exit condition within its body, risking an infinite loop if internal logic doesn't guarantee a 'break'."}}
-]
-ONLY RETURN THE JSON LIST. Do NOT include any other explanatory text, greetings, or formatting outside of the JSON list itself. If no significant issues are found, return an empty JSON list: [].
+async def run_code_analysis_agent_v1(
+    dynamic_context: Dict[str, Any], # dynamic_context từ create_dynamic_project_context
+    settings_obj: Any # settings object từ get_settings()
+) -> List[am_schemas.AnalysisFindingCreate]: # Trả về list các schema để tạo finding trong DB
     """
-    
-    logger.debug(f"Prompt for LLM (first 500 chars): {prompt_template[:500]}...")
-    
+    Runs the DeepLogicBugHunterAI agent using Langchain.
+    """
+    logger.info(f"Running Langchain-based Code Analysis Agent for PR: {dynamic_context.get('pr_title', 'N/A')}")
+
     try:
-        llm_response_text = await invoke_ollama(
-            prompt=prompt_template, 
-            model_name=settings_obj.OLLAMA_DEFAULT_MODEL
+        # 1. Load Prompt Template
+        prompt_content = load_prompt_template("deep_logic_bug_hunter_v1.md")
+
+        # 2. Initialize LLM
+        # Bạn có thể dùng OllamaLLM (cho completion) hoặc ChatOllama (cho chat models)
+        # OllamaLLM có vẻ phù hợp hơn nếu prompt của bạn là một template text lớn.
+        llm = ChatOllama(
+            model=settings_obj.OLLAMA_DEFAULT_MODEL,
+            base_url=settings_obj.OLLAMA_BASE_URL,
+            temperature=0.2, # Điều chỉnh nhiệt độ để kết quả nhất quán hơn
+            # num_ctx=4096, # Tùy chỉnh context window nếu cần và model hỗ trợ
         )
-        logger.info("Received response from LLM.")
-        logger.debug(f"LLM raw response (first 500 chars): {llm_response_text[:500]}")
 
-        findings = []
-        try:
-            json_start = llm_response_text.find('[')
-            json_end = llm_response_text.rfind(']')
-            if json_start != -1 and json_end != -1 and json_end >= json_start:
-                json_str = llm_response_text[json_start : json_end+1]
-                logger.debug(f"Attempting to parse JSON string from LLM: {json_str}")
-                parsed_findings = json.loads(json_str)
-                if isinstance(parsed_findings, list):
-                    for pf_dict in parsed_findings:
-                        if isinstance(pf_dict, dict) and \
-                           all(k in pf_dict for k in ["file_path", "severity", "message"]) and \
-                           isinstance(pf_dict["file_path"], str) and \
-                           isinstance(pf_dict["severity"], str) and pf_dict["severity"] in ["Error", "Warning", "Note"] and \
-                           isinstance(pf_dict["message"], str):
-                            line_start = pf_dict.get("line_start")
-                            line_end = pf_dict.get("line_end")
-                            if line_start is not None and not isinstance(line_start, int): line_start = None
-                            if line_end is not None and not isinstance(line_end, int): line_end = None
-                            
-                            findings.append({
-                                "file_path": pf_dict["file_path"],
-                                "line_start": line_start, "line_end": line_end,
-                                "severity": pf_dict["severity"], "message": pf_dict["message"],
-                                "suggestion": pf_dict.get("suggestion") if isinstance(pf_dict.get("suggestion"), str) else None,
-                                "agent_name": "DeepLogicBugHunterAI_MVP1"
-                            })
-                        else:
-                            logger.warning(f"Skipping invalid finding structure from LLM: {pf_dict}")
-                else:
-                    logger.error(f"LLM response was valid JSON but not a list. Type: {type(parsed_findings)}. Content: {str(parsed_findings)[:500]}")
-            else:
-                logger.error(f"Could not find valid JSON list structure in LLM response. Snippet: {llm_response_text[:500]}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM response as JSON: {e}. Response snippet: {llm_response_text[:500]}")
-        except Exception as e_parse:
-            logger.exception(f"Unexpected error parsing LLM findings: {e_parse}. Response snippet: {llm_response_text[:500]}")
-
-        logger.info(f"Parsed {len(findings)} findings from LLM.")
-        return findings
+        # 3. Setup Output Parser
+        # Parser sẽ cố gắng parse output của LLM thành LLMStructuredOutput Pydantic model.
+        pydantic_parser = PydanticOutputParser(pydantic_object=LLMStructuredOutput)
         
-    except LLMServiceError as e_llm:
-        logger.error(f"LLMServiceError in DeepLogicBugHunterAI: {e_llm.message}, Details: {e_llm.details}")
-        raise
-    except Exception as e_unexpected:
-        logger.exception("Unexpected error in DeepLogicBugHunterAI.")
-        raise
+        # (Tùy chọn nhưng khuyến khích) OutputFixingParser để thử sửa lỗi JSON nếu LLM trả về không hoàn hảo
+        # Cần LLM để sửa lỗi, nên nó sẽ gọi LLM thêm một lần nếu parsing lỗi.
+        output_fixing_parser = OutputFixingParser.from_llm(parser=pydantic_parser, llm=llm)
+
+
+        # 4. Create PromptTemplate object
+        # Nó sẽ tự động lấy format_instructions từ parser.
+        prompt = PromptTemplate(
+            template=prompt_content,
+            input_variables=list(dynamic_context.keys()), # Các key trong dynamic_context
+            partial_variables={"format_instructions": pydantic_parser.get_format_instructions()}
+        )
+        logger.debug(f"Prompt to be sent (with format instructions):\n{prompt.template}")
+
+
+        # 5. Create Langchain Chain (LCEL - Langchain Expression Language)
+        # Chuỗi: format prompt -> gọi LLM -> parse output
+        chain = prompt | llm | output_fixing_parser # Sử dụng output_fixing_parser
+
+        # 6. Invoke Chain
+        logger.info(f"Invoking Langchain analysis chain for PR: {dynamic_context.get('pr_title', 'N/A')}")
+        # Truyền các giá trị thực tế từ dynamic_context vào chain
+        # Ví dụ: chain.invoke({"pr_title": "...", "project_language": "...", ...})
+        llm_response_structured: LLMStructuredOutput = await chain.ainvoke(dynamic_context)
+        
+        logger.info(f"Received structured response from Langchain chain for PR: {dynamic_context.get('pr_title', 'N/A')}. Number of findings: {len(llm_response_structured.findings)}")
+
+        # 7. Convert LLM findings to AnalysisFindingCreate schemas
+        analysis_findings_to_create: List[am_schemas.AnalysisFindingCreate] = []
+        if llm_response_structured and llm_response_structured.findings:
+            for llm_finding in llm_response_structured.findings:
+                # Trích xuất code snippet (logic này giữ nguyên hoặc cải tiến)
+                code_snippet_text = None
+                if llm_finding.file_path and llm_finding.line_start is not None:
+                    original_file_content = None
+                    # `dynamic_context` cần chứa `raw_pr_data_changed_files`
+                    # raw_pr_data_changed_files = dynamic_context.get("raw_pr_data_changed_files", [])
+                    # Đây là một thay đổi quan trọng: làm sao để có raw_pr_data_changed_files ở đây một cách hiệu quả.
+                    # Giả sử nó được truyền vào dynamic_context
+                    
+                    # Để truy cập file content, dynamic_context cần có thông tin này.
+                    # Giả sử dynamic_context["raw_pr_data_changed_files"] là list các dict {"filename": "path", "content": "text"}
+                    raw_changed_files = dynamic_context.get("raw_pr_data_changed_files", [])
+                    for file_detail in raw_changed_files:
+                        if file_detail.get("filename") == llm_finding.file_path:
+                            original_file_content = file_detail.get("content")
+                            break
+                    
+                    if original_file_content:
+                        lines = original_file_content.splitlines()
+                        actual_end_line = llm_finding.line_end if llm_finding.line_end is not None else llm_finding.line_start
+                        start_idx = max(0, llm_finding.line_start - 1)
+                        end_idx = min(len(lines), actual_end_line)
+                        if start_idx < end_idx:
+                            snippet_lines = lines[start_idx:end_idx]
+                            code_snippet_text = "\n".join(snippet_lines)
+                        else:
+                            logger.warning(f"Invalid line range for snippet: file {llm_finding.file_path}, L{llm_finding.line_start}-L{actual_end_line}")
+                    else:
+                        logger.warning(f"Could not find content for file {llm_finding.file_path} to extract snippet.")
+
+                # Map severity từ string (Error, Warning, Note) sang Enum nếu schema DB/Pydantic dùng Enum
+                # Ví dụ, nếu am_schemas.AnalysisFindingCreate.severity là Enum:
+                # severity_enum_val = am_schemas.SeverityLevel[llm_finding.severity.upper()] 
+                # (cần định nghĩa SeverityLevel Enum trong am_schemas)
+                # Nếu schema vẫn dùng string thì không cần chuyển.
+                # Schema hiện tại của bạn (AnalysisFindingBase) dùng `severity: str`.
+                
+                finding_for_db = am_schemas.AnalysisFindingCreate(
+                    file_path=llm_finding.file_path,
+                    line_start=llm_finding.line_start,
+                    line_end=llm_finding.line_end,
+                    severity=llm_finding.severity, # Giữ là string nếu schema là string
+                    message=llm_finding.message,
+                    suggestion=llm_finding.suggestion,
+                    agent_name="DeepLogicBugHunterAI_AgentV1_LC", # Cập nhật tên agent
+                    code_snippet=code_snippet_text
+                )
+                analysis_findings_to_create.append(finding_for_db)
+        
+        return analysis_findings_to_create
+
+    except FileNotFoundError as e_fnf:
+        logger.error(f"Prompt file error: {e_fnf}")
+        # Có thể raise lại hoặc trả về list rỗng tùy chiến lược xử lý lỗi
+        return []
+    except Exception as e:
+        logger.exception(f"Error during Langchain code analysis for PR {dynamic_context.get('pr_title', 'N/A')}: {e}")
+        # Có thể raise lại hoặc trả về list rỗng
+        return []
+    
 
 async def process_message_logic(message_value: dict, db: Session, settings_obj):
     pr_analysis_request_id = message_value.get("pr_analysis_request_id")
@@ -338,47 +370,50 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj):
         raw_pr_data = await fetch_pr_data_from_github(gh_client, owner, repo_slug, pr_number, head_sha_from_webhook)
         
         if raw_pr_data.get("pr_metadata"):
+            # ... (cập nhật db_pr_request với metadata từ GitHub) ...
             pr_meta = raw_pr_data["pr_metadata"]
             db_pr_request.pr_title = pr_meta.get("title", db_pr_request.pr_title)
             html_url_val = pr_meta.get("html_url")
             db_pr_request.pr_github_url = str(html_url_val) if html_url_val else db_pr_request.pr_github_url
         db_pr_request.head_sha = raw_pr_data.get("head_sha", db_pr_request.head_sha)
         db.commit()
-        db.refresh(db_pr_request) 
+        db.refresh(db_pr_request)
 
         crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.DATA_FETCHED)
         logger.info(f"PML: PR ID {pr_analysis_request_id} status updated to DATA_FETCHED. Preparing for LLM analysis.")
 
+        # Tạo dynamic_context
         dynamic_context = create_dynamic_project_context(raw_pr_data, db_project, db_pr_request)
+        # QUAN TRỌNG: Thêm raw_pr_data['changed_files'] vào context để agent có thể dùng để trích xuất snippet
+        dynamic_context["raw_pr_data_changed_files"] = raw_pr_data.get("changed_files", [])
         
-        logger.info(f"PML: Invoking LLM for PR ID {pr_analysis_request_id}...")
-        llm_findings_dicts = await run_deep_logic_bug_hunter_mvp1(dynamic_context, settings_obj)
+        logger.info(f"PML: Invoking Langchain-based analysis agent for PR ID {pr_analysis_request_id}...")
         
-        if llm_findings_dicts:
-            findings_to_create_schemas = []
-            for finding_dict in llm_findings_dicts:
-                try:
-                    # Validate và tạo schema object trước khi tạo DB object
-                    findings_to_create_schemas.append(schemas_finding.AnalysisFindingCreate(**finding_dict))
-                except Exception as e_pydantic: # Bắt lỗi validation của Pydantic
-                    logger.warning(f"PML: Invalid finding structure from LLM, skipping: {finding_dict}. Error: {e_pydantic}")
-            
-            if findings_to_create_schemas:
-                created_db_findings = crud_finding.create_analysis_findings(db, pr_analysis_request_id, findings_to_create_schemas)
-                logger.info(f"PML: Saved {len(created_db_findings)} findings from LLM for PR ID {pr_analysis_request_id}.")
-            else:
-                logger.info(f"PML: No valid findings to save after LLM processing for PR ID {pr_analysis_request_id}.")
+        # Gọi agent mới thay vì run_deep_logic_bug_hunter_mvp1 cũ
+        analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
+            dynamic_context=dynamic_context,
+            settings_obj=settings_obj
+        )
+        
+        if analysis_findings_create_schemas:
+            # crud_finding.create_analysis_findings nhận List[AnalysisFindingCreate]
+            created_db_findings = crud_finding.create_analysis_findings(
+                db, 
+                pr_analysis_request_id, 
+                analysis_findings_create_schemas # Đây là list các Pydantic model
+            )
+            logger.info(f"PML: Saved {len(created_db_findings)} findings from Langchain agent for PR ID {pr_analysis_request_id}.")
         else:
-            logger.info(f"PML: LLM returned no findings for PR ID {pr_analysis_request_id}.")
+            logger.info(f"PML: Langchain agent returned no findings for PR ID {pr_analysis_request_id}.")
 
         crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.COMPLETED)
-        logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED.")
+        logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
 
     except Exception as e:
-        error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id}: {type(e).__name__} - {str(e)}"
-        logger.exception(error_msg_detail) # Log full traceback để dễ debug
+        error_msg_detail = f"Error in process_message_logic (Langchain) for PR ID {pr_analysis_request_id}: {type(e).__name__} - {str(e)}"
+        logger.exception(error_msg_detail)
         try:
-            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020]) # Giới hạn độ dài
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020])
         except Exception as db_error:
             logger.error(f"PML: Additionally, failed to update PR ID {pr_analysis_request_id} status to FAILED: {db_error}")
 

@@ -422,61 +422,79 @@ async def update_existing_project(
     logger.info(f"Project ID {project_id} updated successfully by user {current_user.email}.")
     return updated_project_db
 
-
-@router.delete("/{project_id}", response_model=project_schemas_module.ProjectPublic) # Hoặc trả về status code 204 No Content
-async def delete_existing_project(
+@router.delete(
+    "/{project_id}", 
+    response_model=project_schemas_module.ProjectPublic, # Trả về thông tin project đã xóa
+    summary="Delete a project",
+    status_code=status.HTTP_200_OK # Hoặc 204 No Content nếu không trả về body
+)
+async def delete_existing_project_api( # Đổi tên hàm để rõ ràng là API
     project_id: int,
     db: Session = Depends(get_db),
     current_user: auth_schemas_module.UserPublic = Depends(get_current_active_user)
 ):
-    logger.info(f"User {current_user.email} (ID: {current_user.id}) attempting to delete project ID: {project_id}")
+    logger.info(f"API: User {current_user.email} (ID: {current_user.id}) attempting to delete project ID: {project_id}")
     
-    project_to_delete_db_info = crud_project.get_project_by_id(db, project_id, current_user.id) # Đổi tên biến
+    # 1. Lấy thông tin project và kiểm tra quyền sở hữu
+    # Hàm get_project_by_id đã kiểm tra user_id
+    project_to_delete_db = crud_project.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
     
-    if not project_to_delete_db_info:
-        logger.warning(f"Failed to delete project ID {project_id}: Not found or not owned by user {current_user.email}.")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found or not owned by user to delete")
+    if not project_to_delete_db:
+        logger.warning(f"API: Failed to delete project ID {project_id}. Not found or not owned by user {current_user.email}.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Project not found or you do not have permission to delete it."
+        )
 
-    github_token_for_delete: Optional[str] = None # Đổi tên biến
-    if project_to_delete_db_info.github_webhook_id:
-        db_user_for_token_del = db.query(User).filter(User.id == current_user.id).first() # Đổi tên biến
-        if db_user_for_token_del and db_user_for_token_del.github_access_token_encrypted:
-            github_token_for_delete = decrypt_data(db_user_for_token_del.github_access_token_encrypted)
+    # Lưu lại thông tin cần cho việc xóa webhook TRƯỚC KHI xóa project khỏi DB
+    repo_name_for_hook_deletion = project_to_delete_db.repo_name
+    github_webhook_id_for_deletion = project_to_delete_db.github_webhook_id
+    
+    # 2. Cố gắng xóa Webhook trên GitHub nếu có
+    github_token_for_delete_hook: Optional[str] = None
+    if github_webhook_id_for_deletion:
+        # Lấy token của user để gọi GitHub API
+        # Cần query User model đầy đủ từ current_user.id
+        user_db_for_token = db.query(User).filter(User.id == current_user.id).first()
+        if user_db_for_token and user_db_for_token.github_access_token_encrypted:
+            github_token_for_delete_hook = decrypt_data(user_db_for_token.github_access_token_encrypted)
+        
+        if github_token_for_delete_hook and repo_name_for_hook_deletion:
+            delete_hook_url = f"https://api.github.com/repos/{repo_name_for_hook_deletion}/hooks/{github_webhook_id_for_deletion}"
+            headers_gh_delete_hook = {
+                "Authorization": f"token {github_token_for_delete_hook}",
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                try:
+                    logger.info(f"API: Attempting to delete webhook ID {github_webhook_id_for_deletion} for project '{repo_name_for_hook_deletion}' on GitHub.")
+                    hook_delete_response = await client.delete(delete_hook_url, headers=headers_gh_delete_hook)
+                    
+                    if hook_delete_response.status_code == 204: # No Content - Success
+                        logger.info(f"API: Successfully deleted webhook {github_webhook_id_for_deletion} from GitHub for project '{repo_name_for_hook_deletion}'.")
+                    elif hook_delete_response.status_code == 404: # Not Found
+                        logger.warning(f"API: Webhook {github_webhook_id_for_deletion} not found on GitHub for project '{repo_name_for_hook_deletion}'. It might have been deleted manually or never existed with this ID.")
+                    else:
+                        # Log lỗi nhưng vẫn tiếp tục xóa project khỏi DB NovaGuard
+                        logger.error(f"API: GitHub API error when deleting webhook {github_webhook_id_for_deletion} for '{repo_name_for_hook_deletion}': {hook_delete_response.status_code} - {hook_delete_response.text[:200]}")
+                        # Không raise HTTPException ở đây để việc xóa project trong DB vẫn diễn ra
+                except Exception as e_gh_hook_delete:
+                    logger.exception(f"API: Unexpected error deleting GitHub webhook for '{repo_name_for_hook_deletion}'. Error: {e_gh_hook_delete}")
+        elif github_webhook_id_for_deletion: # Có webhook ID nhưng không lấy được token hoặc repo_name
+            logger.warning(f"API: Could not delete webhook {github_webhook_id_for_deletion} for project '{repo_name_for_hook_deletion}' due to missing GitHub token or repo name.")
 
-    deleted_project_obj = crud_project.delete_project(db=db, project_id=project_id, user_id=current_user.id) # Đổi tên biến
-
-    if deleted_project_obj and project_to_delete_db_info.github_webhook_id and github_token_for_delete:
-        logger.info(f"Attempting to delete webhook ID {project_to_delete_db_info.github_webhook_id} for project '{project_to_delete_db_info.repo_name}' on GitHub.")
-        delete_hook_url = f"https://api.github.com/repos/{project_to_delete_db_info.repo_name}/hooks/{project_to_delete_db_info.github_webhook_id}"
-        headers_gh_del = { # Đổi tên biến
-            "Authorization": f"token {github_token_for_delete}",
-            "Accept": "application/vnd.github.v3+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client: # Thêm timeout
-            try:
-                del_hook_response = await client.delete(delete_hook_url, headers=headers_gh_del)
-                if del_hook_response.status_code == 204:
-                    logger.info(f"Successfully deleted webhook {project_to_delete_db_info.github_webhook_id} from GitHub for project '{project_to_delete_db_info.repo_name}'.")
-                elif del_hook_response.status_code == 404:
-                    logger.warning(f"Webhook {project_to_delete_db_info.github_webhook_id} not found on GitHub for project '{project_to_delete_db_info.repo_name}'. It might have been deleted manually.")
-                else:
-                    del_hook_response.raise_for_status()
-            except httpx.HTTPStatusError as e_del_hook: # Đổi tên biến
-                logger.error(f"GitHub API error when deleting webhook {project_to_delete_db_info.github_webhook_id} for '{project_to_delete_db_info.repo_name}': {e_del_hook.response.status_code} - {e_del_hook.response.text[:200]}")
-            except Exception as e_unexp_del_hook: # Đổi tên biến
-                logger.exception(f"Unexpected error deleting GitHub webhook for '{project_to_delete_db_info.repo_name}'. Error: {e_unexp_del_hook}")
-    elif project_to_delete_db_info and project_to_delete_db_info.github_webhook_id and not github_token_for_delete:
-        logger.warning(f"Could not retrieve GitHub token for user {current_user.email}. Webhook {project_to_delete_db_info.github_webhook_id} for project '{project_to_delete_db_info.repo_name}' was not deleted from GitHub.")
-
-    logger.info(f"Project ID {project_id} (Name: '{deleted_project_obj.repo_name if deleted_project_obj else 'N/A'}') processing for deletion completed by user {current_user.email}.")
-    # Trả về thông tin project đã bị xóa
-    if deleted_project_obj:
-        return deleted_project_obj
+    # 3. Xóa project khỏi DB NovaGuard
+    deleted_project_from_db = crud_project.delete_project(db=db, project_id=project_id, user_id=current_user.id)
+    
+    # crud_project.delete_project sẽ trả về project đã xóa (trước khi commit)
+    # hoặc None nếu không tìm thấy (đã kiểm tra ở trên)
+    if deleted_project_from_db:
+        logger.info(f"API: Project ID {project_id} (Name: '{deleted_project_from_db.repo_name}') successfully deleted from NovaGuard DB by user {current_user.email}.")
+        # Trả về thông tin project vừa bị xóa
+        return project_schemas_module.ProjectPublic.from_orm(deleted_project_from_db)
     else:
-        # Điều này không nên xảy ra nếu get_project_by_id ở trên đã tìm thấy nó
-        # Trả về thông tin đã lấy trước khi xóa nếu crud_project.delete_project không trả về gì sau commit
-        # Hoặc raise lỗi nếu không muốn trả về dữ liệu "cũ"
-        logger.error(f"Project {project_id} was found but delete operation returned None. This is unexpected.")
-        # Để an toàn, trả về thông tin đã lấy trước đó, nhưng đây là dấu hiệu có thể có vấn đề
-        return project_to_delete_db_info
+        # Trường hợp này không nên xảy ra nếu logic ở trên đúng
+        logger.error(f"API: Project {project_id} was confirmed to exist but delete operation in DB returned None. This is unexpected.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error deleting project from database after initial checks.")
+

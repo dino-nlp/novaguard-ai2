@@ -1,0 +1,162 @@
+{% extends "layout/base.html" %} {# Đảm bảo layout của bạn tên là "base.html" hoặc tương tự #}
+
+{% block head_extra %}
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    {# Bạn có thể chọn theme khác của highlight.js nếu muốn, ví dụ: github.min.css #}
+    <style>
+        .finding-card {
+            border-left-width: 5px;
+            border-left-style: solid;
+            margin-bottom: 1.5rem; /* Tailwind: mb-6 */
+        }
+        /* Sử dụng class trực tiếp từ Tailwind nếu có thể, hoặc định nghĩa ở đây */
+        .finding-severity-error { border-left-color: #dc3545; /* Tailwind: border-red-600 */ }
+        .finding-severity-warning { border-left-color: #ffc107; /* Tailwind: border-yellow-500 */ }
+        .finding-severity-note { border-left-color: #0dcaf0; /* Tailwind: border-sky-500 */ }
+        .finding-severity-info { border-left-color: #6c757d; /* Tailwind: border-gray-500 */ }
+
+        .severity-badge-error { background-color: #dc3545 !important; color: white !important; }
+        .severity-badge-warning { background-color: #ffc107 !important; color: black !important; }
+        .severity-badge-note { background-color: #0dcaf0 !important; color: black !important; }
+        .severity-badge-info { background-color: #6c757d !important; color: white !important; }
+
+        pre code.hljs {
+            padding: 1em; /* Tailwind: p-4 */
+            border-radius: 0.375rem; /* Tailwind: rounded-md */
+            max-height: 400px;
+            overflow-y: auto;
+            /* background-color: #f8f9fa; /* Tailwind: bg-gray-50 (nếu theme HLJS không có bg) */
+        }
+        .finding-title {
+            font-size: 1.1rem; /* Tailwind: text-lg (gần bằng) */
+            font-weight: 600; /* Tailwind: font-semibold */
+        }
+    </style>
+{% endblock %}
+
+
+{% block content %}
+<div class="bg-white p-6 rounded-lg shadow-xl"> {# Tailwind: shadow-xl cho bóng đổ đẹp hơn #}
+    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 pb-4 border-b border-gray-200">
+        <div class="mb-3 sm:mb-0">
+            <h1 class="text-2xl font-semibold text-nv-dark">
+                PR Analysis Report
+            </h1>
+            <p class="text-sm text-gray-600">
+                Project: <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" class="text-nv-accent hover:underline">{{ project.repo_name }}</a>
+            </p>
+            <p class="text-lg font-medium text-gray-800 mt-1">
+                <a href="{{ pr_request_details.pr_github_url or '#' }}" target="_blank" class="hover:text-nv-accent hover:underline">
+                    {{ pr_request_details.pr_title or 'PR #' ~ pr_request_details.pr_number }}
+                </a>
+            </p>
+        </div>
+        <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" 
+           class="text-sm bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-2 px-4 rounded-md transition duration-150 self-start sm:self-center">
+            &larr; Back to Project
+        </a>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 text-sm">
+        <div class="bg-gray-50 p-3 rounded-md shadow-sm"><strong>Status:</strong> 
+            <span class="px-2 py-0.5 text-xs font-semibold rounded-full
+                {% if pr_request_details.status.value == 'completed' %} bg-green-100 text-green-700
+                {% elif pr_request_details.status.value == 'failed' %} bg-red-100 text-red-700
+                {% elif pr_request_details.status.value == 'processing' %} bg-yellow-100 text-yellow-700
+                {% elif pr_request_details.status.value == 'data_fetched' %} bg-blue-100 text-blue-700
+                {% else %} bg-gray-200 text-gray-700 {% endif %}">
+                {{ pr_request_details.status.value | capitalize }}
+            </span>
+        </div>
+        <div class="bg-gray-50 p-3 rounded-md shadow-sm"><strong>Commit SHA:</strong> 
+            <code class="text-xs">{{ pr_request_details.head_sha[:10] if pr_request_details.head_sha else 'N/A' }}</code>
+        </div>
+        <div class="bg-gray-50 p-3 rounded-md shadow-sm"><strong>Analyzed At:</strong> 
+            {{ pr_request_details.completed_at.strftime('%d %b %Y, %H:%M') if pr_request_details.completed_at else (pr_request_details.requested_at.strftime('%d %b %Y, %H:%M') if pr_request_details.requested_at else 'N/A') }}
+        </div>
+    </div>
+
+     {% if pr_request_details.error_message %}
+        <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded-md" role="alert">
+            <p class="font-bold">Analysis Error Encountered</p>
+            <p>{{ pr_request_details.error_message }}</p>
+        </div>
+    {% endif %}
+
+    <h2 class="text-xl font-semibold text-nv-dark mt-8 mb-5">Findings ({{ findings | length }})</h2>
+    
+    {% if findings %}
+        {% for finding in findings %}
+        <div class="finding-card finding-severity-{{ finding.severity | lower }} bg-white border border-gray-200 rounded-lg shadow-md mb-6">
+            <div class="p-4 border-b border-gray-200 flex justify-between items-center">
+                {# Giả sử message chứa title hoặc message chính của finding #}
+                <span class="finding-title text-gray-800">{{ finding.message | truncate(80, True) }}</span>
+                <span class="severity-badge-{{ finding.severity | lower }} px-2.5 py-1 text-xs font-bold rounded-full">
+                    {{ finding.severity | capitalize }}
+                </span>
+            </div>
+            <div class="p-4 space-y-3 text-sm">
+                <p><strong>File:</strong> <code class="text-nv-med-dark bg-gray-100 px-1.5 py-0.5 rounded-md text-xs">{{ finding.file_path }}</code>
+                   {% if finding.line_start %}
+                     <span class="text-gray-500 ml-1">(Line{{ "s" if finding.line_end and finding.line_start != finding.line_end else "" }}
+                     {{ finding.line_start }}{% if finding.line_end and finding.line_start != finding.line_end %}-{{ finding.line_end }}{% endif %})</span>
+                   {% endif %}
+                </p>
+                
+                <div>
+                    <p class="font-semibold text-gray-700">Agent:</p>
+                    <p class="text-gray-600">{{ finding.agent_name or "NovaGuard Analysis Agent" }}</p>
+                </div>
+
+                <div>
+                    <p class="font-semibold text-gray-700">Full Description:</p>
+                    <p class="text-gray-600 whitespace-pre-wrap">{{ finding.message }}</p>
+                </div>
+                
+                {% if finding.suggestion %}
+                <div class="mt-2">
+                    <p class="font-semibold text-gray-700">Suggestion:</p>
+                    <p class="text-gray-600 whitespace-pre-wrap">{{ finding.suggestion }}</p>
+                </div>
+                {% endif %}
+
+                {% if finding.code_snippet %}
+                <div class="mt-3">
+                    <p class="font-semibold text-gray-700 mb-1">Relevant Code Snippet:</p>
+                    {# Thêm class cho ngôn ngữ nếu có, ví dụ 'language-python' #}
+                    {% set lang = finding.file_path.split('.')[-1] if '.' in finding.file_path else 'plaintext' %}
+                    <pre class="rounded-md"><code class="language-{{ lang }} hljs">{{- finding.code_snippet -}}</code></pre>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="bg-sky-50 border-l-4 border-sky-400 text-sky-700 p-4 rounded-md" role="alert">
+            <p class="font-bold">No Findings Reported</p>
+            {% if pr_request_details.status.value == 'completed' %}
+            <p>It appears NovaGuard didn't identify any specific issues in this Pull Request during the analysis. Well done!</p>
+            {% elif pr_request_details.status.value == 'pending' or pr_request_details.status.value == 'processing' or pr_request_details.status.value == 'data_fetched' %}
+            <p>The analysis is currently in progress, or data is being fetched. Please check back again shortly for results.</p>
+            {% elif pr_request_details.status.value == 'failed' %}
+             <p>The analysis failed to complete. Please check the error message above or contact support if the issue persists.</p>
+            {% endif %}
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts_extra %}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    {# Tải thêm các ngôn ngữ cụ thể nếu cần thiết cho highlight.js #}
+    {# Ví dụ: <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script> #}
+    <script>
+    document.addEventListener('DOMContentLoaded', (event) => {
+        // Khởi tạo highlight.js cho tất cả các block code có class 'hljs'
+        // Hoặc bạn có thể dùng selector cụ thể hơn: document.querySelectorAll('pre code[class^="language-"]')
+        document.querySelectorAll('pre code.hljs').forEach((el) => {
+            hljs.highlightElement(el);
+        });
+    });
+    </script>
+{% endblock %}

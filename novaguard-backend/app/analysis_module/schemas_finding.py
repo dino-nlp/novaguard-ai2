@@ -14,6 +14,7 @@ class AnalysisFindingBase(BaseModel):
     message: str
     suggestion: Optional[str] = None
     agent_name: Optional[str] = Field(None, max_length=100)
+    code_snippet: Optional[str] = None
 
 class AnalysisFindingCreate(AnalysisFindingBase):
     pass

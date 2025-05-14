@@ -11,3 +11,10 @@ kafka-python
 jinja2
 python-multipart # Đã có, nhưng cần cho form HTML
 itsdangerous
+
+langchain
+langchain-core
+langchain-community
+langchain-ollama # Để làm việc với Ollama
+# langgraph (nếu bạn muốn sử dụng ngay, nhưng có thể thêm sau khi có nhiều agent)
+# PyYAML (nếu bạn định dùng file prompt YAML, cho .txt thì không cần)

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS AnalysisFindings (
     message TEXT NOT NULL, -- Mô tả vấn đề
     suggestion TEXT, -- Gợi ý sửa lỗi (từ LLM)
     agent_name VARCHAR(100), -- Tên của Agent đã tạo ra phát hiện này (ví dụ: 'DeepLogicBugHunterAI_MVP1')
+    code_snippet TEXT,
     user_feedback VARCHAR(50), -- Phản hồi từ người dùng (ví dụ: 'Helpful', 'NotHelpful', 'Ignore') - tùy chọn MVP1
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );

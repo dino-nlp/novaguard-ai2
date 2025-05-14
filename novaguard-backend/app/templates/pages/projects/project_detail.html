@@ -73,8 +73,8 @@
                         </td>
                         <td class="py-2 px-3 text-sm text-gray-700">{{ req.requested_at.strftime('%Y-%m-%d %H:%M') if req.requested_at else 'N/A' }}</td>
                         <td class="py-2 px-3 text-sm">
-                            <a href="{{ url_for('ui_pr_report_get', request_id=req.id) }}" 
-                               class="text-white bg-nv-accent hover:bg-nv-accent-dark font-medium rounded-md text-xs px-3 py-1.5 text-center transition duration-150">
+                            <a href="{{ url_for('ui_pr_report_get', request_id_param=req.id) }}"
+                            class="text-white bg-nv-accent hover:bg-nv-accent-dark font-medium rounded-md text-xs px-3 py-1.5 text-center transition duration-150">
                                 View Report
                             </a>
                         </td>

@@ -130,3 +130,12 @@ cat novaguard-backend/database/schema.sql | docker-compose exec -T postgres_db p
     * `novaguard_analysis_worker`: Có nhận được task từ Kafka không.
 
 ---
+
+## Cách lấy thông tin Github repository
+
+```bash
+curl -L \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/dino-nlp/novaguard-test-project
+```
