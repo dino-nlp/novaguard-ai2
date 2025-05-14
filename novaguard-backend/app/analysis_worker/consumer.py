@@ -438,6 +438,76 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj):
 
         crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.COMPLETED)
         logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
+        
+        if db_pr_request.status == PRAnalysisStatus.COMPLETED:
+            logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED. Attempting to post summary comment to GitHub.")
+
+            # Lấy GitHub token (đã có logic ở phần fetch data)
+            # github_token đã được giải mã ở trên
+            if github_token and settings_obj.NOVAGUARD_PUBLIC_URL: # NOVAGUARD_PUBLIC_URL cần để tạo link báo cáo
+                try:
+                    gh_client_for_comment = GitHubAPIClient(token=github_token)
+
+                    num_errors = 0
+                    num_warnings = 0
+                    # Giả sử bạn đã query lại các findings từ DB hoặc có chúng từ `created_db_findings`
+                    # Nếu không, bạn cần query lại:
+                    # all_findings_for_pr = crud_finding.get_findings_by_request_id(db, pr_analysis_request_id)
+                    # Thay vì query lại, tốt hơn là dùng kết quả từ `created_db_findings` nếu có
+
+                    # Lấy lại findings từ DB để đảm bảo có ID chính xác (nếu created_db_findings không đầy đủ)
+                    # Hoặc bạn có thể dùng `analysis_findings_create_schemas` để đếm trước khi lưu DB
+
+                    # Để đơn giản, giả sử `analysis_findings_create_schemas` phản ánh đúng những gì sẽ được lưu
+                    for finding_schema in analysis_findings_create_schemas: # Hoặc lặp qua created_db_findings
+                        if finding_schema.severity.lower() == 'error':
+                            num_errors += 1
+                        elif finding_schema.severity.lower() == 'warning':
+                            num_warnings += 1
+
+                    report_url = f"{settings_obj.NOVAGUARD_PUBLIC_URL.rstrip('/')}/ui/reports/pr-analysis/{pr_analysis_request_id}/report"
+
+                    comment_body = f"### NovaGuard AI Analysis Report 🤖\n\n"
+                    comment_body += f"NovaGuard AI has completed the analysis for this Pull Request.\n\n"
+                    if num_errors == 0 and num_warnings == 0 and not analysis_findings_create_schemas:
+                        comment_body += f"✅ No significant issues found.\n\n"
+                    else:
+                        comment_body += f"🔍 **Summary:**\n"
+                        if num_errors > 0:
+                            comment_body += f"  - **{num_errors} Error(s)** found.\n"
+                        if num_warnings > 0:
+                            comment_body += f"  - **{num_warnings} Warning(s)** found.\n"
+                        other_findings_count = len(analysis_findings_create_schemas) - num_errors - num_warnings
+                        if other_findings_count > 0:
+                            comment_body += f"  - **{other_findings_count} Note/Info item(s)** found.\n"
+                        comment_body += f"\n"
+
+                    comment_body += f"👉 [**View Full Report on NovaGuard AI**]({report_url})\n\n"
+                    comment_body += f"---\n*Powered by NovaGuard AI*"
+
+                    # owner, repo_slug từ db_project.repo_name
+                    if '/' not in db_project.repo_name:
+                        logger.error(f"Cannot post comment: Invalid project repo_name format: {db_project.repo_name}")
+                    else:
+                        owner_for_comment, repo_slug_for_comment = db_project.repo_name.split('/', 1)
+                        pr_number_for_comment = db_pr_request.pr_number
+
+                        comment_response = await gh_client_for_comment.create_pr_comment(
+                            owner=owner_for_comment,
+                            repo=repo_slug_for_comment,
+                            pr_number=pr_number_for_comment,
+                            body=comment_body
+                        )
+                        if comment_response and comment_response.get("id"):
+                            logger.info(f"Successfully posted summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}. Comment ID: {comment_response.get('id')}")
+                        else:
+                            logger.error(f"Failed to post summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}.")
+                except Exception as e_comment:
+                    logger.exception(f"Error attempting to post comment to GitHub for PR ID {pr_analysis_request_id}: {e_comment}")
+            elif not settings_obj.NOVAGUARD_PUBLIC_URL:
+                logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: NOVAGUARD_PUBLIC_URL is not set.")
+            elif not github_token:
+                logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: GitHub token is missing or could not be decrypted.")
 
     except Exception as e:
         error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id} (Provider: {settings_obj.DEFAULT_LLM_PROVIDER}): {type(e).__name__} - {str(e)}"

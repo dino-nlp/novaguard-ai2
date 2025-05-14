@@ -119,6 +119,23 @@ class GitHubAPIClient:
                 return all_files if all_files else None
         return all_files
 
+    async def create_pr_comment(
+        self, owner: str, repo: str, pr_number: int, body: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Tạo một comment trên một Pull Request (thông qua API Issues).
+        pr_number ở đây là issue_number.
+        """
+        # PRs là Issues, nên chúng ta dùng issue_number (chính là pr_number)
+        url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/issues/{pr_number}/comments"
+        payload = {"body": body}
+        logger.info(f"Attempting to create comment on PR {owner}/{repo}#{pr_number}")
+        try:
+            response = await self._request("POST", url, json=payload) # Sử dụng default_json_headers
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to create comment on PR {owner}/{repo}#{pr_number}: {e}")
+            return None
 
     async def get_file_content(self, owner: str, repo: str, file_path: str, ref: Optional[str] = None) -> Optional[str]:
         """
