@@ -1,0 +1,76 @@
+{% extends "layout/base.html" %}
+
+{% block content %}
+<div class="bg-white p-6 md:p-8 rounded-lg shadow-xl max-w-2xl mx-auto">
+    <h1 class="text-2xl font-semibold text-nv-dark mb-2">Project Settings</h1>
+    <p class="text-sm text-gray-600 mb-6 border-b pb-4">Editing: <strong class="text-nv-dark">{{ project.repo_name }}</strong></p>
+
+    <form action="{{ url_for('ui_project_settings_post', project_id=project.id) }}" method="post" class="space-y-6">
+        <div>
+            <label for="repo_name" class="block text-sm font-medium text-gray-700">
+                Repository Name 
+                <span class="text-xs text-gray-500">(Format: `owner/repository-name`)</span>
+            </label>
+            <input type="text" name="repo_name" id="repo_name" 
+                   value="{{ project.repo_name }}" required
+                   class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm 
+                          {% if True %} bg-gray-100 cursor-not-allowed {% endif %}" readonly 
+                   title="Repository Name cannot be changed after creation for now.">
+             <p class="mt-1 text-xs text-gray-500">Currently, repository name (owner/repo) cannot be changed after project creation to maintain webhook integrity.</p>
+        </div>
+
+        <div>
+            <label for="main_branch" class="block text-sm font-medium text-gray-700">Main Branch</label>
+            <input type="text" name="main_branch" id="main_branch" 
+                   value="{{ project.main_branch }}" required
+                   class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+
+        <div>
+            <label for="language" class="block text-sm font-medium text-gray-700">Primary Language (Optional)</label>
+            <input type="text" name="language" id="language" 
+                   value="{{ project.language or '' }}"
+                   placeholder="e.g., Python, JavaScript"
+                   class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+
+        <div>
+            <label for="custom_project_notes" class="block text-sm font-medium text-gray-700">Custom Project Notes (Optional)</label>
+            <textarea name="custom_project_notes" id="custom_project_notes" rows="4"
+                      placeholder="Coding conventions, architectural guidelines for LLM analysis..."
+                      class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">{{ project.custom_project_notes or '' }}</textarea>
+        </div>
+
+        <div class="pt-4 flex justify-between items-center">
+             <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" 
+               class="text-sm text-nv-accent hover:underline">
+                &larr; Back to Project Details
+            </a>
+            <div>
+                <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" class="mr-3 py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 hover:bg-gray-50">
+                    Cancel
+                </a>
+                <button type="submit"
+                        class="py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-nv-accent hover:bg-nv-accent-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-nv-accent-dark">
+                    Save Changes
+                </button>
+            </div>
+        </div>
+    </form>
+    <hr class="my-8 border-gray-300">
+
+    <div class="mt-8 p-4 border border-red-300 rounded-md bg-red-50">
+        <h3 class="text-lg font-semibold text-red-700 mb-2">Danger Zone</h3>
+        <p class="text-sm text-red-600 mb-3">
+            Deleting this project will remove all its associated data from NovaGuard, including analysis history. 
+            This action cannot be undone. We will also attempt to remove the webhook from your GitHub repository.
+        </p>
+        <form action="{{ url_for('ui_delete_project_post', project_id_path=project.id) }}" method="post" onsubmit="return confirm('Are you absolutely sure you want to delete this project? This action cannot be undone.');">
+            <button type="submit"
+                    class="w-full sm:w-auto bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                Delete This Project
+            </button>
+        </form>
+    </div>
+</div>
+{% endblock %}

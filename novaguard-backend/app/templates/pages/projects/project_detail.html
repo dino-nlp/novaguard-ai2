@@ -1,0 +1,94 @@
+{% extends "layout/base.html" %}
+
+{% block content %}
+<div class="bg-white p-6 rounded-lg shadow">
+    <div class="flex justify-between items-center mb-6 pb-4 border-b">
+        <div>
+            <h1 class="text-2xl font-semibold text-nv-dark">Project: {{ project.repo_name }}</h1>
+            <p class="text-sm text-gray-500">ID: {{ project.id }}</p>
+        </div>
+        <div>
+            <a href="{{ url_for('ui_project_settings_get', project_id=project.id) }}"
+               class="bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold py-2 px-4 rounded text-sm transition duration-150">
+                Project Settings
+            </a>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+        <div>
+            <h3 class="text-md font-semibold text-nv-dark mb-1">Repository Details</h3>
+            <p class="text-sm text-gray-700"><strong>Full Name:</strong> {{ project.repo_name }}</p>
+            <p class="text-sm text-gray-700"><strong>GitHub Repo ID:</strong> {{ project.github_repo_id }}</p>
+            <p class="text-sm text-gray-700"><strong>Main Branch:</strong> {{ project.main_branch }}</p>
+            <p class="text-sm text-gray-700"><strong>Language:</strong> {{ project.language or 'Not set' }}</p>
+            <p class="text-sm text-gray-700"><strong>GitHub Webhook ID:</strong> {{ project.github_webhook_id or 'Not set' }}</p>
+        </div>
+        <div>
+            <h3 class="text-md font-semibold text-nv-dark mb-1">NovaGuard Details</h3>
+            <p class="text-sm text-gray-700"><strong>Added on:</strong> {{ project.created_at.strftime('%Y-%m-%d %H:%M') if project.created_at else 'N/A' }}</p>
+            <p class="text-sm text-gray-700"><strong>Last Updated:</strong> {{ project.updated_at.strftime('%Y-%m-%d %H:%M') if project.updated_at else 'N/A' }}</p>
+            {% if project.custom_project_notes %}
+            <h4 class="text-sm font-semibold text-nv-dark mt-3 mb-1">Custom Project Notes:</h4>
+            <p class="text-sm text-gray-700 bg-gray-50 p-2 rounded border max-h-28 overflow-y-auto custom-scrollbar">{{ project.custom_project_notes }}</p>
+            {% else %}
+            <p class="text-sm text-gray-500 mt-3 italic">No custom project notes provided.</p>
+            {% endif %}
+        </div>
+    </div>
+
+    <hr class="my-6">
+
+    <h2 class="text-xl font-semibold text-nv-dark mb-3">Pull Request Analysis History</h2>
+    {% if pr_analysis_requests and pr_analysis_requests|length > 0 %}
+        <div class="overflow-x-auto">
+            <table class="min-w-full bg-white border">
+                <thead class="bg-gray-100">
+                    <tr>
+                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">PR #</th>
+                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Title</th>
+                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Status</th>
+                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Requested At</th>
+                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-200">
+                    {% for req in pr_analysis_requests %}
+                    <tr>
+                        <td class="py-2 px-3 text-sm text-gray-700">{{ req.pr_number }}</td>
+                        <td class="py-2 px-3 text-sm text-gray-700">
+                            <a href="{{ req.pr_github_url or '#' }}" target="_blank" class="hover:text-nv-accent hover:underline" title="View PR on GitHub">
+                                {{ req.pr_title or 'N/A' }}
+                            </a>
+                        </td>
+                        <td class="py-2 px-3 text-sm">
+                            <span class="px-2 py-1 text-xs font-semibold rounded-full
+                                {% if req.status.value == 'completed' %} bg-green-100 text-green-700
+                                {% elif req.status.value == 'failed' %} bg-red-100 text-red-700
+                                {% elif req.status.value == 'processing' %} bg-yellow-100 text-yellow-700
+                                {% elif req.status.value == 'data_fetched' %} bg-blue-100 text-blue-700
+                                {% else %} bg-gray-100 text-gray-700 {% endif %}">
+                                {{ req.status.value | capitalize }}
+                            </span>
+                        </td>
+                        <td class="py-2 px-3 text-sm text-gray-700">{{ req.requested_at.strftime('%Y-%m-%d %H:%M') if req.requested_at else 'N/A' }}</td>
+                        <td class="py-2 px-3 text-sm">
+                            <a href="{{ url_for('ui_pr_report_get', request_id_param=req.id) }}"
+                            class="text-white bg-nv-accent hover:bg-nv-accent-dark font-medium rounded-md text-xs px-3 py-1.5 text-center transition duration-150">
+                                View Report
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <p class="text-gray-600">No Pull Request analysis history found for this project yet.</p>
+    {% endif %}
+
+    <div class="mt-8 text-center">
+        <a href="{{ url_for('ui_dashboard_get') }}" class="text-nv-accent hover:underline">&larr; Back to Dashboard</a>
+    </div>
+</div>
+{% endblock %}

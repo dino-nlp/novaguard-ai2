@@ -1,0 +1,104 @@
+{% extends "layout/base.html" %}
+
+{% block content %}
+<div class="bg-white p-6 rounded-lg shadow">
+    <h1 class="text-2xl font-semibold text-nv-dark mb-4">Dashboard</h1>
+    {% if current_user %}
+        <p class="mb-6 text-gray-700">Welcome back, <strong class="text-nv-dark">{{ current_user.email }}</strong>!</p>
+        
+        <div class="mb-6 space-x-0 space-y-3 sm:space-y-0 sm:space-x-4 flex flex-col sm:flex-row">
+            <a href="{{ url_for('ui_add_project_get') }}" class="w-full sm:w-auto bg-nv-accent hover:bg-nv-accent-dark text-white font-bold py-2 px-4 rounded transition duration-150 text-center">
+                Add New Project Manually
+            </a>
+            {% if not github_connected %}
+            <a href="{{ url_for('api_github_oauth_redirect') }}" class="w-full sm:w-auto bg-gray-700 hover:bg-gray-800 text-white font-bold py-2 px-4 rounded transition duration-150 text-center">
+                Connect GitHub Account
+            </a>
+            {% else %}
+            <a href="{{ url_for('api_github_oauth_redirect') }}" class="w-full sm:w-auto bg-gray-600 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded transition duration-150 text-center">
+                Reconnect/Refresh GitHub Account
+            </a>
+            {% endif %}
+        </div>
+
+        <h2 class="text-xl font-semibold text-nv-dark mb-3">Your Projects in NovaGuard</h2>
+        {% if projects and projects|length > 0 %}
+            <ul class="space-y-3">
+                {% for project in projects %}
+                    <li class="p-4 bg-gray-50 rounded shadow hover:shadow-md transition-shadow">
+                        <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" class="font-semibold text-nv-accent hover:underline">{{ project.repo_name }}</a>
+                        <p class="text-sm text-gray-600">Main Branch: {{ project.main_branch }}</p>
+                        <p class="text-sm text-gray-600">Language: {{ project.language or 'Not set' }}</p>
+                    </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <p class="text-gray-600">You haven't added any projects to NovaGuard yet.
+                {% if github_connected %}
+                    Consider adding from your GitHub repositories below or
+                {% endif %}
+                <a href="{{ url_for('ui_add_project_get') }}" class="text-nv-accent hover:underline">add one manually</a>.
+            </p>
+        {% endif %}
+
+        {% if github_connected %}
+        <div class="mt-10 pt-6 border-t">
+            <h2 class="text-xl font-semibold text-nv-dark mb-3">Available GitHub Repositories</h2>
+            {% if available_github_repos and available_github_repos|length > 0 %}
+                <p class="text-sm text-gray-600 mb-4">
+                    Select a repository to add it to NovaGuard for analysis. Only repositories not yet in NovaGuard are listed.
+                </p>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {% for repo in available_github_repos %}
+                    <div class="p-4 border rounded-lg shadow-sm hover:shadow-md transition-shadow flex flex-col justify-between bg-white">
+                        <div>
+                            <h3 class="font-semibold text-nv-dark break-all">
+                                <a href="{{ repo.html_url }}" target="_blank" class="hover:text-nv-accent hover:underline" title="View on GitHub">
+                                    {{ repo.full_name }}
+                                    {% if repo.private %}
+                                        <span class="ml-2 text-xs bg-gray-200 text-gray-700 px-1.5 py-0.5 rounded-full align-middle">Private</span>
+                                    {% endif %}
+                                </a>
+                            </h3>
+                            {% if repo.description %}
+                                <p class="text-sm text-gray-600 mt-1 mb-2 h-10 overflow-y-auto custom-scrollbar">{{ repo.description }}</p>
+                            {% else %}
+                                <p class="text-sm text-gray-500 mt-1 mb-2 h-10 italic">No description provided.</p>
+                            {% endif %}
+                            <p class="text-xs text-gray-500 mt-1">Default branch: <strong class="text-gray-700">{{ repo.default_branch or 'N/A' }}</strong></p>
+                            <p class="text-xs text-gray-500">Last updated: {{ repo.updated_at.strftime('%Y-%m-%d %H:%M') if repo.updated_at else 'N/A' }}</p>
+                        </div>
+                        <div class="mt-3 text-right">
+                            {# --- WORKAROUND: Xây dựng URL thủ công --- #}
+                            {% set base_add_url = url_for('ui_add_project_get') %} {# Lấy path gốc #}
+                            {% set repo_id_str = repo.id | string %}
+                            {% set repo_name_encoded = repo.full_name | urlencode %}
+                            {% set main_branch_encoded = (repo.default_branch or 'main') | urlencode %}
+                            {% set final_add_url = base_add_url ~ "?gh_repo_id=" ~ repo_id_str ~ "&gh_repo_name=" ~ repo_name_encoded ~ "&gh_main_branch=" ~ main_branch_encoded %}
+                            <a href="{{ final_add_url }}"
+                               class="inline-block bg-nv-accent hover:bg-nv-accent-dark text-white font-semibold py-1.5 px-3 rounded text-sm transition duration-150">
+                                Add to NovaGuard
+                            </a>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            {% elif github_connected %} 
+                <p class="text-gray-600">
+                    All your accessible GitHub repositories appear to be already added to NovaGuard, or no new repositories were found for your account. You can <a href="{{ url_for('api_github_oauth_redirect') }}" class="text-nv-accent hover:underline">refresh your GitHub connection</a> or check your repositories on GitHub.
+                </p>
+            {% endif %}
+        </div>
+        {% endif %}
+
+    {% else %}
+        <p>Please <a href="{{ url_for('ui_login_get') }}" class="text-nv-accent hover:underline">login</a> to view your dashboard.</p>
+    {% endif %}
+</div>
+<style>
+    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #aaa; }
+</style>
+{% endblock %}

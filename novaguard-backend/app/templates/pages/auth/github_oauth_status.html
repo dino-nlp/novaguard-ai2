@@ -1,0 +1,25 @@
+{% extends "layout/base.html" %}
+
+    {% block content %}
+    <div class="bg-white p-8 rounded-lg shadow-lg text-center">
+        <h1 class="text-3xl font-bold text-nv-dark mb-6">{{ page_title }}</h1>
+        {% if success %}
+            <p class="text-green-600 text-lg mb-4">{{ message }}</p>
+            <p class="text-sm">You will be redirected shortly...</p>
+            {% if token_for_js %}
+            <script>
+                // This is if frontend JS needs to pick up the token.
+                // For server-side sessions, this might not be directly used this way.
+                // localStorage.setItem('novaGuardApiToken', '{{ token_for_js }}');
+                // window.location.href = "{{ url_for('ui_dashboard_get') }}";
+                setTimeout(function() {
+                    window.location.href = "{{ url_for('ui_dashboard_get') }}";
+                }, 2000); // Redirect after 2 seconds
+            </script>
+            {% endif %}
+        {% else %}
+            <p class="text-red-600 text-lg mb-4">{{ message }}</p>
+            <p><a href="{{ url_for('ui_home') }}" class="text-nv-accent hover:underline">Return to Home</a></p>
+        {% endif %}
+    </div>
+    {% endblock %}

@@ -62,6 +62,8 @@ services:
     container_name: novaguard_ollama_docker
     ports:
       - "11435:11434" # Map cổng 11435 của host tới cổng 11434 của container
+    env_file:
+      - .env
     volumes:
       - ollama_docker_data:/root/.ollama # Sử dụng volume đã đổi tên
     networks:
@@ -92,11 +94,12 @@ services:
       - ./novaguard-backend/app:/app/app # Mount code để live reload khi dev
                                       # Đường dẫn đầu tiên là trên host, thứ hai là trong container
                                       # Đảm bảo đường dẫn trong container khớp với nơi code được COPY trong Dockerfile
+    env_file:
+      - .env
     environment:
       DATABASE_URL: "postgresql://novaguard_user:novaguard_password@postgres_db:5432/novaguard_db"
       # KAFKA_BOOTSTRAP_SERVERS: "kafka:29092" # Sẽ dùng sau
       OLLAMA_BASE_URL: "http://ollama:11434" # Service ollama trong cùng network
-      SECRET_KEY: "your-super-secret-key-please-change-this" # Nên đặt giá trị thực ở đây hoặc env file
       ACCESS_TOKEN_EXPIRE_MINUTES: "1440" # ví dụ 1 ngày
       # Thêm các biến môi trường khác nếu cần
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
@@ -120,6 +123,8 @@ services:
         condition: service_healthy
     volumes: # Mount code để có thể cập nhật worker mà không cần rebuild image (cho dev)
       - ./novaguard-backend/app:/app/app # Giống như API service
+    env_file:
+      - .env
     environment:
       DATABASE_URL: "postgresql://novaguard_user:novaguard_password@postgres_db:5432/novaguard_db"
       KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"

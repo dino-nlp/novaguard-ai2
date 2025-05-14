@@ -1,0 +1,26 @@
+{% extends "layout/base.html" %}
+
+{% block content %}
+<div class="bg-white p-8 rounded-lg shadow-lg text-center">
+    <h1 class="text-4xl font-bold mb-6 text-nv-dark">Welcome to NovaGuard-AI!</h1>
+    <p class="text-lg text-gray-700 mb-8">
+        The Intelligent and In-depth Code Analysis Platform, designed to elevate your code quality and development efficiency.
+    </p>
+    {% if not current_user %}
+    <div class="space-x-4">
+        <a href="{{ url_for('ui_login_get') }}" 
+           class="bg-nv-accent hover:bg-nv-accent-dark text-white font-semibold py-3 px-6 rounded-lg shadow-md transition duration-150 ease-in-out">
+            Login
+        </a>
+        <a href="{{ url_for('ui_register_get') }}" 
+           class="bg-green-500 hover:bg-green-600 text-white font-semibold py-3 px-6 rounded-lg shadow-md transition duration-150 ease-in-out">
+            Register Now
+        </a>
+    </div>
+    {% else %}
+    <p class="text-lg text-gray-700 mb-8">
+        You are logged in. Go to your <a href="{{ url_for('ui_dashboard_get') }}" class="text-nv-accent hover:underline">dashboard</a> to manage your projects.
+    </p>
+    {% endif %}
+</div>
+{% endblock %}

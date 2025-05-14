@@ -16,10 +16,12 @@ class Settings(BaseSettings):
     # GitHub OAuth App Settings
     GITHUB_CLIENT_ID: str | None = None
     GITHUB_CLIENT_SECRET: str | None = None
-    GITHUB_REDIRECT_URI: str | None = "http://localhost:8000/auth/github/callback"
-
+    GITHUB_REDIRECT_URI: str = "http://localhost:8000/api/auth/github/callback"
+    
     # GitHub Webhook Secret (cho webhook của repository)
     GITHUB_WEBHOOK_SECRET: str | None = None # Sẽ load từ .env
+    
+    SESSION_SECRET_KEY: str | None = None
 
     # Kafka settings
     KAFKA_BOOTSTRAP_SERVERS: str = "kafka:29092"
@@ -29,7 +31,17 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://ollama:11434" # Map tới 11435 trên host nếu dùng lựa chọn 2
     OLLAMA_DEFAULT_MODEL: str = "codellama:7b-instruct-q4_K_M"
     
+    OPENAI_API_KEY: str | None = None
+    GEMINI_API_KEY: str | None = None
+    GOOGLE_API_KEY: str | None = None
+    DEFAULT_LLM_PROVIDER: str | None = "ollama" #(ollama, openai, gemini)
+    OPENAI_DEFAULT_MODEL: str | None = "gpt-3.5-turbo"
+    GEMINI_DEFAULT_MODEL: str | None = "gemini-2.0-flash-exp"
+    
+    
     NOVAGUARD_PUBLIC_URL: str | None = None # Ví dụ: https://abcdef123.ngrok.io hoặc https://novaguard.yourcompany.com
+    
+    DEBUG: bool = False
 
     # Pydantic-Settings V2 configuration to load from .env file
     model_config = SettingsConfigDict(

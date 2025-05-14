@@ -1,32 +1,49 @@
 import json
 import logging
 import time
+import re
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
+from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker  # Đảm bảo import Session
 # from kafka import KafkaConsumer, KafkaError # KafkaConsumer, KafkaError được dùng trong hàm main_worker
 
-from app.core.config import get_settings
+from app.llm_service import (
+    invoke_llm_analysis_chain,
+    LLMProviderConfig,
+    LLMServiceError
+)
+
+from app.core.config import get_settings, Settings
 from app.core.db import SessionLocal as AppSessionLocal
 from app.core.security import decrypt_data
 from app.models import User, Project, PRAnalysisRequest, PRAnalysisStatus, AnalysisFinding
-from app.webhook_service import crud_pr_analysis # Để update status PRAnalysisRequest
-from app.analysis_module import crud_finding, schemas_finding # CRUD và Schema cho Findings
+from app.webhook_service import crud_pr_analysis
+from app.analysis_module import crud_finding, schemas_finding as am_schemas 
 from app.common.github_client import GitHubAPIClient
-from app.llm_service import invoke_ollama, LLMServiceError
+
+# Import Pydantic models cho LLM output
+from .llm_schemas import  LLMStructuredOutput
 
 # --- Logging Setup ---
 # logger đã được định nghĩa và cấu hình ở phần trước, sử dụng tên "AnalysisWorker"
 logger = logging.getLogger("AnalysisWorker")
-# Nếu bạn muốn chắc chắn handler được thêm chỉ một lần (ví dụ khi module được nạp lại trong 1 số kịch bản test)
-if not logger.handlers:
+logger = logging.getLogger("AnalysisWorker")
+if not logger.handlers: # Kiểm tra để tránh thêm handler nhiều lần nếu module được reload
     handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # (Bạn có thể muốn dùng sys.stdout thay vì sys.stderr mặc định của StreamHandler)
+    # import sys
+    # handler = logging.StreamHandler(sys.stdout) 
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s') # Thêm funcName, lineno
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO) # Hoặc DEBUG nếu cần chi tiết hơn
-# ---
+    # Đặt ở đây để thấy các debug logs:
+    logger.setLevel(logging.DEBUG if get_settings().DEBUG else logging.INFO) # Hoặc luôn là DEBUG khi phát triển
+    # logger.setLevel(logging.DEBUG) # Luôn DEBUG cho worker
+
+# Đường dẫn đến thư mục prompts
+PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # --- Database Session Management for Worker ---
 _worker_db_session_factory: Optional[sessionmaker] = None
@@ -46,8 +63,8 @@ def get_db_session_for_worker() -> Optional[Session]:
         logger.warning("Worker DB Session factory was not pre-initialized by main_worker. Attempting now.")
         initialize_worker_db_session_factory_if_needed()
         if _worker_db_session_factory is None:
-             logger.error("Failed to initialize DB factory on demand for worker.")
-             return None
+            logger.error("Failed to initialize DB factory on demand for worker.")
+            return None
     db: Optional[Session] = None
     try:
         db = _worker_db_session_factory()
@@ -159,117 +176,162 @@ def create_dynamic_project_context(
         "pr_diff_content": (raw_pr_data.get("pr_diff", "") or "")[:8000], # Giới hạn tổng diff
         "formatted_changed_files_with_content": "\n".join(formatted_changed_files_str_list) if formatted_changed_files_str_list else "No relevant file content available for analysis.",
         "project_language": project_model.language or "Undefined",
-        "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided."
+        "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided.",
+        "raw_pr_data_changed_files": raw_pr_data.get("changed_files", [])
     }
     logger.debug(f"Dynamic context created for PR ID {pr_model.id}. Title: {context['pr_title']}")
     return context
 
-async def run_deep_logic_bug_hunter_mvp1(context: Dict[str, Any], settings_obj) -> List[Dict[str, Any]]:
-    logger.info("Running DeepLogicBugHunterAI_MVP1 agent...")
-    
-    # --- Updated English Prompt ---
-    prompt_template = f"""
-You are an expert code reviewer focused on identifying potential logic errors, security vulnerabilities, and subtle issues in code.
-Project Language: {context.get("project_language", "Undefined")}
-Project-specific coding conventions or architectural notes (if any): {context.get("project_custom_notes", "None provided")}
+def load_prompt_template_str(template_name: str) -> str: # Đổi tên hàm để rõ là trả về string
+    """Loads a prompt template string from the prompts directory."""
+    prompt_file = PROMPT_DIR / template_name
+    if not prompt_file.exists():
+        logger.error(f"Prompt template file not found: {prompt_file}")
+        raise FileNotFoundError(f"Prompt template {template_name} not found.")
+    return prompt_file.read_text(encoding="utf-8")
 
-Pull Request Information:
-- Title: {context.get("pr_title", "N/A")}
-- Description: {context.get("pr_description", "N/A")}
-- Author: {context.get("pr_author", "N/A")}
-- Branch: {context.get("head_branch", "N/A")} -> {context.get("base_branch", "N/A")}
+async def run_code_analysis_agent_v1(
+    dynamic_context: Dict[str, Any], # dynamic_context chứa tất cả các giá trị cần cho prompt
+    settings_obj: Settings # settings object từ get_settings()
+) -> List[am_schemas.AnalysisFindingCreate]:
+    pr_title_for_log = dynamic_context.get('pr_title', 'N/A')
+    logger.info(f"Worker: Running Code Analysis Agent for PR: {pr_title_for_log} using centralized LLMService.")
 
-Overall PR Diff (partial, if available):
-```diff
-{context.get("pr_diff_content", "No overall diff provided")}
-```
-
-Changed files and their content (or snippets):
-{context.get("formatted_changed_files_with_content", "No changed file content available.")}
-
-Based on ALL the provided information (PR description, overall diff, and full content of changed files), please perform a thorough analysis.
-Your main goal is to find:
-1. Potential logical errors (e.g., null pointer exceptions, incorrect condition handling, simple race conditions).
-2. Edge cases that might lead to errors.
-3. Code segments that could be improved in terms of logic, performance, or readability.
-4. Basic data safety issues (e.g., leaking sensitive information in logs).
-
-DO NOT comment on code style or minor issues that a linter can catch. Focus on MORE SIGNIFICANT and SUBTLE problems.
-
-For EACH distinct issue you identify, provide the information STRICTLY as a JSON OBJECT within a JSON LIST.
-Each JSON object MUST have the following fields:
-- "file_path": (string) The full path of the relevant file.
-- "line_start": (integer, optional) The starting line number of the relevant code segment in the file.
-- "line_end": (integer, optional) The ending line number of the relevant code segment.
-- "severity": (string) MUST be one of: "Error", "Warning", or "Note".
-- "message": (string) A clear, detailed description of the issue.
-- "suggestion": (string, optional) A suggestion on how to fix or improve the code.
-
-Example of the desired JSON output format:
-[
-  {{"file_path": "src/moduleA.py", "line_start": 25, "line_end": 28, "severity": "Warning", "message": "The variable 'x' might be None at line 27, potentially leading to a NullPointerException if its 'value' attribute is accessed without a prior check.", "suggestion": "Consider adding an 'if x is not None:' check before accessing x.value."}},
-  {{"file_path": "src/utils/calculator.js", "line_start": 102, "severity": "Error", "message": "The 'while(true)' loop at this location does not have a clear exit condition within its body, risking an infinite loop if internal logic doesn't guarantee a 'break'."}}
-]
-ONLY RETURN THE JSON LIST. Do NOT include any other explanatory text, greetings, or formatting outside of the JSON list itself. If no significant issues are found, return an empty JSON list: [].
-    """
-    
-    logger.debug(f"Prompt for LLM (first 500 chars): {prompt_template[:500]}...")
-    
     try:
-        llm_response_text = await invoke_ollama(
-            prompt=prompt_template, 
-            model_name=settings_obj.OLLAMA_DEFAULT_MODEL
+        # 1. Load Prompt Template String (giữ nguyên)
+        prompt_template_str = load_prompt_template_str("deep_logic_bug_hunter_v1.md")
+
+        # 2. Chuẩn bị payload cho prompt (dynamic_context đã chứa các giá trị này)
+        #    `invoke_payload` là `dynamic_context` đã được chuẩn bị
+        #    (Kiểm tra các key cần thiết đã có trong `dynamic_context` trước khi gọi)
+        invoke_payload = {
+            key: dynamic_context[key]
+            for key in dynamic_context # Lọc ra các key cần thiết cho prompt nếu cần
+            # Ví dụ: nếu prompt chỉ cần một subset các key từ dynamic_context
+        }
+        # IMPORTANT: dynamic_context cần phải chứa tất cả các placeholder mà prompt template mong đợi,
+        # ngoại trừ `format_instructions` sẽ được llm_service xử lý.
+        # Kiểm tra này có thể thực hiện ở đây hoặc trong llm_service.
+
+        # 3. Tạo cấu hình LLM cho llm_service
+        # Lấy provider và model mặc định từ settings
+        # Trong tương lai, có thể lấy từ project-specific config
+        current_llm_provider_config = LLMProviderConfig(
+            provider_name=settings_obj.DEFAULT_LLM_PROVIDER,
+            # model_name sẽ được llm_service xác định dựa trên provider và settings_obj.OPENAI_DEFAULT_MODEL etc.
+            # Hoặc bạn có thể xác định model_name ở đây nếu muốn logic đó nằm trong worker:
+            # model_name = (
+            #     settings_obj.OPENAI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "openai"
+            #     else settings_obj.GEMINI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "gemini"
+            #     else settings_obj.OLLAMA_DEFAULT_MODEL
+            # ),
+            temperature=0.1, # Hoặc lấy từ settings_obj
+            # api_key không cần truyền ở đây, llm_service sẽ tự lấy từ settings_obj
         )
-        logger.info("Received response from LLM.")
-        logger.debug(f"LLM raw response (first 500 chars): {llm_response_text[:500]}")
 
-        findings = []
-        try:
-            json_start = llm_response_text.find('[')
-            json_end = llm_response_text.rfind(']')
-            if json_start != -1 and json_end != -1 and json_end >= json_start:
-                json_str = llm_response_text[json_start : json_end+1]
-                logger.debug(f"Attempting to parse JSON string from LLM: {json_str}")
-                parsed_findings = json.loads(json_str)
-                if isinstance(parsed_findings, list):
-                    for pf_dict in parsed_findings:
-                        if isinstance(pf_dict, dict) and \
-                           all(k in pf_dict for k in ["file_path", "severity", "message"]) and \
-                           isinstance(pf_dict["file_path"], str) and \
-                           isinstance(pf_dict["severity"], str) and pf_dict["severity"] in ["Error", "Warning", "Note"] and \
-                           isinstance(pf_dict["message"], str):
-                            line_start = pf_dict.get("line_start")
-                            line_end = pf_dict.get("line_end")
-                            if line_start is not None and not isinstance(line_start, int): line_start = None
-                            if line_end is not None and not isinstance(line_end, int): line_end = None
-                            
-                            findings.append({
-                                "file_path": pf_dict["file_path"],
-                                "line_start": line_start, "line_end": line_end,
-                                "severity": pf_dict["severity"], "message": pf_dict["message"],
-                                "suggestion": pf_dict.get("suggestion") if isinstance(pf_dict.get("suggestion"), str) else None,
-                                "agent_name": "DeepLogicBugHunterAI_MVP1"
-                            })
-                        else:
-                            logger.warning(f"Skipping invalid finding structure from LLM: {pf_dict}")
-                else:
-                    logger.error(f"LLM response was valid JSON but not a list. Type: {type(parsed_findings)}. Content: {str(parsed_findings)[:500]}")
-            else:
-                logger.error(f"Could not find valid JSON list structure in LLM response. Snippet: {llm_response_text[:500]}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM response as JSON: {e}. Response snippet: {llm_response_text[:500]}")
-        except Exception as e_parse:
-            logger.exception(f"Unexpected error parsing LLM findings: {e_parse}. Response snippet: {llm_response_text[:500]}")
+        logger.info(f"Worker: Invoking LLMService with provider config: {current_llm_provider_config.provider_name}")
 
-        logger.info(f"Parsed {len(findings)} findings from LLM.")
-        return findings
+        # 4. Gọi LLM Service
+        structured_llm_output: LLMStructuredOutput = await invoke_llm_analysis_chain(
+            prompt_template_str=prompt_template_str,
+            dynamic_context_values=invoke_payload, # Đây là dict các giá trị để điền vào prompt
+            output_pydantic_model_class=LLMStructuredOutput, # Schema Pydantic cho output
+            llm_provider_config=current_llm_provider_config,
+            settings_obj=settings_obj # llm_service dùng để lấy API keys, default models
+        )
+
+        num_findings_from_llm = len(structured_llm_output.findings) if structured_llm_output and structured_llm_output.findings else 0
+        logger.info(f"Worker: Received structured response from LLMService for PR: {pr_title_for_log}. Number of raw findings: {num_findings_from_llm}")
+
+        # 5. Convert LLM findings to AnalysisFindingCreate schemas (logic này giữ nguyên)
+        analysis_findings_to_create: List[am_schemas.AnalysisFindingCreate] = []
+        if structured_llm_output and structured_llm_output.findings:
+            for llm_finding in structured_llm_output.findings:
+                # ... (logic trích xuất code snippet và tạo finding_for_db như cũ) ...
+                # Ví dụ:
+                code_snippet_text = None
+                if llm_finding.file_path and llm_finding.line_start is not None:
+                    original_file_content = None
+                    raw_changed_files = dynamic_context.get("raw_pr_data_changed_files", []) # Đảm bảo key này có trong dynamic_context
+                    for file_detail in raw_changed_files:
+                        if file_detail.get("filename") == llm_finding.file_path:
+                            original_file_content = file_detail.get("content")
+                            break
+                    if original_file_content:
+                        lines = original_file_content.splitlines()
+
+                        CONTEXT_LINES_BEFORE_AFTER = 5 # Số dòng ngữ cảnh trước và sau
+
+                        # Xác định dòng bắt đầu và kết thúc của lỗi (1-based từ LLM)
+                        error_line_start_1based = llm_finding.line_start
+                        error_line_end_1based = llm_finding.line_end if llm_finding.line_end is not None and llm_finding.line_end >= error_line_start_1based else error_line_start_1based
+
+                        # Tính toán phạm vi snippet bao gồm cả context (0-based cho slicing)
+                        snippet_start_idx_0based = max(0, error_line_start_1based - 1 - CONTEXT_LINES_BEFORE_AFTER)
+                        snippet_end_idx_0based = min(len(lines), error_line_end_1based + CONTEXT_LINES_BEFORE_AFTER) # slice sẽ không bao gồm dòng này, nên + CONTEXT_LINES_BEFORE_AFTER là đúng
         
-    except LLMServiceError as e_llm:
-        logger.error(f"LLMServiceError in DeepLogicBugHunterAI: {e_llm.message}, Details: {e_llm.details}")
-        raise
-    except Exception as e_unexpected:
-        logger.exception("Unexpected error in DeepLogicBugHunterAI.")
-        raise
+                        if snippet_start_idx_0based < snippet_end_idx_0based:
+                            snippet_lines_with_context = lines[snippet_start_idx_0based:snippet_end_idx_0based]
+
+                            # Đánh dấu các dòng lỗi thực sự (tùy chọn, nếu muốn highlight trong frontend)
+                            # Dòng lỗi bắt đầu trong snippet (0-based relative to snippet_lines_with_context)
+                            error_start_in_snippet_0based = (error_line_start_1based - 1) - snippet_start_idx_0based
+                            # Dòng lỗi kết thúc trong snippet (0-based relative to snippet_lines_with_context)
+                            error_end_in_snippet_0based = (error_line_end_1based - 1) - snippet_start_idx_0based
+
+                            # Thêm tiền tố hoặc class để frontend có thể highlight 
+                            formatted_snippet_lines = []
+                            for i, line_text in enumerate(snippet_lines_with_context):
+                                actual_line_number = snippet_start_idx_0based + 1 + i
+                                prefix = f"{actual_line_number:>{len(str(snippet_end_idx_0based))}} | " # Căn chỉnh số dòng
+                                if error_start_in_snippet_0based <= i <= error_end_in_snippet_0based:
+                                    prefix = f">{prefix}" # Đánh dấu dòng lỗi
+                                else:
+                                    prefix = f" {prefix}"
+                                formatted_snippet_lines.append(prefix + line_text)
+                            code_snippet_text = "\n".join(formatted_snippet_lines)
+
+                            # Cách đơn giản hơn là chỉ join các dòng, frontend tự xử lý highlight nếu cần
+                            # code_snippet_text = "\n".join(snippet_lines_with_context)
+
+                        else:
+                            logger.warning(f"Invalid line range for snippet extraction (with context): file '{llm_finding.file_path}', "
+                                            f"LLM lines L{error_line_start_1based}-L{error_line_end_1based}, "
+                                            f"calculated snippet slice [{snippet_start_idx_0based}:{snippet_end_idx_0based}] for {len(lines)} actual lines. PR: {pr_title_for_log}")
+                            # Fallback về snippet gốc nếu có lỗi logic
+                            start_idx_orig = max(0, error_line_start_1based - 1)
+                            end_idx_orig = min(len(lines), error_line_end_1based)
+                            if start_idx_orig < end_idx_orig :
+                                code_snippet_text = "\n".join(lines[start_idx_orig:end_idx_orig])
+
+
+                finding_for_db = am_schemas.AnalysisFindingCreate(
+                    file_path=llm_finding.file_path,
+                    line_start=llm_finding.line_start,
+                    line_end=llm_finding.line_end,
+                    severity=llm_finding.severity,
+                    message=llm_finding.message,
+                    suggestion=llm_finding.suggestion,
+                    agent_name=f"NovaGuardAgent_v1_{current_llm_provider_config.provider_name}", # Tên agent có thể kèm provider
+                    code_snippet=code_snippet_text
+                )
+                analysis_findings_to_create.append(finding_for_db)
+        
+        return analysis_findings_to_create
+
+    except LLMServiceError as e_llm_service:
+        logger.error(f"Worker: LLMServiceError during analysis for PR '{pr_title_for_log}': {e_llm_service}")
+        # Lỗi này đã được log chi tiết bởi llm_service. Worker có thể chỉ cần ghi nhận và trả về rỗng.
+        return [] # Trả về list rỗng nếu có lỗi từ LLM service
+    except FileNotFoundError as e_fnf: # Lỗi không tìm thấy file prompt
+        logger.error(f"Worker: Prompt file error for PR '{pr_title_for_log}': {e_fnf}")
+        return []
+    except KeyError as e_key: # Lỗi thiếu key trong dynamic_context cho prompt
+        logger.error(f"Worker: KeyError formatting prompt for PR '{pr_title_for_log}': {e_key}. Check dynamic_context and prompt template.")
+        return []
+    except Exception as e: # Các lỗi không mong muốn khác trong worker
+        logger.exception(f"Worker: Unexpected error during code analysis agent execution for PR '{pr_title_for_log}': {type(e).__name__} - {e}")
+        return []
 
 async def process_message_logic(message_value: dict, db: Session, settings_obj):
     pr_analysis_request_id = message_value.get("pr_analysis_request_id")
@@ -338,47 +400,120 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj):
         raw_pr_data = await fetch_pr_data_from_github(gh_client, owner, repo_slug, pr_number, head_sha_from_webhook)
         
         if raw_pr_data.get("pr_metadata"):
+            # ... (cập nhật db_pr_request với metadata từ GitHub) ...
             pr_meta = raw_pr_data["pr_metadata"]
             db_pr_request.pr_title = pr_meta.get("title", db_pr_request.pr_title)
             html_url_val = pr_meta.get("html_url")
             db_pr_request.pr_github_url = str(html_url_val) if html_url_val else db_pr_request.pr_github_url
         db_pr_request.head_sha = raw_pr_data.get("head_sha", db_pr_request.head_sha)
         db.commit()
-        db.refresh(db_pr_request) 
+        db.refresh(db_pr_request)
 
         crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.DATA_FETCHED)
         logger.info(f"PML: PR ID {pr_analysis_request_id} status updated to DATA_FETCHED. Preparing for LLM analysis.")
 
+        # Tạo dynamic_context
         dynamic_context = create_dynamic_project_context(raw_pr_data, db_project, db_pr_request)
+        # QUAN TRỌNG: Thêm raw_pr_data['changed_files'] vào context để agent có thể dùng để trích xuất snippet
+        dynamic_context["raw_pr_data_changed_files"] = raw_pr_data.get("changed_files", [])
         
-        logger.info(f"PML: Invoking LLM for PR ID {pr_analysis_request_id}...")
-        llm_findings_dicts = await run_deep_logic_bug_hunter_mvp1(dynamic_context, settings_obj)
+        logger.info(f"PML: Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
         
-        if llm_findings_dicts:
-            findings_to_create_schemas = []
-            for finding_dict in llm_findings_dicts:
-                try:
-                    # Validate và tạo schema object trước khi tạo DB object
-                    findings_to_create_schemas.append(schemas_finding.AnalysisFindingCreate(**finding_dict))
-                except Exception as e_pydantic: # Bắt lỗi validation của Pydantic
-                    logger.warning(f"PML: Invalid finding structure from LLM, skipping: {finding_dict}. Error: {e_pydantic}")
-            
-            if findings_to_create_schemas:
-                created_db_findings = crud_finding.create_analysis_findings(db, pr_analysis_request_id, findings_to_create_schemas)
-                logger.info(f"PML: Saved {len(created_db_findings)} findings from LLM for PR ID {pr_analysis_request_id}.")
-            else:
-                logger.info(f"PML: No valid findings to save after LLM processing for PR ID {pr_analysis_request_id}.")
+        # Gọi agent mới thay vì run_deep_logic_bug_hunter_mvp1 cũ
+        analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
+            dynamic_context=dynamic_context,
+            settings_obj=settings_obj
+        )
+        
+        if analysis_findings_create_schemas:
+            # crud_finding.create_analysis_findings nhận List[AnalysisFindingCreate]
+            created_db_findings = crud_finding.create_analysis_findings(
+                db, 
+                pr_analysis_request_id, 
+                analysis_findings_create_schemas # Đây là list các Pydantic model
+            )
+            logger.info(f"PML: Saved {len(created_db_findings)} findings from Langchain agent for PR ID {pr_analysis_request_id}.")
         else:
-            logger.info(f"PML: LLM returned no findings for PR ID {pr_analysis_request_id}.")
+            logger.info(f"PML: Langchain agent returned no findings for PR ID {pr_analysis_request_id}.")
 
         crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.COMPLETED)
-        logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED.")
+        logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
+        
+        if db_pr_request.status == PRAnalysisStatus.COMPLETED:
+            logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED. Attempting to post summary comment to GitHub.")
+
+            # Lấy GitHub token (đã có logic ở phần fetch data)
+            # github_token đã được giải mã ở trên
+            if github_token and settings_obj.NOVAGUARD_PUBLIC_URL: # NOVAGUARD_PUBLIC_URL cần để tạo link báo cáo
+                try:
+                    gh_client_for_comment = GitHubAPIClient(token=github_token)
+
+                    num_errors = 0
+                    num_warnings = 0
+                    # Giả sử bạn đã query lại các findings từ DB hoặc có chúng từ `created_db_findings`
+                    # Nếu không, bạn cần query lại:
+                    # all_findings_for_pr = crud_finding.get_findings_by_request_id(db, pr_analysis_request_id)
+                    # Thay vì query lại, tốt hơn là dùng kết quả từ `created_db_findings` nếu có
+
+                    # Lấy lại findings từ DB để đảm bảo có ID chính xác (nếu created_db_findings không đầy đủ)
+                    # Hoặc bạn có thể dùng `analysis_findings_create_schemas` để đếm trước khi lưu DB
+
+                    # Để đơn giản, giả sử `analysis_findings_create_schemas` phản ánh đúng những gì sẽ được lưu
+                    for finding_schema in analysis_findings_create_schemas: # Hoặc lặp qua created_db_findings
+                        if finding_schema.severity.lower() == 'error':
+                            num_errors += 1
+                        elif finding_schema.severity.lower() == 'warning':
+                            num_warnings += 1
+
+                    report_url = f"{settings_obj.NOVAGUARD_PUBLIC_URL.rstrip('/')}/ui/reports/pr-analysis/{pr_analysis_request_id}/report"
+
+                    comment_body = f"### NovaGuard AI Analysis Report 🤖\n\n"
+                    comment_body += f"NovaGuard AI has completed the analysis for this Pull Request.\n\n"
+                    if num_errors == 0 and num_warnings == 0 and not analysis_findings_create_schemas:
+                        comment_body += f"✅ No significant issues found.\n\n"
+                    else:
+                        comment_body += f"🔍 **Summary:**\n"
+                        if num_errors > 0:
+                            comment_body += f"  - **{num_errors} Error(s)** found.\n"
+                        if num_warnings > 0:
+                            comment_body += f"  - **{num_warnings} Warning(s)** found.\n"
+                        other_findings_count = len(analysis_findings_create_schemas) - num_errors - num_warnings
+                        if other_findings_count > 0:
+                            comment_body += f"  - **{other_findings_count} Note/Info item(s)** found.\n"
+                        comment_body += f"\n"
+
+                    comment_body += f"👉 [**View Full Report on NovaGuard AI**]({report_url})\n\n"
+                    comment_body += f"---\n*Powered by NovaGuard AI*"
+
+                    # owner, repo_slug từ db_project.repo_name
+                    if '/' not in db_project.repo_name:
+                        logger.error(f"Cannot post comment: Invalid project repo_name format: {db_project.repo_name}")
+                    else:
+                        owner_for_comment, repo_slug_for_comment = db_project.repo_name.split('/', 1)
+                        pr_number_for_comment = db_pr_request.pr_number
+
+                        comment_response = await gh_client_for_comment.create_pr_comment(
+                            owner=owner_for_comment,
+                            repo=repo_slug_for_comment,
+                            pr_number=pr_number_for_comment,
+                            body=comment_body
+                        )
+                        if comment_response and comment_response.get("id"):
+                            logger.info(f"Successfully posted summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}. Comment ID: {comment_response.get('id')}")
+                        else:
+                            logger.error(f"Failed to post summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}.")
+                except Exception as e_comment:
+                    logger.exception(f"Error attempting to post comment to GitHub for PR ID {pr_analysis_request_id}: {e_comment}")
+            elif not settings_obj.NOVAGUARD_PUBLIC_URL:
+                logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: NOVAGUARD_PUBLIC_URL is not set.")
+            elif not github_token:
+                logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: GitHub token is missing or could not be decrypted.")
 
     except Exception as e:
-        error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id}: {type(e).__name__} - {str(e)}"
-        logger.exception(error_msg_detail) # Log full traceback để dễ debug
+        error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id} (Provider: {settings_obj.DEFAULT_LLM_PROVIDER}): {type(e).__name__} - {str(e)}"
+        logger.exception(error_msg_detail)
         try:
-            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020]) # Giới hạn độ dài
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020])
         except Exception as db_error:
             logger.error(f"PML: Additionally, failed to update PR ID {pr_analysis_request_id} status to FAILED: {db_error}")
 
