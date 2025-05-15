@@ -38,10 +38,17 @@ class Settings(BaseSettings):
     OPENAI_DEFAULT_MODEL: str | None = "gpt-3.5-turbo"
     GEMINI_DEFAULT_MODEL: str | None = "gemini-2.0-flash-exp"
     
+    # Neo4j Settings
+    NEO4J_URI: str = "neo4j://neo4j_db:7687" # Sử dụng neo4j:// cho driver v5+
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "your_default_neo4j_password" # Sẽ bị override bởi .env
+    # NEO4J_AUTH: str | None = None
+
+    
     
     NOVAGUARD_PUBLIC_URL: str | None = None # Ví dụ: https://abcdef123.ngrok.io hoặc https://novaguard.yourcompany.com
     
-    DEBUG: bool = False
+    DEBUG: bool = True
 
     # Pydantic-Settings V2 configuration to load from .env file
     model_config = SettingsConfigDict(
@@ -80,3 +87,9 @@ if __name__ == "__main__":
         print("\nWARNING: GitHub OAuth Client ID or Secret is not set. GitHub OAuth flow will fail.")
     if not settings.GITHUB_WEBHOOK_SECRET:
         print("\nWARNING: GITHUB_WEBHOOK_SECRET is not set. Webhook signature verification will be skipped or fail if enforced.")
+        
+    print(f"  NEO4J_URI: {settings.NEO4J_URI}")
+    print(f"  NEO4J_USER: {settings.NEO4J_USER}")
+    print(f"  NEO4J_PASSWORD: {'********' if settings.NEO4J_PASSWORD else 'Not Set'}")
+    if settings.NEO4J_PASSWORD == "your_default_neo4j_password" or not settings.NEO4J_PASSWORD:
+        print("\nWARNING: Default or empty NEO4J_PASSWORD is used. Ensure it's set via .env and matches docker-compose NEO4J_AUTH!")

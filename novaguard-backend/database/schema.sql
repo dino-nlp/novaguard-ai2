@@ -3,28 +3,77 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
-    github_user_id VARCHAR(255) UNIQUE, -- Sẽ được cập nhật sau khi OAuth với GitHub
-    github_access_token_encrypted TEXT, -- Token truy cập GitHub của người dùng, đã mã hóa
+    github_user_id VARCHAR(255) UNIQUE,
+    github_access_token_encrypted TEXT,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Bảng projects: Lưu trữ thông tin các dự án người dùng thêm vào
+-- Tạm thời chưa có last_full_scan_request_id làm FOREIGN KEY trực tiếp ở đây
 CREATE TABLE IF NOT EXISTS projects (
     id SERIAL PRIMARY KEY,
-    user_id INT REFERENCES users(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng users
-    github_repo_id VARCHAR(255) NOT NULL, -- ID của repository trên GitHub
-    repo_name VARCHAR(255) NOT NULL, -- Tên repository (ví dụ: 'owner/repo_name')
-    main_branch VARCHAR(255) NOT NULL, -- Nhánh chính của dự án (ví dụ: 'main', 'master')
-    language VARCHAR(100), -- Ngôn ngữ lập trình chính của dự án (người dùng cấu hình)
-    custom_project_notes TEXT, -- Ghi chú tùy chỉnh về kiến trúc hoặc quy ước code của dự án
-    github_webhook_id VARCHAR(255), -- ID của webhook đã được tạo trên GitHub cho repository này
+    user_id INT REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+    github_repo_id VARCHAR(255) NOT NULL,
+    repo_name VARCHAR(255) NOT NULL,
+    main_branch VARCHAR(255) NOT NULL,
+    language VARCHAR(100),
+    custom_project_notes TEXT,
+    github_webhook_id VARCHAR(255),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, github_repo_id) -- Đảm bảo mỗi người dùng chỉ thêm một repo GitHub một lần
+    -- Các cột mới cho full scan, nhưng khóa ngoại sẽ được thêm sau
+    last_full_scan_request_id INT, -- Sẽ thêm FK sau
+    last_full_scan_status VARCHAR(20), -- Sẽ dùng ENUM type sau
+    last_full_scan_at TIMESTAMPTZ,
+    UNIQUE(user_id, github_repo_id)
 );
 
+-- Bảng fullprojectanalysisrequests: Lưu trữ thông tin về các yêu cầu phân tích toàn bộ dự án
+-- Tạo ENUM type trước nếu chưa có và SQLAlchemy không tự tạo trong schema.sql
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'full_project_analysis_status_enum') THEN
+        CREATE TYPE full_project_analysis_status_enum AS ENUM ('pending', 'processing', 'source_fetched', 'ckg_building', 'analyzing', 'completed', 'failed');
+    END IF;
+END$$;
+
+CREATE TABLE IF NOT EXISTS fullprojectanalysisrequests (
+    id SERIAL PRIMARY KEY,
+    project_id INT REFERENCES projects(id) ON DELETE CASCADE NOT NULL, -- Tham chiếu đến projects
+    branch_name VARCHAR(255) NOT NULL,
+    status full_project_analysis_status_enum DEFAULT 'pending' NOT NULL, -- Sử dụng ENUM đã tạo
+    error_message TEXT,
+    requested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMPTZ,
+    source_fetched_at TIMESTAMPTZ,
+    ckg_built_at TIMESTAMPTZ,
+    analysis_completed_at TIMESTAMPTZ,
+    total_files_analyzed INT,
+    total_findings INT
+);
+
+-- Bây giờ thêm FOREIGN KEY cho projects.last_full_scan_request_id
+ALTER TABLE projects
+ADD CONSTRAINT fk_projects_last_full_scan
+FOREIGN KEY (last_full_scan_request_id)
+REFERENCES fullprojectanalysisrequests(id)
+ON DELETE SET NULL;
+
+-- Và cập nhật kiểu dữ liệu cho projects.last_full_scan_status để sử dụng ENUM
+ALTER TABLE projects
+ALTER COLUMN last_full_scan_status TYPE full_project_analysis_status_enum
+USING last_full_scan_status::full_project_analysis_status_enum;
+
+
 -- Bảng pranalysisrequests: Lưu trữ thông tin về các yêu cầu phân tích Pull Request
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'pr_analysis_status_enum') THEN
+        CREATE TYPE pr_analysis_status_enum AS ENUM ('pending', 'processing', 'data_fetched', 'completed', 'failed');
+    END IF;
+END$$;
+
 CREATE TABLE IF NOT EXISTS pranalysisrequests (
     id SERIAL PRIMARY KEY,
     project_id INT REFERENCES projects(id) ON DELETE CASCADE NOT NULL,
@@ -32,7 +81,7 @@ CREATE TABLE IF NOT EXISTS pranalysisrequests (
     pr_title TEXT,
     pr_github_url VARCHAR(2048),
     head_sha VARCHAR(40),
-    status VARCHAR(20) CHECK (status IN ('pending', 'processing', 'data_fetched', 'completed', 'failed')) DEFAULT 'pending' NOT NULL, -- Thêm NOT NULL nếu status luôn phải có giá trị
+    status pr_analysis_status_enum DEFAULT 'pending' NOT NULL,
     error_message TEXT,
     requested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMPTZ,
@@ -40,18 +89,25 @@ CREATE TABLE IF NOT EXISTS pranalysisrequests (
 );
 
 -- Bảng analysisfindings: Lưu trữ các phát hiện/gợi ý từ quá trình phân tích code
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'analysis_severity_enum') THEN
+        CREATE TYPE analysis_severity_enum AS ENUM ('Error', 'Warning', 'Note', 'Info');
+    END IF;
+END$$;
+
 CREATE TABLE IF NOT EXISTS analysisfindings (
     id SERIAL PRIMARY KEY,
-    pr_analysis_request_id INT REFERENCES pranalysisrequests(id) ON DELETE CASCADE NOT NULL, -- Khóa ngoại tới bảng pranalysisrequests
-    file_path VARCHAR(1024) NOT NULL, -- Đường dẫn file liên quan đến phát hiện
-    line_start INT, -- Dòng bắt đầu (nếu có)
-    line_end INT, -- Dòng kết thúc (nếu có)
-    severity VARCHAR(50) CHECK (severity IN ('Error', 'Warning', 'Note', 'Info')) NOT NULL, -- Mức độ nghiêm trọng
-    message TEXT NOT NULL, -- Mô tả vấn đề
-    suggestion TEXT, -- Gợi ý sửa lỗi (từ LLM)
-    agent_name VARCHAR(100), -- Tên của Agent đã tạo ra phát hiện này (ví dụ: 'DeepLogicBugHunterAI_MVP1')
+    pr_analysis_request_id INT REFERENCES pranalysisrequests(id) ON DELETE CASCADE NOT NULL,
+    file_path VARCHAR(1024) NOT NULL,
+    line_start INT,
+    line_end INT,
+    severity analysis_severity_enum NOT NULL, -- Sử dụng ENUM
+    message TEXT NOT NULL,
+    suggestion TEXT,
+    agent_name VARCHAR(100),
     code_snippet TEXT,
-    user_feedback VARCHAR(50), -- Phản hồi từ người dùng (ví dụ: 'Helpful', 'NotHelpful', 'Ignore') - tùy chọn MVP1
+    user_feedback VARCHAR(50),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -78,13 +134,13 @@ BEFORE UPDATE ON projects
 FOR EACH ROW
 EXECUTE FUNCTION trigger_set_timestamp();
 
--- (Không cần trigger updated_at cho pranalysisrequests và analysisfindings vì chúng thường không được cập nhật nhiều sau khi tạo)
-
--- Indexes (Cân nhắc thêm các index cần thiết để tăng tốc độ truy vấn)
+-- Indexes
 CREATE INDEX IF NOT EXISTS idx_projects_user_id ON projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_fullprojectanalysisrequests_project_id ON fullprojectanalysisrequests(project_id);
+CREATE INDEX IF NOT EXISTS idx_fullprojectanalysisrequests_status ON fullprojectanalysisrequests(status);
 CREATE INDEX IF NOT EXISTS idx_pranalysisrequests_project_id ON pranalysisrequests(project_id);
 CREATE INDEX IF NOT EXISTS idx_pranalysisrequests_status ON pranalysisrequests(status);
 CREATE INDEX IF NOT EXISTS idx_analysisfindings_pr_analysis_request_id ON analysisfindings(pr_analysis_request_id);
 CREATE INDEX IF NOT EXISTS idx_analysisfindings_severity ON analysisfindings(severity);
 
-COMMIT; -- Hoặc bỏ qua nếu bạn chạy từng lệnh một
+COMMIT;
