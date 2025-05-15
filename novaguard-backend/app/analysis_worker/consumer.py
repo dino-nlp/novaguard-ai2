@@ -23,12 +23,13 @@ from app.llm_service import (
 from app.core.config import get_settings, Settings
 from app.core.db import SessionLocal as AppSessionLocal
 from app.core.security import decrypt_data
-from app.models import User, Project, PRAnalysisRequest, PRAnalysisStatus, AnalysisFinding
+from app.models import User, Project, PRAnalysisRequest, PRAnalysisStatus, AnalysisFinding, FullProjectAnalysisRequest
 from app.webhook_service import crud_pr_analysis
 from app.analysis_module import crud_finding, schemas_finding as am_schemas 
 from app.common.github_client import GitHubAPIClient
 from app.project_service import crud_full_scan
 from app.models import FullProjectAnalysisStatus # Import Enum
+from app.ckg_builder import CKGBuilder
 
 
 # Import Pydantic models cho LLM output
@@ -340,6 +341,7 @@ async def run_code_analysis_agent_v1(
         logger.exception(f"Worker: Unexpected error during code analysis agent execution for PR '{pr_title_for_log}': {type(e).__name__} - {e}")
         return []
 
+
 async def process_message_logic(message_value: dict, db: Session, settings_obj: Settings):
     task_type = message_value.get("task_type", "pr_analysis") # Mặc định là pr_analysis nếu không có
     if task_type == "pr_analysis":
@@ -581,29 +583,6 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
             repo_clone_dir = repo_clone_dir_obj.name
             logger.info(f"Full Project Scan: Cloning {repo_full_name} (branch: {branch_to_scan}) into {repo_clone_dir}")
 
-            # URL để clone (HTTPS với token)
-            # Cần đảm bảo github_token không chứa ký tự đặc biệt làm hỏng URL, hoặc encode nó.
-            # Tuy nhiên, GitPython thường xử lý việc này nếu token được truyền đúng cách.
-            # Đối với clone qua HTTPS, token thường được nhúng vào URL.
-            # Hoặc, GitPython có thể hỗ trợ các cơ chế xác thực khác.
-            # Cách đơn giản nhất là nhúng token:
-            # repo_url_with_token = f"https://oauth2:{github_token}@github.com/{repo_full_name}.git"
-            # Tuy nhiên, cách này lộ token trong log nếu URL được log.
-
-            # Cách an toàn hơn là dùng GitPython với thông tin xác thực riêng,
-            # nhưng nó hơi phức tạp hơn.
-            # Cho MVP, có thể dùng subprocess và truyền token qua biến môi trường hoặc file credential helper.
-            #
-            # Giả sử dùng GitPython với URL có token (CẢNH BÁO: Lộ token nếu log URL)
-            # Hoặc, nếu bạn thiết lập Git Credential Helper bên trong container.
-            #
-            # Cách an toàn và đơn giản hơn với GitPython khi có token:
-            # Không nhúng token vào URL. GitPython có thể không trực tiếp hỗ trợ token
-            # cho clone dễ dàng như username/password.
-            #
-            # => Sử dụng GitHubAPIClient để lấy tarball/zipball của repo tại commit/branch cụ thể
-            #    là một lựa chọn tốt hơn để tránh phức tạp của Git CLI và xác thực trong worker.
-
             gh_client = GitHubAPIClient(token=github_token)
             archive_link = await gh_client.get_repository_archive_link(
                 owner=repo_full_name.split('/')[0],
@@ -622,34 +601,52 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
 
             crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.SOURCE_FETCHED)
 
-            # --- Bước 2: (Sẽ thêm ở bước sau) Xây dựng/Cập nhật CKG ---
-            # crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.CKG_BUILDING)
-            # logger.info(f"Full Project Scan: Starting CKG build for Request ID {full_scan_request_id}")
-            # # Gọi logic xây dựng CKG ở đây, truyền vào repo_clone_dir, project_id
-            # # ckg_builder.build_or_update_for_project(db_project_model.id, repo_clone_dir)
-            # db_full_scan_request.ckg_built_at = datetime.now(timezone.utc)
-            # db.commit()
-            # db.refresh(db_full_scan_request)
+            # --- Bước 2: Xây dựng/Cập nhật CKG ---
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.CKG_BUILDING)
+            logger.info(f"Full Project Scan: Starting CKG build for Request ID {full_scan_request_id}")
+            
+            ckg_builder_instance = CKGBuilder(project_model=db_project_model) # db_project_model là Project SQLAlchemy object
+            files_processed_for_ckg = await ckg_builder_instance.build_for_project(repo_clone_dir)
+            
+            db_full_scan_request.ckg_built_at = datetime.now(timezone.utc)
+            # db_full_scan_request.total_files_analyzed = files_processed_for_ckg # Hoặc một con số khác nếu analysis sau này khác
+            db.commit() # Commit sau khi CKG build xong
+            db.refresh(db_full_scan_request)
+            logger.info(f"Full Project Scan: CKG build completed for Request ID {full_scan_request_id}. Processed {files_processed_for_ckg} files for CKG.")
 
-            # --- Bước 3: (Sẽ thêm ở bước sau) Phân tích code với LLM Agents ---
-            # crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING)
-            # logger.info(f"Full Project Scan: Starting LLM analysis for Request ID {full_scan_request_id}")
-            # # Tạo DynamicProjectContext cho toàn bộ project
-            # # Gọi các agents
-            # # Lưu findings (có thể vào bảng findings riêng cho full scan)
 
-            # Tạm thời cho MVP2 của Full Scan (phần 1): chỉ fetch code và đánh dấu hoàn thành
-            # (Sau này sẽ thêm logic CKG và analysis)
-            logger.warning(f"Full Project Scan: CKG Building and LLM Analysis for full project are NOT YET IMPLEMENTED. Marking as completed after source fetch for now (Request ID: {full_scan_request_id}).")
+            # --- Bước 3: Phân tích code với LLM Agents (Sử dụng CKG nếu có) ---
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING)
+            logger.info(f"Full Project Scan: Starting LLM analysis for Request ID {full_scan_request_id}")
+            
+            # TODO:
+            # 1. Tạo DynamicProjectContext cho TOÀN BỘ project.
+            #    - Cần duyệt qua các file trong repo_clone_dir.
+            #    - `create_dynamic_project_context` hiện tại được thiết kế cho PR. Cần điều chỉnh/tạo hàm mới.
+            #    - Context này sẽ cần được làm giàu bằng thông tin từ CKG (Mục 3 của Giai đoạn 2).
+            #
+            # 2. Điều chỉnh/Tạo Agent LLM phù hợp cho Full Scan.
+            #    - Prompt có thể khác, tập trung vào các vấn đề kiến trúc, nợ kỹ thuật, an ninh tổng thể.
+            #    - Có thể cần nhiều agent nhỏ hơn, mỗi agent tập trung vào một khía cạnh.
+            #
+            # 3. Gọi llm_service để thực hiện phân tích.
+            #
+            # 4. Lưu findings.
+            #    - Cần quyết định lưu vào bảng `analysisfindings` (thêm cột `full_project_analysis_request_id` và `scan_type`)
+            #      hay một bảng riêng `fullprojectanalysisfindings`.
+            #    - Schema Pydantic cho finding có thể cần điều chỉnh (ví dụ: không có line_number cho phát hiện ở mức project).
 
-            # Đếm số file (ví dụ)
-            num_files = sum(1 for _ in Path(repo_clone_dir).rglob('*') if _.is_file())
-            db_full_scan_request.total_files_analyzed = num_files
-            db.commit()
+            logger.warning(f"Full Project Scan: LLM Analysis for full project is NOT YET IMPLEMENTED. Marking as completed after CKG build for now (Request ID: {full_scan_request_id}).")
+            
+            # Cập nhật số file được CKG xử lý vào total_files_analyzed
+            if db_full_scan_request.total_files_analyzed is None : # Chỉ set nếu chưa có
+                db_full_scan_request.total_files_analyzed = files_processed_for_ckg
+
+            db.commit() # Commit lại sau khi cập nhật các thông tin phân tích
             db.refresh(db_full_scan_request)
 
             crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.COMPLETED)
-            logger.info(f"Full Project Scan: Request ID {full_scan_request_id} marked as COMPLETED (placeholder until full analysis logic is added).")
+            logger.info(f"Full Project Scan: Request ID {full_scan_request_id} marked as COMPLETED (CKG built, LLM analysis placeholder).")
 
         except Exception as e_full_scan:
             error_msg_detail = f"Full Project Scan: Error processing Request ID {full_scan_request_id}: {type(e_full_scan).__name__} - {str(e_full_scan)}"
@@ -659,12 +656,13 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
             except Exception as db_error_fs:
                 logger.error(f"Full Project Scan: Additionally, failed to update Request ID {full_scan_request_id} status to FAILED: {db_error_fs}")
         finally:
-            if repo_clone_dir_obj and Path(repo_clone_dir_obj.name).exists():
-                try:
-                    # repo_clone_dir_obj.cleanup() # TemporaryDirectory sẽ tự xóa khi ra khỏi scope hoặc khi object bị delete
-                    logger.info(f"Full Project Scan: Cleaned up temporary directory: {repo_clone_dir_obj.name}")
-                except Exception as e_cleanup:
-                     logger.error(f"Full Project Scan: Error cleaning up temp directory {repo_clone_dir_obj.name}: {e_cleanup}")
+            if repo_clone_dir_obj: # Kiểm tra xem object TemporaryDirectory có được tạo không
+                    try:
+                        logger.info(f"Full Project Scan: Attempting to clean up temporary directory: {repo_clone_dir_obj.name}")
+                        repo_clone_dir_obj.cleanup() # Gọi cleanup tường minh
+                        logger.info(f"Full Project Scan: Cleaned up temporary directory successfully.")
+                    except Exception as e_cleanup:
+                        logger.error(f"Full Project Scan: Error cleaning up temp directory {repo_clone_dir_obj.name}: {e_cleanup}")
     else:
         logger.warning(f"Unknown task_type received in Kafka message: {task_type}")
 

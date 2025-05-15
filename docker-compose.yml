@@ -142,8 +142,6 @@ services:
       - "7687:7687" # Cổng Bolt cho driver kết nối
     volumes:
       - neo4j_data:/data # Volume để lưu trữ dữ liệu Neo4j
-    env_file:
-      - .env
     environment:
       # Đặt password cho user 'neo4j'. THAY ĐỔI 'yourStrongPassword' thành một mật khẩu mạnh!
       NEO4J_AUTH: neo4j/yourStrongPassword
@@ -160,7 +158,8 @@ services:
 
 volumes:
   postgres_data:
-  ollama_docker_data: # <-- Đảm bảo dòng này tồn tại và tên khớp với tên volume trong service ollama
+  ollama_docker_data:
+  neo4j_data:
 
 networks:
   novaguard_network:

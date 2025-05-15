@@ -38,6 +38,8 @@ from app.core.db import get_db
 from app.models import User, Project, PRAnalysisRequest, AnalysisFinding, FullProjectAnalysisRequest, PyAnalysisSeverity
 from app.models.pr_analysis_request_model import PRAnalysisStatus
 from app.models.full_project_analysis_request_model import FullProjectAnalysisStatus
+from app.core.graph_db import close_async_neo4j_driver, get_async_neo4j_driver # Import các hàm Neo4j
+
 
 
 
@@ -91,6 +93,30 @@ app.mount("/static", StaticFiles(directory=str(static_directory)), name="static"
 app.include_router(auth_api_router, prefix="/api/auth", tags=["API - Authentication"])
 app.include_router(project_api_router, prefix="/api/projects", tags=["API - Projects"])
 app.include_router(webhook_api_router, prefix="/api/webhooks", tags=["API - Webhooks"])
+
+
+@app.on_event("startup")
+async def on_startup_event():
+    logger.info("Application is starting up...")
+    # Kiểm tra kết nối Neo4j khi khởi động (tùy chọn nhưng tốt)
+    try:
+        driver = await get_async_neo4j_driver()
+        if driver:
+            await driver.verify_connectivity()
+            logger.info("Successfully connected to Neo4j and verified connectivity.")
+        else:
+            logger.error("Neo4j driver could not be initialized on startup.")
+    except Exception as e:
+        logger.error(f"Failed to connect to Neo4j on startup: {e}", exc_info=True)
+        # Bạn có thể quyết định có nên dừng ứng dụng ở đây không nếu Neo4j là critical
+        # raise RuntimeError("Failed to connect to Neo4j, application cannot start.") from e
+
+@app.on_event("shutdown")
+async def on_shutdown_event():
+    logger.info("Application is shutting down...")
+    await close_async_neo4j_driver() # Đóng driver Neo4j
+    # Thêm các cleanup khác nếu có
+    logger.info("Application shutdown complete.")
 
 async def get_current_ui_user(request: Request, db: Session = Depends(get_db)) -> Optional[auth_schemas.UserPublic]:
     user_id = request.session.get("user_id")

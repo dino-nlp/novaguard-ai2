@@ -22,3 +22,5 @@ langchain-google-genai
 # PyYAML (nếu bạn định dùng file prompt YAML, cho .txt thì không cần)
 GitPython
 neo4j>=5.0
+tree-sitter
+tree-sitter-languages
