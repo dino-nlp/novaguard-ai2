@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import httpx
 from urllib.parse import urlencode
 import secrets
@@ -28,12 +28,17 @@ from app.project_service import schemas as project_schemas
 from app.webhook_service.api import router as webhook_api_router
 from app.webhook_service import crud_pr_analysis as pr_crud # Đổi tên để tránh xung đột với project_crud
 from app.webhook_service import schemas_pr_analysis # Không đổi tên schema để dễ theo dõi
+from app.project_service import crud_full_scan # Import crud cho full scan
+from app.project_service.schemas import AnalysisHistoryItem # Import schema mới
 
 from app.analysis_module import crud_finding as finding_crud
 from app.analysis_module import schemas_finding as finding_schemas
 
 from app.core.db import get_db
-from app.models import User, Project, PRAnalysisRequest, AnalysisFinding
+from app.models import User, Project, PRAnalysisRequest, AnalysisFinding, FullProjectAnalysisRequest, PyAnalysisSeverity
+from app.models.pr_analysis_request_model import PRAnalysisStatus
+from app.models.full_project_analysis_request_model import FullProjectAnalysisStatus
+
 
 
 logger = logging.getLogger("main_app")
@@ -41,6 +46,7 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(levelname)s [%(name)s:%(lineno)s] - %(message)s')
     handler.setFormatter(formatter)
+    logger.addHandler(handler)
     logger.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
 
 
@@ -420,46 +426,151 @@ async def ui_list_github_repos_for_add_project_form( # Đổi tên hàm để r�
         )
 
 @ui_project_router.get("/{project_id_path}", response_class=HTMLResponse, name="ui_project_detail_get")
-async def project_detail_page_ui_get( # Đổi tên tham số path để tránh nhầm lẫn với biến project_id sau này
+async def project_detail_page_ui_get(
     request: Request,
-    project_id_path: int, # Đây là path parameter, FastAPI sẽ tự động chuyển kiểu
+    project_id_path: int,
     db: Session = Depends(get_db),
     current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
 ):
     if not current_user:
+        # ... (redirect nếu chưa login)
         flash_messages = request.session.get("_flash_messages", [])
         flash_messages.append({"category": "warning", "message": "Please login to view project details."})
         request.session["_flash_messages"] = flash_messages
         return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
 
     logger.info(f"Serving project detail page for project ID: {project_id_path}, user: {current_user.email}")
-
-    # Lấy thông tin chi tiết project từ DB, đảm bảo project thuộc user
     project_details = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
     
     if not project_details:
+        # ... (xử lý project không tìm thấy)
         logger.warning(f"Project ID {project_id_path} not found or not owned by user {current_user.email}.")
         flash_messages = request.session.get("_flash_messages", [])
         flash_messages.append({"category": "error", "message": "Project not found or you do not have access."})
         request.session["_flash_messages"] = flash_messages
         return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
 
-    # Lấy danh sách các PR analysis requests cho project này
-    # (Sử dụng pr_crud từ app.webhook_service.crud_pr_analysis)
-    pr_analysis_reqs = pr_crud.get_pr_analysis_requests_by_project_id(db, project_id=project_id_path, limit=20) # Lấy 20 PR mới nhất
-    # total_pr_reqs = pr_crud.count_pr_analysis_requests_by_project_id(db, project_id=project_id_path) # Nếu cần phân trang
+    pr_scans_db = pr_crud.get_pr_analysis_requests_by_project_id(db, project_id=project_id_path, limit=10)
+    full_scans_db = crud_full_scan.get_full_scan_requests_for_project(db, project_id=project_id_path, limit=10)
+    analysis_history: List[AnalysisHistoryItem] = []
 
-    # Chuyển đổi sang Pydantic model nếu template của bạn mong đợi (tùy chọn)
-    # project_details_pydantic = project_schemas.ProjectPublic.model_validate(project_details)
-    # pr_analysis_reqs_pydantic = [pr_schemas.PRAnalysisRequestItem.model_validate(req) for req in pr_analysis_reqs]
+    # Xử lý PR Scans
+    for pr_req_db in pr_scans_db:
+        errors = 0
+        warnings = 0
+        others = 0
+        # Đảm bảo bạn query findings *sau khi* worker đã commit vào DB.
+        # Trạng thái pr_req_db.status nên là trạng thái mới nhất từ DB.
+        if pr_req_db.status == PRAnalysisStatus.COMPLETED:
+            # Query cột severity từ bảng analysisfindings
+            findings_severities_tuples = db.query(AnalysisFinding.severity)\
+                                           .filter(AnalysisFinding.pr_analysis_request_id == pr_req_db.id)\
+                                           .all()
+            # findings_severities_tuples sẽ là list các tuple, ví dụ: [(<PyAnalysisSeverity.ERROR: 'Error'>,), (<PyAnalysisSeverity.WARNING: 'Warning'>,)]
+            # Cần lấy giá trị Enum từ tuple
+            for severity_tuple in findings_severities_tuples:
+                severity_enum_member = severity_tuple[0] # Lấy phần tử đầu tiên của tuple
+                if severity_enum_member == PyAnalysisSeverity.ERROR: errors += 1
+                elif severity_enum_member == PyAnalysisSeverity.WARNING: warnings += 1
+                else: others += 1 # Bao gồm Note, Info
+
+        report_url_str = None
+        try:
+            # Đảm bảo request_id_param là tên đúng của path parameter trong route ui_pr_report_get
+            report_url_str = str(request.url_for('ui_pr_report_get', request_id_param=pr_req_db.id))
+        except Exception as e:
+            logger.warning(f"Could not generate report URL for PR scan {pr_req_db.id}: {e}")
+
+        analysis_history.append(
+            AnalysisHistoryItem(
+                id=pr_req_db.id,
+                scan_type="pr",
+                identifier=f"PR #{pr_req_db.pr_number}",
+                title=pr_req_db.pr_title,
+                status=pr_req_db.status, # pr_req_db.status là Enum object (PRAnalysisStatus)
+                requested_at=pr_req_db.requested_at,
+                report_url=report_url_str,
+                total_errors=errors,
+                total_warnings=warnings,
+                total_other_findings=others
+            )
+        )
+        
+    # Xử lý Full Project Scans
+    for full_req_db in full_scans_db:
+        errors_full = 0
+        warnings_full = 0
+        others_full = 0 # total_other_findings
+        
+        # TODO: Logic để đếm error/warning cho full scan khi có bảng findings cho full scan
+        # Hiện tại, total_findings trong full_req_db là tổng chung (nếu worker đã cập nhật)
+        if full_req_db.status == FullProjectAnalysisStatus.COMPLETED:
+            # Giả sử bạn sẽ có một bảng tương tự analysisfindings cho full scans,
+            # hoặc bạn cập nhật total_errors, total_warnings trực tiếp vào fullprojectanalysisrequests
+            # Ví dụ, nếu bạn thêm cột total_errors, total_warnings vào model FullProjectAnalysisRequest:
+            # errors_full = full_req_db.total_errors or 0
+            # warnings_full = full_req_db.total_warnings or 0
+            # others_full = (full_req_db.total_findings or 0) - errors_full - warnings_full
+            pass # Để trống cho đến khi có logic cụ thể
+
+        report_url_full_scan_str = None
+        # TODO: Tạo route và trang report cho full scan
+        # Ví dụ: name='ui_full_scan_report_get'
+        # try:
+        #     report_url_full_scan_str = str(request.url_for('ui_full_scan_report_get', request_id_param=full_req_db.id)) # Đảm bảo tên route và param đúng
+        # except Exception as e:
+        #     logger.warning(f"Could not generate report URL for full scan {full_req_db.id}: {e}")
+
+        analysis_history.append(
+            AnalysisHistoryItem(
+                id=full_req_db.id,
+                scan_type="full",
+                identifier=f"Branch: {full_req_db.branch_name}",
+                title=f"Full Scan - {full_req_db.branch_name}",
+                status=full_req_db.status, # full_req_db.status là Enum object (FullProjectAnalysisStatus)
+                requested_at=full_req_db.requested_at,
+                report_url=report_url_full_scan_str,
+                total_errors=errors_full,
+                total_warnings=warnings_full,
+                total_other_findings=full_req_db.total_findings if full_req_db.total_findings is not None and (errors_full + warnings_full == 0) else others_full
+            )
+        )
+
+    analysis_history.sort(key=lambda item: item.requested_at, reverse=True)
+    analysis_history = analysis_history[:20]
+
+    # LOGGING ĐỂ DEBUG (đã có từ lần trước, giữ lại)
+    logger.debug(f"--- Debug analysis_history_items for Project ID {project_id_path} ---")
+    for idx, history_item in enumerate(analysis_history):
+        # Kiểm tra xem status có phải là Enum object không
+        status_value_to_log = history_item.status
+        if hasattr(history_item.status, 'value'):
+            status_value_to_log = history_item.status.value
+        
+        logger.debug(
+            f"Item {idx}: id={history_item.id}, type={history_item.scan_type}, "
+            f"identifier='{history_item.identifier}', title='{history_item.title}', "
+            f"status='{status_value_to_log}', " # In ra value của Enum
+            f"req_at='{history_item.requested_at}', "
+            f"report_url='{history_item.report_url}', "
+            f"errors={history_item.total_errors}, warnings={history_item.total_warnings}, others={history_item.total_other_findings}"
+        )
+        # Tìm item cụ thể gây lỗi (ví dụ PR ID 5)
+        if history_item.id == 5 and history_item.scan_type == 'pr': # Thay 5 bằng ID bạn đang debug
+            logger.info(f"Specific check for PR Scan ID {history_item.id}: Status in history_item is '{status_value_to_log}' (type: {type(history_item.status)})")
+            # Kiểm tra giá trị gốc từ DB object (nếu có thể)
+            original_db_object = next((pr for pr in pr_scans_db if pr.id == history_item.id), None)
+            if original_db_object:
+                logger.info(f"Original DB status for PR Scan ID {original_db_object.id} was '{original_db_object.status.value}' (type: {type(original_db_object.status)})")
+
+    logger.debug("--- End Debug analysis_history_items ---")
 
     return templates.TemplateResponse("pages/projects/project_detail.html", {
         "request": request,
-        "page_title": f"Project: {project_details.repo_name}", # Sử dụng project_details trực tiếp
+        "page_title": f"Project: {project_details.repo_name}",
         "current_user": current_user,
-        "project": project_details, # Truyền project_details (SQLAlchemy model)
-        "pr_analysis_requests": pr_analysis_reqs, # Truyền pr_analysis_reqs (list SQLAlchemy models)
-        # "total_pr_analysis_requests": total_pr_reqs,
+        "project": project_details,
+        "analysis_history_items": analysis_history,
         "current_year": datetime.now().year
     })
 
@@ -667,7 +778,7 @@ async def delete_project_ui_post(
                 logger.exception(f"UI: Unexpected error deleting GitHub webhook for '{repo_name_hook_del}'.")
                 flash_messages.append({"category": "warning", "message": "Error contacting GitHub to delete webhook. Project deleted from NovaGuard."})
         elif gh_webhook_id_hook_del:
-             flash_messages.append({"category": "info", "message": "Could not retrieve GitHub token to delete webhook. Project deleted from NovaGuard."})
+            flash_messages.append({"category": "info", "message": "Could not retrieve GitHub token to delete webhook. Project deleted from NovaGuard."})
 
 
     # Xóa project khỏi DB NovaGuard

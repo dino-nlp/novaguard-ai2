@@ -1,7 +1,9 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Literal, Union
 from datetime import datetime
 from pydantic import BaseModel as PydanticBaseModel, HttpUrl 
+from app.models.full_project_analysis_request_model import FullProjectAnalysisStatus # Import enum
+from app.models.pr_analysis_request_model import PRAnalysisStatus
 
 # Schema cơ bản cho Project
 class ProjectBase(BaseModel):
@@ -55,3 +57,46 @@ class ProjectPublic(ProjectBase):
 class ProjectList(BaseModel):
     projects: list[ProjectPublic]
     total: int
+    
+class FullProjectAnalysisRequestBase(BaseModel):
+    project_id: int
+    branch_name: str
+
+class FullProjectAnalysisRequestCreate(BaseModel): # Input cho API trigger
+    pass # project_id sẽ lấy từ path, branch_name từ project settings
+
+class FullProjectAnalysisRequestPublic(FullProjectAnalysisRequestBase):
+    id: int
+    status: FullProjectAnalysisStatus
+    error_message: Optional[str] = None
+    requested_at: datetime
+    started_at: Optional[datetime] = None
+    source_fetched_at: Optional[datetime] = None
+    ckg_built_at: Optional[datetime] = None
+    analysis_completed_at: Optional[datetime] = None
+    total_files_analyzed: Optional[int] = None
+    total_findings: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+        use_enum_values = True # Để serialize enum thành string
+
+class FullProjectAnalysisRequestList(BaseModel):
+    items: List[FullProjectAnalysisRequestPublic]
+    total: int
+    
+class AnalysisHistoryItem(BaseModel):
+    id: int
+    scan_type: Literal["pr", "full"]
+    identifier: Optional[str] = None # PR number cho PR scan, hoặc Branch cho Full scan
+    title: Optional[str] = None # PR Title cho PR scan
+    status: Union[PRAnalysisStatus, FullProjectAnalysisStatus] # Sử dụng Union để chấp nhận cả hai loại Enum
+    requested_at: datetime
+    report_url: Optional[HttpUrl] = None # URL đến trang report chi tiết
+    total_errors: Optional[int] = 0
+    total_warnings: Optional[int] = 0
+    total_other_findings: Optional[int] = 0
+
+    class Config:
+        from_attributes = True
+        use_enum_values = True

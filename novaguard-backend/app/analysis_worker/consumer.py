@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
+import tempfile # Để tạo thư mục tạm
+import shutil   # Để xóa thư mục
+import git      # Nếu dùng GitPython
+from pathlib import Path
+
 from sqlalchemy.orm import Session, sessionmaker  # Đảm bảo import Session
 # from kafka import KafkaConsumer, KafkaError # KafkaConsumer, KafkaError được dùng trong hàm main_worker
 
@@ -22,6 +27,9 @@ from app.models import User, Project, PRAnalysisRequest, PRAnalysisStatus, Analy
 from app.webhook_service import crud_pr_analysis
 from app.analysis_module import crud_finding, schemas_finding as am_schemas 
 from app.common.github_client import GitHubAPIClient
+from app.project_service import crud_full_scan
+from app.models import FullProjectAnalysisStatus # Import Enum
+
 
 # Import Pydantic models cho LLM output
 from .llm_schemas import  LLMStructuredOutput
@@ -247,8 +255,7 @@ async def run_code_analysis_agent_v1(
         analysis_findings_to_create: List[am_schemas.AnalysisFindingCreate] = []
         if structured_llm_output and structured_llm_output.findings:
             for llm_finding in structured_llm_output.findings:
-                # ... (logic trích xuất code snippet và tạo finding_for_db như cũ) ...
-                # Ví dụ:
+                
                 code_snippet_text = None
                 if llm_finding.file_path and llm_finding.line_start is not None:
                     original_file_content = None
@@ -333,189 +340,333 @@ async def run_code_analysis_agent_v1(
         logger.exception(f"Worker: Unexpected error during code analysis agent execution for PR '{pr_title_for_log}': {type(e).__name__} - {e}")
         return []
 
-async def process_message_logic(message_value: dict, db: Session, settings_obj):
-    pr_analysis_request_id = message_value.get("pr_analysis_request_id")
-    if not pr_analysis_request_id: 
-        logger.error("PML: Kafka message missing 'pr_analysis_request_id'. Skipping.")
-        return
+async def process_message_logic(message_value: dict, db: Session, settings_obj: Settings):
+    task_type = message_value.get("task_type", "pr_analysis") # Mặc định là pr_analysis nếu không có
+    if task_type == "pr_analysis":
+        pr_analysis_request_id = message_value.get("pr_analysis_request_id")
+        if not pr_analysis_request_id: 
+            logger.error("PML: Kafka message missing 'pr_analysis_request_id'. Skipping.")
+            return
 
-    logger.info(f"PML: Starting processing for PRAnalysisRequest ID: {pr_analysis_request_id}")
-    db_pr_request = crud_pr_analysis.get_pr_analysis_request_by_id(db, pr_analysis_request_id)
+        logger.info(f"PML: Starting processing for PRAnalysisRequest ID: {pr_analysis_request_id}")
+        db_pr_request = crud_pr_analysis.get_pr_analysis_request_by_id(db, pr_analysis_request_id)
 
-    if not db_pr_request:
-        logger.error(f"PML: PRAnalysisRequest ID {pr_analysis_request_id} not found in DB. Skipping.")
-        return
+        if not db_pr_request:
+            logger.error(f"PML: PRAnalysisRequest ID {pr_analysis_request_id} not found in DB. Skipping.")
+            return
 
-    # Chỉ xử lý nếu đang PENDING, hoặc FAILED (để thử lại), hoặc DATA_FETCHED (để chạy lại LLM nếu cần)
-    if db_pr_request.status not in [PRAnalysisStatus.PENDING, PRAnalysisStatus.FAILED, PRAnalysisStatus.DATA_FETCHED]:
-        logger.info(f"PML: PR ID {pr_analysis_request_id} has status '{db_pr_request.status.value}', not processable now. Skipping.")
-        return
-    
-    db_project = db.query(Project).filter(Project.id == db_pr_request.project_id).first()
-    if not db_project:
-        error_msg = f"Associated project (ID: {db_pr_request.project_id}) not found for PR ID {pr_analysis_request_id}."
-        logger.error(error_msg)
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-        return
-
-    # Cập nhật status lên PROCESSING, xóa error_message cũ nếu có
-    crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.PROCESSING, error_message=None)
-    logger.info(f"PML: Updated PR ID {pr_analysis_request_id} to PROCESSING.")
-
-    user_id = message_value.get("user_id")
-    if not user_id:
-        error_msg = f"User ID missing in Kafka message for PRAnalysisRequest {pr_analysis_request_id}."
-        logger.error(error_msg)
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-        return
-
-    db_user = db.query(User).filter(User.id == user_id).first()
-    if not db_user or not db_user.github_access_token_encrypted:
-        error_msg = f"User (ID: {user_id}) not found or GitHub token missing for PR ID {pr_analysis_request_id}."
-        logger.error(error_msg)
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-        return
-    
-    github_token = decrypt_data(db_user.github_access_token_encrypted)
-    if not github_token:
-        error_msg = f"GitHub token decryption failed for user ID {user_id} (PR ID {pr_analysis_request_id})."
-        logger.error(error_msg)
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-        return
-    
-    gh_client = GitHubAPIClient(token=github_token)
-    
-    if '/' not in db_project.repo_name:
-        error_msg = f"Invalid project repo_name format: {db_project.repo_name} for project ID {db_project.id}."
-        logger.error(error_msg)
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-        return
-    owner, repo_slug = db_project.repo_name.split('/', 1)
-    
-    pr_number = db_pr_request.pr_number
-    head_sha_from_webhook = message_value.get("head_sha", db_pr_request.head_sha)
-
-    try:
-        logger.info(f"PML: Fetching GitHub data for PR ID {pr_analysis_request_id}...")
-        raw_pr_data = await fetch_pr_data_from_github(gh_client, owner, repo_slug, pr_number, head_sha_from_webhook)
+        # Chỉ xử lý nếu đang PENDING, hoặc FAILED (để thử lại), hoặc DATA_FETCHED (để chạy lại LLM nếu cần)
+        if db_pr_request.status not in [PRAnalysisStatus.PENDING, PRAnalysisStatus.FAILED, PRAnalysisStatus.DATA_FETCHED]:
+            logger.info(f"PML: PR ID {pr_analysis_request_id} has status '{db_pr_request.status.value}', not processable now. Skipping.")
+            return
         
-        if raw_pr_data.get("pr_metadata"):
-            # ... (cập nhật db_pr_request với metadata từ GitHub) ...
-            pr_meta = raw_pr_data["pr_metadata"]
-            db_pr_request.pr_title = pr_meta.get("title", db_pr_request.pr_title)
-            html_url_val = pr_meta.get("html_url")
-            db_pr_request.pr_github_url = str(html_url_val) if html_url_val else db_pr_request.pr_github_url
-        db_pr_request.head_sha = raw_pr_data.get("head_sha", db_pr_request.head_sha)
-        db.commit()
-        db.refresh(db_pr_request)
+        db_project = db.query(Project).filter(Project.id == db_pr_request.project_id).first()
+        if not db_project:
+            error_msg = f"Associated project (ID: {db_pr_request.project_id}) not found for PR ID {pr_analysis_request_id}."
+            logger.error(error_msg)
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
+            return
 
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.DATA_FETCHED)
-        logger.info(f"PML: PR ID {pr_analysis_request_id} status updated to DATA_FETCHED. Preparing for LLM analysis.")
+        # Cập nhật status lên PROCESSING, xóa error_message cũ nếu có
+        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.PROCESSING, error_message=None)
+        logger.info(f"PML: Updated PR ID {pr_analysis_request_id} to PROCESSING.")
 
-        # Tạo dynamic_context
-        dynamic_context = create_dynamic_project_context(raw_pr_data, db_project, db_pr_request)
-        # QUAN TRỌNG: Thêm raw_pr_data['changed_files'] vào context để agent có thể dùng để trích xuất snippet
-        dynamic_context["raw_pr_data_changed_files"] = raw_pr_data.get("changed_files", [])
+        user_id = message_value.get("user_id")
+        if not user_id:
+            error_msg = f"User ID missing in Kafka message for PRAnalysisRequest {pr_analysis_request_id}."
+            logger.error(error_msg)
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
+            return
+
+        db_user = db.query(User).filter(User.id == user_id).first()
+        if not db_user or not db_user.github_access_token_encrypted:
+            error_msg = f"User (ID: {user_id}) not found or GitHub token missing for PR ID {pr_analysis_request_id}."
+            logger.error(error_msg)
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
+            return
         
-        logger.info(f"PML: Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
+        github_token = decrypt_data(db_user.github_access_token_encrypted)
+        if not github_token:
+            error_msg = f"GitHub token decryption failed for user ID {user_id} (PR ID {pr_analysis_request_id})."
+            logger.error(error_msg)
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
+            return
         
-        # Gọi agent mới thay vì run_deep_logic_bug_hunter_mvp1 cũ
-        analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
-            dynamic_context=dynamic_context,
-            settings_obj=settings_obj
-        )
+        gh_client = GitHubAPIClient(token=github_token)
         
-        if analysis_findings_create_schemas:
-            # crud_finding.create_analysis_findings nhận List[AnalysisFindingCreate]
-            created_db_findings = crud_finding.create_analysis_findings(
-                db, 
-                pr_analysis_request_id, 
-                analysis_findings_create_schemas # Đây là list các Pydantic model
-            )
-            logger.info(f"PML: Saved {len(created_db_findings)} findings from Langchain agent for PR ID {pr_analysis_request_id}.")
-        else:
-            logger.info(f"PML: Langchain agent returned no findings for PR ID {pr_analysis_request_id}.")
-
-        crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.COMPLETED)
-        logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
+        if '/' not in db_project.repo_name:
+            error_msg = f"Invalid project repo_name format: {db_project.repo_name} for project ID {db_project.id}."
+            logger.error(error_msg)
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
+            return
+        owner, repo_slug = db_project.repo_name.split('/', 1)
         
-        if db_pr_request.status == PRAnalysisStatus.COMPLETED:
-            logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED. Attempting to post summary comment to GitHub.")
+        pr_number = db_pr_request.pr_number
+        head_sha_from_webhook = message_value.get("head_sha", db_pr_request.head_sha)
 
-            # Lấy GitHub token (đã có logic ở phần fetch data)
-            # github_token đã được giải mã ở trên
-            if github_token and settings_obj.NOVAGUARD_PUBLIC_URL: # NOVAGUARD_PUBLIC_URL cần để tạo link báo cáo
-                try:
-                    gh_client_for_comment = GitHubAPIClient(token=github_token)
-
-                    num_errors = 0
-                    num_warnings = 0
-                    # Giả sử bạn đã query lại các findings từ DB hoặc có chúng từ `created_db_findings`
-                    # Nếu không, bạn cần query lại:
-                    # all_findings_for_pr = crud_finding.get_findings_by_request_id(db, pr_analysis_request_id)
-                    # Thay vì query lại, tốt hơn là dùng kết quả từ `created_db_findings` nếu có
-
-                    # Lấy lại findings từ DB để đảm bảo có ID chính xác (nếu created_db_findings không đầy đủ)
-                    # Hoặc bạn có thể dùng `analysis_findings_create_schemas` để đếm trước khi lưu DB
-
-                    # Để đơn giản, giả sử `analysis_findings_create_schemas` phản ánh đúng những gì sẽ được lưu
-                    for finding_schema in analysis_findings_create_schemas: # Hoặc lặp qua created_db_findings
-                        if finding_schema.severity.lower() == 'error':
-                            num_errors += 1
-                        elif finding_schema.severity.lower() == 'warning':
-                            num_warnings += 1
-
-                    report_url = f"{settings_obj.NOVAGUARD_PUBLIC_URL.rstrip('/')}/ui/reports/pr-analysis/{pr_analysis_request_id}/report"
-
-                    comment_body = f"### NovaGuard AI Analysis Report 🤖\n\n"
-                    comment_body += f"NovaGuard AI has completed the analysis for this Pull Request.\n\n"
-                    if num_errors == 0 and num_warnings == 0 and not analysis_findings_create_schemas:
-                        comment_body += f"✅ No significant issues found.\n\n"
-                    else:
-                        comment_body += f"🔍 **Summary:**\n"
-                        if num_errors > 0:
-                            comment_body += f"  - **{num_errors} Error(s)** found.\n"
-                        if num_warnings > 0:
-                            comment_body += f"  - **{num_warnings} Warning(s)** found.\n"
-                        other_findings_count = len(analysis_findings_create_schemas) - num_errors - num_warnings
-                        if other_findings_count > 0:
-                            comment_body += f"  - **{other_findings_count} Note/Info item(s)** found.\n"
-                        comment_body += f"\n"
-
-                    comment_body += f"👉 [**View Full Report on NovaGuard AI**]({report_url})\n\n"
-                    comment_body += f"---\n*Powered by NovaGuard AI*"
-
-                    # owner, repo_slug từ db_project.repo_name
-                    if '/' not in db_project.repo_name:
-                        logger.error(f"Cannot post comment: Invalid project repo_name format: {db_project.repo_name}")
-                    else:
-                        owner_for_comment, repo_slug_for_comment = db_project.repo_name.split('/', 1)
-                        pr_number_for_comment = db_pr_request.pr_number
-
-                        comment_response = await gh_client_for_comment.create_pr_comment(
-                            owner=owner_for_comment,
-                            repo=repo_slug_for_comment,
-                            pr_number=pr_number_for_comment,
-                            body=comment_body
-                        )
-                        if comment_response and comment_response.get("id"):
-                            logger.info(f"Successfully posted summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}. Comment ID: {comment_response.get('id')}")
-                        else:
-                            logger.error(f"Failed to post summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}.")
-                except Exception as e_comment:
-                    logger.exception(f"Error attempting to post comment to GitHub for PR ID {pr_analysis_request_id}: {e_comment}")
-            elif not settings_obj.NOVAGUARD_PUBLIC_URL:
-                logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: NOVAGUARD_PUBLIC_URL is not set.")
-            elif not github_token:
-                logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: GitHub token is missing or could not be decrypted.")
-
-    except Exception as e:
-        error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id} (Provider: {settings_obj.DEFAULT_LLM_PROVIDER}): {type(e).__name__} - {str(e)}"
-        logger.exception(error_msg_detail)
         try:
-            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020])
-        except Exception as db_error:
-            logger.error(f"PML: Additionally, failed to update PR ID {pr_analysis_request_id} status to FAILED: {db_error}")
+            logger.info(f"PML: Fetching GitHub data for PR ID {pr_analysis_request_id}...")
+            raw_pr_data = await fetch_pr_data_from_github(gh_client, owner, repo_slug, pr_number, head_sha_from_webhook)
+            
+            if raw_pr_data.get("pr_metadata"):
+                # ... (cập nhật db_pr_request với metadata từ GitHub) ...
+                pr_meta = raw_pr_data["pr_metadata"]
+                db_pr_request.pr_title = pr_meta.get("title", db_pr_request.pr_title)
+                html_url_val = pr_meta.get("html_url")
+                db_pr_request.pr_github_url = str(html_url_val) if html_url_val else db_pr_request.pr_github_url
+            db_pr_request.head_sha = raw_pr_data.get("head_sha", db_pr_request.head_sha)
+            db.commit()
+            db.refresh(db_pr_request)
+
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.DATA_FETCHED)
+            logger.info(f"PML: PR ID {pr_analysis_request_id} status updated to DATA_FETCHED. Preparing for LLM analysis.")
+
+            # Tạo dynamic_context
+            dynamic_context = create_dynamic_project_context(raw_pr_data, db_project, db_pr_request)
+            # QUAN TRỌNG: Thêm raw_pr_data['changed_files'] vào context để agent có thể dùng để trích xuất snippet
+            dynamic_context["raw_pr_data_changed_files"] = raw_pr_data.get("changed_files", [])
+            
+            logger.info(f"PML: Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
+            
+            # Gọi agent mới thay vì run_deep_logic_bug_hunter_mvp1 cũ
+            analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
+                dynamic_context=dynamic_context,
+                settings_obj=settings_obj
+            )
+            
+            if analysis_findings_create_schemas:
+                # crud_finding.create_analysis_findings nhận List[AnalysisFindingCreate]
+                created_db_findings = crud_finding.create_analysis_findings(
+                    db, 
+                    pr_analysis_request_id, 
+                    analysis_findings_create_schemas # Đây là list các Pydantic model
+                )
+                logger.info(f"PML: Saved {len(created_db_findings)} findings from Langchain agent for PR ID {pr_analysis_request_id}.")
+            else:
+                logger.info(f"PML: Langchain agent returned no findings for PR ID {pr_analysis_request_id}.")
+
+            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.COMPLETED)
+            logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
+            
+            if db_pr_request.status == PRAnalysisStatus.COMPLETED:
+                logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED. Attempting to post summary comment to GitHub.")
+
+                # Lấy GitHub token (đã có logic ở phần fetch data)
+                # github_token đã được giải mã ở trên
+                if github_token and settings_obj.NOVAGUARD_PUBLIC_URL: # NOVAGUARD_PUBLIC_URL cần để tạo link báo cáo
+                    try:
+                        gh_client_for_comment = GitHubAPIClient(token=github_token)
+
+                        num_errors = 0
+                        num_warnings = 0
+                        # Giả sử bạn đã query lại các findings từ DB hoặc có chúng từ `created_db_findings`
+                        # Nếu không, bạn cần query lại:
+                        # all_findings_for_pr = crud_finding.get_findings_by_request_id(db, pr_analysis_request_id)
+                        # Thay vì query lại, tốt hơn là dùng kết quả từ `created_db_findings` nếu có
+
+                        # Lấy lại findings từ DB để đảm bảo có ID chính xác (nếu created_db_findings không đầy đủ)
+                        # Hoặc bạn có thể dùng `analysis_findings_create_schemas` để đếm trước khi lưu DB
+
+                        # Để đơn giản, giả sử `analysis_findings_create_schemas` phản ánh đúng những gì sẽ được lưu
+                        for finding_schema in analysis_findings_create_schemas: # Hoặc lặp qua created_db_findings
+                            if finding_schema.severity.lower() == 'error':
+                                num_errors += 1
+                            elif finding_schema.severity.lower() == 'warning':
+                                num_warnings += 1
+
+                        report_url = f"{settings_obj.NOVAGUARD_PUBLIC_URL.rstrip('/')}/ui/reports/pr-analysis/{pr_analysis_request_id}/report"
+
+                        comment_body = f"### NovaGuard AI Analysis Report 🤖\n\n"
+                        comment_body += f"NovaGuard AI has completed the analysis for this Pull Request.\n\n"
+                        if num_errors == 0 and num_warnings == 0 and not analysis_findings_create_schemas:
+                            comment_body += f"✅ No significant issues found.\n\n"
+                        else:
+                            comment_body += f"🔍 **Summary:**\n"
+                            if num_errors > 0:
+                                comment_body += f"  - **{num_errors} Error(s)** found.\n"
+                            if num_warnings > 0:
+                                comment_body += f"  - **{num_warnings} Warning(s)** found.\n"
+                            other_findings_count = len(analysis_findings_create_schemas) - num_errors - num_warnings
+                            if other_findings_count > 0:
+                                comment_body += f"  - **{other_findings_count} Note/Info item(s)** found.\n"
+                            comment_body += f"\n"
+
+                        comment_body += f"👉 [**View Full Report on NovaGuard AI**]({report_url})\n\n"
+                        comment_body += f"---\n*Powered by NovaGuard AI*"
+
+                        # owner, repo_slug từ db_project.repo_name
+                        if '/' not in db_project.repo_name:
+                            logger.error(f"Cannot post comment: Invalid project repo_name format: {db_project.repo_name}")
+                        else:
+                            owner_for_comment, repo_slug_for_comment = db_project.repo_name.split('/', 1)
+                            pr_number_for_comment = db_pr_request.pr_number
+
+                            comment_response = await gh_client_for_comment.create_pr_comment(
+                                owner=owner_for_comment,
+                                repo=repo_slug_for_comment,
+                                pr_number=pr_number_for_comment,
+                                body=comment_body
+                            )
+                            if comment_response and comment_response.get("id"):
+                                logger.info(f"Successfully posted summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}. Comment ID: {comment_response.get('id')}")
+                            else:
+                                logger.error(f"Failed to post summary comment to GitHub PR {owner_for_comment}/{repo_slug_for_comment}#{pr_number_for_comment}.")
+                    except Exception as e_comment:
+                        logger.exception(f"Error attempting to post comment to GitHub for PR ID {pr_analysis_request_id}: {e_comment}")
+                elif not settings_obj.NOVAGUARD_PUBLIC_URL:
+                    logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: NOVAGUARD_PUBLIC_URL is not set.")
+                elif not github_token:
+                    logger.warning(f"Cannot post comment to GitHub for PR ID {pr_analysis_request_id}: GitHub token is missing or could not be decrypted.")
+
+        except Exception as e:
+            error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id} (Provider: {settings_obj.DEFAULT_LLM_PROVIDER}): {type(e).__name__} - {str(e)}"
+            logger.exception(error_msg_detail)
+            try:
+                crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020])
+            except Exception as db_error:
+                logger.error(f"PML: Additionally, failed to update PR ID {pr_analysis_request_id} status to FAILED: {db_error}")
+    elif task_type == "full_project_scan":
+        full_scan_request_id = message_value.get("full_project_analysis_request_id")
+        if not full_scan_request_id:
+            logger.error("Full Project Scan: Kafka message missing 'full_project_analysis_request_id'. Skipping.")
+            return
+
+        logger.info(f"Full Project Scan: Starting processing for Request ID: {full_scan_request_id}")
+        db_full_scan_request = crud_full_scan.get_full_scan_request_by_id(db, full_scan_request_id)
+
+        if not db_full_scan_request:
+            logger.error(f"Full Project Scan: Request ID {full_scan_request_id} not found in DB. Skipping.")
+            return
+
+        if db_full_scan_request.status not in [FullProjectAnalysisStatus.PENDING, FullProjectAnalysisStatus.FAILED]:
+            logger.info(f"Full Project Scan: Request ID {full_scan_request_id} has status '{db_full_scan_request.status.value}', not processable now. Skipping.")
+            return
+
+        # Lấy thông tin project và user
+        project_id = message_value.get("project_id")
+        user_id = message_value.get("user_id")
+        repo_full_name = message_value.get("repo_full_name") # "owner/repo"
+        branch_to_scan = message_value.get("branch_to_scan")
+
+        if not all([project_id, user_id, repo_full_name, branch_to_scan]):
+            error_msg = f"Full Project Scan: Missing critical info in Kafka message for Request ID {full_scan_request_id}."
+            logger.error(error_msg)
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
+            return
+
+        db_project_model = db.query(Project).filter(Project.id == project_id).first()
+        db_user_model = db.query(User).filter(User.id == user_id).first()
+
+        if not db_project_model or not db_user_model or not db_user_model.github_access_token_encrypted:
+            error_msg = f"Full Project Scan: Project/User not found or GitHub token missing for Request ID {full_scan_request_id}."
+            logger.error(error_msg)
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
+            return
+
+        crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.PROCESSING, error_message=None)
+        logger.info(f"Full Project Scan: Updated Request ID {full_scan_request_id} to PROCESSING.")
+
+        github_token = decrypt_data(db_user_model.github_access_token_encrypted)
+        if not github_token:
+            error_msg = f"Full Project Scan: GitHub token decryption failed for User ID {user_id} (Request ID {full_scan_request_id})."
+            logger.error(error_msg)
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
+            return
+
+        repo_clone_dir = None
+        try:
+            # --- Bước 1: Fetch/Clone source code ---
+            # Sử dụng tempfile để tạo thư mục tạm an toàn
+            repo_clone_dir_obj = tempfile.TemporaryDirectory(prefix=f"novaguard_scan_{full_scan_request_id}_")
+            repo_clone_dir = repo_clone_dir_obj.name
+            logger.info(f"Full Project Scan: Cloning {repo_full_name} (branch: {branch_to_scan}) into {repo_clone_dir}")
+
+            # URL để clone (HTTPS với token)
+            # Cần đảm bảo github_token không chứa ký tự đặc biệt làm hỏng URL, hoặc encode nó.
+            # Tuy nhiên, GitPython thường xử lý việc này nếu token được truyền đúng cách.
+            # Đối với clone qua HTTPS, token thường được nhúng vào URL.
+            # Hoặc, GitPython có thể hỗ trợ các cơ chế xác thực khác.
+            # Cách đơn giản nhất là nhúng token:
+            # repo_url_with_token = f"https://oauth2:{github_token}@github.com/{repo_full_name}.git"
+            # Tuy nhiên, cách này lộ token trong log nếu URL được log.
+
+            # Cách an toàn hơn là dùng GitPython với thông tin xác thực riêng,
+            # nhưng nó hơi phức tạp hơn.
+            # Cho MVP, có thể dùng subprocess và truyền token qua biến môi trường hoặc file credential helper.
+            #
+            # Giả sử dùng GitPython với URL có token (CẢNH BÁO: Lộ token nếu log URL)
+            # Hoặc, nếu bạn thiết lập Git Credential Helper bên trong container.
+            #
+            # Cách an toàn và đơn giản hơn với GitPython khi có token:
+            # Không nhúng token vào URL. GitPython có thể không trực tiếp hỗ trợ token
+            # cho clone dễ dàng như username/password.
+            #
+            # => Sử dụng GitHubAPIClient để lấy tarball/zipball của repo tại commit/branch cụ thể
+            #    là một lựa chọn tốt hơn để tránh phức tạp của Git CLI và xác thực trong worker.
+
+            gh_client = GitHubAPIClient(token=github_token)
+            archive_link = await gh_client.get_repository_archive_link(
+                owner=repo_full_name.split('/')[0],
+                repo=repo_full_name.split('/')[1],
+                ref=branch_to_scan,
+                archive_format="tarball" # hoặc "zipball"
+            )
+
+            if not archive_link:
+                raise Exception("Failed to get repository archive link from GitHub.")
+
+            logger.info(f"Full Project Scan: Downloading archive from {archive_link}...")
+            # Hàm download và giải nén archive
+            await gh_client.download_and_extract_archive(archive_link, repo_clone_dir)
+            logger.info(f"Full Project Scan: Successfully downloaded and extracted source code to {repo_clone_dir}")
+
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.SOURCE_FETCHED)
+
+            # --- Bước 2: (Sẽ thêm ở bước sau) Xây dựng/Cập nhật CKG ---
+            # crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.CKG_BUILDING)
+            # logger.info(f"Full Project Scan: Starting CKG build for Request ID {full_scan_request_id}")
+            # # Gọi logic xây dựng CKG ở đây, truyền vào repo_clone_dir, project_id
+            # # ckg_builder.build_or_update_for_project(db_project_model.id, repo_clone_dir)
+            # db_full_scan_request.ckg_built_at = datetime.now(timezone.utc)
+            # db.commit()
+            # db.refresh(db_full_scan_request)
+
+            # --- Bước 3: (Sẽ thêm ở bước sau) Phân tích code với LLM Agents ---
+            # crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING)
+            # logger.info(f"Full Project Scan: Starting LLM analysis for Request ID {full_scan_request_id}")
+            # # Tạo DynamicProjectContext cho toàn bộ project
+            # # Gọi các agents
+            # # Lưu findings (có thể vào bảng findings riêng cho full scan)
+
+            # Tạm thời cho MVP2 của Full Scan (phần 1): chỉ fetch code và đánh dấu hoàn thành
+            # (Sau này sẽ thêm logic CKG và analysis)
+            logger.warning(f"Full Project Scan: CKG Building and LLM Analysis for full project are NOT YET IMPLEMENTED. Marking as completed after source fetch for now (Request ID: {full_scan_request_id}).")
+
+            # Đếm số file (ví dụ)
+            num_files = sum(1 for _ in Path(repo_clone_dir).rglob('*') if _.is_file())
+            db_full_scan_request.total_files_analyzed = num_files
+            db.commit()
+            db.refresh(db_full_scan_request)
+
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.COMPLETED)
+            logger.info(f"Full Project Scan: Request ID {full_scan_request_id} marked as COMPLETED (placeholder until full analysis logic is added).")
+
+        except Exception as e_full_scan:
+            error_msg_detail = f"Full Project Scan: Error processing Request ID {full_scan_request_id}: {type(e_full_scan).__name__} - {str(e_full_scan)}"
+            logger.exception(error_msg_detail)
+            try:
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg_detail[:1020])
+            except Exception as db_error_fs:
+                logger.error(f"Full Project Scan: Additionally, failed to update Request ID {full_scan_request_id} status to FAILED: {db_error_fs}")
+        finally:
+            if repo_clone_dir_obj and Path(repo_clone_dir_obj.name).exists():
+                try:
+                    # repo_clone_dir_obj.cleanup() # TemporaryDirectory sẽ tự xóa khi ra khỏi scope hoặc khi object bị delete
+                    logger.info(f"Full Project Scan: Cleaned up temporary directory: {repo_clone_dir_obj.name}")
+                except Exception as e_cleanup:
+                     logger.error(f"Full Project Scan: Error cleaning up temp directory {repo_clone_dir_obj.name}: {e_cleanup}")
+    else:
+        logger.warning(f"Unknown task_type received in Kafka message: {task_type}")
 
 
 # --- Kafka Consumer Loop and Main Worker Function ---

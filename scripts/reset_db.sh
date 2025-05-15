@@ -12,7 +12,6 @@ DB_NAME="novaguard_db"        # Tên database
 
 # --- Function to check if docker compose service is running ---
 is_db_service_running() {
-    # Versuche, den Container-Namen auf verschiedene Arten zu finden
     local container_name
     container_name=$(docker compose ps -q "${DB_SERVICE_NAME}" 2>/dev/null)
 
@@ -57,30 +56,48 @@ echo "Proceeding with database reset for '${DB_NAME}'..."
 
 # SQL commands to drop all known objects.
 # Order is important for objects that depend on each other, unless CASCADE is used.
-# Using fully qualified names (e.g., public.tablename) is safer if not default schema.
-# PostgreSQL table names are case-sensitive if quoted during creation,
-# but typically lowercased if not. Your schema.sql uses mixed case with quotes for tables.
-# The ENUM type created by SQLAlchemy will be lowercase.
+# The 'projects' table now has a foreign key to 'fullprojectanalysisrequests'
+# (last_full_scan_request_id), so 'projects' might need to be dropped before
+# 'fullprojectanalysisrequests' if not using CASCADE, OR 'fullprojectanalysisrequests'
+# should be dropped with CASCADE if 'projects' still references it.
+# Using CASCADE is generally safer for a full reset.
+
+# ENUM type names from your SQLAlchemy models (case-sensitive if defined so,
+# but typically lowercased by SQLAlchemy when creating in DB if not quoted in name='...').
+# From pr_analysis_request_model.py: name="pr_analysis_status_enum"
+# From full_project_analysis_request_model.py: name="full_project_analysis_status_enum"
+# From project_model.py: name="project_last_full_scan_status_enum" (create_type=False, so it uses the one from FullProjectAnalysisStatus)
 
 DROP_COMMANDS=$(cat <<EOF
--- Drop tables in reverse order of dependency, or use CASCADE
--- If a table has a foreign key referencing another, the referenced table should be dropped later,
--- or the referencing table should be dropped with CASCADE.
+-- Drop tables in an order that respects FKs, or use CASCADE.
+-- With CASCADE, the order is less critical, but it's good practice.
+
+-- Foreign keys in 'projects' might reference 'fullprojectanalysisrequests'.
+-- 'analysisfindings' references 'pranalysisrequests'.
+-- 'pranalysisrequests' references 'projects'.
+-- 'projects' references 'users' and 'fullprojectanalysisrequests'.
+-- 'fullprojectanalysisrequests' references 'projects'.
+-- This creates a cycle if projects.last_full_scan_request_id is FK to fullprojectanalysisrequests.id
+-- and fullprojectanalysisrequests.project_id is FK to projects.id.
+-- Using CASCADE will handle this.
 
 DROP TABLE IF EXISTS "analysisfindings" CASCADE;
 DROP TABLE IF EXISTS "pranalysisrequests" CASCADE;
-DROP TABLE IF EXISTS "projects" CASCADE;
+-- DROP TABLE IF EXISTS "projects" CASCADE; -- Will be dropped due to CASCADE from fullprojectanalysisrequests if cycle exists, or needs to be after fullprojectanalysisrequests
+DROP TABLE IF EXISTS "fullprojectanalysisrequests" CASCADE; -- Drop this first if projects refers to it
+DROP TABLE IF EXISTS "projects" CASCADE; -- Now drop projects (if not already dropped by cascade)
 DROP TABLE IF EXISTS "users" CASCADE;
 
--- Drop custom ENUM types created by SQLAlchemy or defined in schema.sql
--- The name of the enum type is 'pr_analysis_status_enum' as defined in your model
--- and `status VARCHAR(20) CHECK \(status IN (...)\)` in schema.sql is a CHECK constraint, not a named ENUM type.
--- If SQLAlchemy's SQLAlchemyEnum(..., name='pr_analysis_status_enum', create_type=True)
--- actually created a PostgreSQL ENUM type, you'd drop it like this:
+-- Drop custom ENUM types created by SQLAlchemy.
+-- Check your database for the exact names if unsure.
+-- SQLAlchemy usually lowercases them.
 DROP TYPE IF EXISTS pr_analysis_status_enum CASCADE;
--- Add other custom ENUM types here if you have them.
+DROP TYPE IF EXISTS full_project_analysis_status_enum CASCADE;
+-- The project_last_full_scan_status_enum uses the same type as full_project_analysis_status_enum
+-- so dropping full_project_analysis_status_enum should be sufficient.
+-- If you defined other ENUMs directly in schema.sql with CREATE TYPE, add them here.
 
--- Drop functions
+-- Drop functions (if any custom ones besides the trigger)
 DROP FUNCTION IF EXISTS trigger_set_timestamp() CASCADE;
 
 -- If you were using Alembic, you might also drop its version table:

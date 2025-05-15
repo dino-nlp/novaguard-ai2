@@ -10,7 +10,7 @@ from pydantic import BaseModel as PydanticBaseModel, HttpUrl
 from app.core.db import get_db
 from app.core.config import settings
 from app.core.security import decrypt_data
-from app.models import User, Project # Đảm bảo Project được import
+from app.models import User, Project, FullProjectAnalysisStatus, FullProjectAnalysisRequest
 from sqlalchemy import func
 
 # Import schemas từ project_service và auth_service, dùng bí danh để rõ ràng
@@ -24,6 +24,9 @@ from app.webhook_service import schemas_pr_analysis # Giả sử bạn đặt t�
 from app.webhook_service import crud_pr_analysis # Đổi tên pr_crud nếu trùng
 from app.analysis_module import schemas_finding as finding_schemas
 from app.analysis_module import crud_finding as finding_crud
+
+from . import crud_full_scan
+from app.common.message_queue.kafka_producer import send_pr_analysis_task 
 
 
 router = APIRouter()
@@ -297,7 +300,7 @@ async def create_new_project(
                 else:
                     logger.error(f"Failed to create webhook for '{db_project.repo_name}' (Status 422 - Unprocessable): {hook_response.text}")
             elif hook_response.status_code == 404: # Not Found (repo không tồn tại trên GitHub hoặc token không có quyền)
-                 logger.error(f"Failed to create webhook for '{db_project.repo_name}' (Status 404 - Not Found). Repo may not exist or token lacks permission. Response: {hook_response.text}")
+                logger.error(f"Failed to create webhook for '{db_project.repo_name}' (Status 404 - Not Found). Repo may not exist or token lacks permission. Response: {hook_response.text}")
             else:
                 hook_response.raise_for_status() # Raise lỗi cho các status code khác
         
@@ -498,3 +501,67 @@ async def delete_existing_project_api( # Đổi tên hàm để rõ ràng là AP
         logger.error(f"API: Project {project_id} was confirmed to exist but delete operation in DB returned None. This is unexpected.")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error deleting project from database after initial checks.")
 
+
+@router.post(
+    "/{project_id}/full-scan",
+    response_model=project_schemas_module.FullProjectAnalysisRequestPublic, # Sửa lại nếu tên schema khác
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Trigger a Full Project Scan"
+)
+async def trigger_full_project_scan(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: auth_schemas_module.UserPublic = Depends(get_current_active_user) # get_current_active_user đã có
+):
+    logger.info(f"User {current_user.email} triggering full project scan for project ID: {project_id}")
+    db_project = crud_project.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
+    if not db_project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found or not owned by user")
+
+    # Kiểm tra xem có scan nào đang chạy không (tùy chọn, để tránh spam)
+    existing_scans = db.query(FullProjectAnalysisRequest).filter(
+        FullProjectAnalysisRequest.project_id == project_id,
+        FullProjectAnalysisRequest.status.in_([
+            FullProjectAnalysisStatus.PENDING, FullProjectAnalysisStatus.PROCESSING,
+            FullProjectAnalysisStatus.SOURCE_FETCHED, FullProjectAnalysisStatus.CKG_BUILDING,
+            FullProjectAnalysisStatus.ANALYZING
+        ])
+    ).first()
+    if existing_scans:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A full project scan is already in progress or pending for this project (Request ID: {existing_scans.id}, Status: {existing_scans.status.value})."
+        )
+
+
+    scan_request = crud_full_scan.create_full_scan_request(
+        db=db, project_id=db_project.id, branch_name=db_project.main_branch
+    )
+    logger.info(f"Created FullProjectAnalysisRequest ID: {scan_request.id} for project {db_project.repo_name}, branch {db_project.main_branch}")
+
+    # Gửi message vào Kafka
+    # Cần một topic riêng cho full scan hoặc một trường để phân biệt task_type
+    # Ví dụ: thêm "task_type": "full_project_scan"
+    kafka_task_data = {
+        "task_type": "full_project_scan", # Để worker phân biệt
+        "full_project_analysis_request_id": scan_request.id,
+        "project_id": db_project.id,
+        "user_id": current_user.id, # Để worker lấy GitHub token
+        "github_repo_id": db_project.github_repo_id, # ID repo trên GitHub
+        "repo_full_name": db_project.repo_name, # Ví dụ: "owner/repo"
+        "branch_to_scan": db_project.main_branch,
+    }
+
+    # Sử dụng lại KAFKA_PR_ANALYSIS_TOPIC nhưng với task_type khác,
+    # hoặc tạo KAFKA_FULL_SCAN_TOPIC mới
+    # Hiện tại, giả sử dùng chung topic và phân biệt bằng task_type
+    success = await send_pr_analysis_task(kafka_task_data) # send_pr_analysis_task có thể cần đổi tên thành send_analysis_task
+    if success:
+        logger.info(f"Task for FullProjectAnalysisRequest ID {scan_request.id} sent to Kafka.")
+    else:
+        logger.error(f"Failed to send task for FullProjectAnalysisRequest ID {scan_request.id} to Kafka.")
+        # Cập nhật status của scan_request thành FAILED? Hoặc để worker xử lý nếu không nhận được
+        crud_full_scan.update_full_scan_request_status(db, scan_request.id, FullProjectAnalysisStatus.FAILED, "Kafka send error")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to queue analysis task.")
+
+    return scan_request

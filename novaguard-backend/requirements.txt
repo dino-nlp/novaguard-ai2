@@ -20,3 +20,5 @@ langchain-openai
 langchain-google-genai
 # langgraph (nếu bạn muốn sử dụng ngay, nhưng có thể thêm sau khi có nhiều agent)
 # PyYAML (nếu bạn định dùng file prompt YAML, cho .txt thì không cần)
+GitPython
+neo4j>=5.0

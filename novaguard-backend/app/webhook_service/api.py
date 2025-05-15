@@ -171,6 +171,7 @@ async def handle_github_webhook(
             "pr_number": pr_number,
             "head_sha": head_sha,
             "diff_url": str(pr_data.diff_url), # URL để lấy file .diff
+            "task_type": "pr_analysis"
             # "target_branch": pr_data.base.ref # Nhánh đích, có thể hữu ích cho context
         }
         

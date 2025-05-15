@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     
     NOVAGUARD_PUBLIC_URL: str | None = None # Ví dụ: https://abcdef123.ngrok.io hoặc https://novaguard.yourcompany.com
     
-    DEBUG: bool = False
+    DEBUG: bool = True
 
     # Pydantic-Settings V2 configuration to load from .env file
     model_config = SettingsConfigDict(

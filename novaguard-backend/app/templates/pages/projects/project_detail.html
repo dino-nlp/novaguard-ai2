@@ -1,94 +1,328 @@
 {% extends "layout/base.html" %}
 
+{% block head_extra %}
+    {# Thêm CSS nếu cần cho các thẻ tag hoặc style cụ thể #}
+    <style>
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #ccc; border-radius: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #aaa; }
+
+        .status-badge {
+            padding: 0.25rem 0.6rem; /* Tương đương px-2.5 py-1 */
+            font-size: 0.75rem; /* text-xs */
+            font-weight: 600; /* font-semibold */
+            border-radius: 9999px; /* rounded-full */
+            display: inline-block;
+            line-height: 1;
+        }
+        .status-completed { background-color: #d1fae5; color: #065f46; } /* bg-green-100 text-green-700 */
+        .status-failed { background-color: #fee2e2; color: #991b1b; } /* bg-red-100 text-red-700 */
+        .status-in-progress { background-color: #fef3c7; color: #92400e; } /* bg-yellow-100 text-yellow-700 */
+        .status-pending { background-color: #e5e7eb; color: #4b5563; } /* bg-gray-200 text-gray-700 */
+
+        .scan-type-badge {
+            padding: 0.125rem 0.5rem; /* py-0.5 px-2 */
+            font-size: 0.75rem; /* text-xs */
+            font-weight: 600; /* font-semibold */
+            border-radius: 9999px; /* rounded-full */
+            display: inline-block;
+        }
+        .scan-type-pr { background-color: #e0f2fe; color: #0369a1; } /* bg-sky-100 text-sky-700 */
+        .scan-type-full { background-color: #e0e7ff; color: #3730a3; } /* bg-indigo-100 text-indigo-700 */
+    </style>
+{% endblock %}
+
+
 {% block content %}
-<div class="bg-white p-6 rounded-lg shadow">
-    <div class="flex justify-between items-center mb-6 pb-4 border-b">
-        <div>
-            <h1 class="text-2xl font-semibold text-nv-dark">Project: {{ project.repo_name }}</h1>
-            <p class="text-sm text-gray-500">ID: {{ project.id }}</p>
+<div class="bg-white p-6 rounded-lg shadow-lg">
+    {# --- Header: Project Name & Settings Button --- #}
+    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 pb-4 border-b border-gray-200">
+        <div class="mb-3 sm:mb-0">
+            <h1 class="text-2xl md:text-3xl font-semibold text-nv-dark">{{ project.repo_name }}</h1>
+            <p class="text-sm text-gray-500">NovaGuard Project ID: {{ project.id }}</p>
         </div>
         <div>
             <a href="{{ url_for('ui_project_settings_get', project_id=project.id) }}"
-               class="bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold py-2 px-4 rounded text-sm transition duration-150">
+               class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold py-2 px-4 rounded-md text-sm transition duration-150 ease-in-out">
                 Project Settings
             </a>
         </div>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+    {# --- Project Information Grid --- #}
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6 mb-8">
         <div>
-            <h3 class="text-md font-semibold text-nv-dark mb-1">Repository Details</h3>
-            <p class="text-sm text-gray-700"><strong>Full Name:</strong> {{ project.repo_name }}</p>
-            <p class="text-sm text-gray-700"><strong>GitHub Repo ID:</strong> {{ project.github_repo_id }}</p>
-            <p class="text-sm text-gray-700"><strong>Main Branch:</strong> {{ project.main_branch }}</p>
-            <p class="text-sm text-gray-700"><strong>Language:</strong> {{ project.language or 'Not set' }}</p>
-            <p class="text-sm text-gray-700"><strong>GitHub Webhook ID:</strong> {{ project.github_webhook_id or 'Not set' }}</p>
+            <h3 class="text-lg font-semibold text-nv-dark mb-2 border-b pb-1">Repository Details</h3>
+            <dl class="space-y-2 text-sm">
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Full Name:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.repo_name }}</dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">GitHub Repo ID:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.github_repo_id }}</dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Main Branch:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.main_branch }}</dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Language:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.language or 'Not set' }}</dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">GitHub Webhook:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.github_webhook_id or 'Not set / Inactive' }}</dd>
+                </div>
+            </dl>
         </div>
         <div>
-            <h3 class="text-md font-semibold text-nv-dark mb-1">NovaGuard Details</h3>
-            <p class="text-sm text-gray-700"><strong>Added on:</strong> {{ project.created_at.strftime('%Y-%m-%d %H:%M') if project.created_at else 'N/A' }}</p>
-            <p class="text-sm text-gray-700"><strong>Last Updated:</strong> {{ project.updated_at.strftime('%Y-%m-%d %H:%M') if project.updated_at else 'N/A' }}</p>
+            <h3 class="text-lg font-semibold text-nv-dark mb-2 border-b pb-1">NovaGuard Details</h3>
+            <dl class="space-y-2 text-sm">
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Added On:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.created_at.strftime('%d %b %Y, %H:%M') if project.created_at else 'N/A' }}</dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Last Updated:</dt>
+                    <dd class="col-span-2 text-gray-800">{{ project.updated_at.strftime('%d %b %Y, %H:%M') if project.updated_at else 'N/A' }}</dd>
+                </div>
+            </dl>
             {% if project.custom_project_notes %}
-            <h4 class="text-sm font-semibold text-nv-dark mt-3 mb-1">Custom Project Notes:</h4>
-            <p class="text-sm text-gray-700 bg-gray-50 p-2 rounded border max-h-28 overflow-y-auto custom-scrollbar">{{ project.custom_project_notes }}</p>
+            <div class="mt-4">
+                <h4 class="text-sm font-semibold text-nv-dark mb-1">Custom Project Notes:</h4>
+                <p class="text-sm text-gray-700 bg-slate-50 p-3 rounded-md border border-slate-200 max-h-28 overflow-y-auto custom-scrollbar">{{ project.custom_project_notes }}</p>
+            </div>
             {% else %}
-            <p class="text-sm text-gray-500 mt-3 italic">No custom project notes provided.</p>
+            <p class="text-sm text-gray-500 mt-4 italic">No custom project notes provided.</p>
             {% endif %}
         </div>
     </div>
 
-    <hr class="my-6">
+    {# --- Khu vực Trigger Full Scan --- #}
+    <div class="my-8 p-4 border border-slate-200 rounded-md bg-slate-50 shadow-sm">
+        <h3 class="text-lg font-semibold text-nv-dark mb-2">Full Project Analysis</h3>
+        {% if project.last_full_scan_request_id %}
+            <div class="text-sm text-gray-600 space-y-1">
+                <p>
+                    Latest scan status:
+                    <span class="font-semibold status-badge
+                        {% if project.last_full_scan_status.value == 'completed' %} status-completed
+                        {% elif project.last_full_scan_status.value == 'failed' %} status-failed
+                        {% elif project.last_full_scan_status.value in ['pending', 'processing', 'source_fetched', 'ckg_building', 'analyzing'] %} status-in-progress
+                        {% else %} status-pending {% endif %}">
+                        {{ project.last_full_scan_status.value | replace('_', ' ') | title if project.last_full_scan_status else 'N/A' }}
+                    </span>
+                </p>
+                {% if project.last_full_scan_at %}
+                    <p>Completed on: <span class="font-medium text-gray-700">{{ project.last_full_scan_at.strftime('%d %b %Y, %H:%M') }}</span></p>
+                {% endif %}
+                {# TODO: Cập nhật link này khi có trang report cho full scan #}
+                {# Link tới report của last_full_scan_request_id #}
+                {% set last_full_scan_report_item = (analysis_history_items | selectattr('id', 'equalto', project.last_full_scan_request_id) | selectattr('scan_type', 'equalto', 'full') | first) %}
+                {% if last_full_scan_report_item and last_full_scan_report_item.report_url %}
+                    <p><a href="{{ last_full_scan_report_item.report_url }}" class="text-nv-accent hover:underline">View Last Full Scan Report &rarr;</a></p>
+                {% elif project.last_full_scan_status.value == 'completed' %}
+                     <p class="italic text-gray-500">Report link for last scan (ID: {{ project.last_full_scan_request_id }}) not yet available.</p>
+                {% endif %}
+            </div>
+        {% else %}
+            <p class="text-sm text-gray-600">No full project scan has been performed yet for branch '{{project.main_branch}}'.</p>
+        {% endif %}
 
-    <h2 class="text-xl font-semibold text-nv-dark mb-3">Pull Request Analysis History</h2>
-    {% if pr_analysis_requests and pr_analysis_requests|length > 0 %}
-        <div class="overflow-x-auto">
-            <table class="min-w-full bg-white border">
-                <thead class="bg-gray-100">
+        <form id="fullScanForm" method="post" class="mt-4">
+            <button type="button" id="triggerFullScanBtn"
+                    class="bg-nv-accent hover:bg-nv-accent-dark focus:ring-2 focus:ring-offset-2 focus:ring-nv-accent text-white font-semibold py-2 px-4 rounded-md transition duration-150 ease-in-out text-sm">
+                Scan '{{ project.main_branch }}' Branch Now
+            </button>
+            <p id="fullScanStatusMsg" class="text-sm mt-2"></p>
+        </form>
+    </div>
+    {# --- Kết thúc Khu vực Trigger Full Scan --- #}
+
+    <hr class="my-8 border-gray-300">
+
+    <h2 class="text-xl font-semibold text-nv-dark mb-4">Analysis History</h2>
+    {% if analysis_history_items and analysis_history_items|length > 0 %}
+        <div class="overflow-x-auto bg-white rounded-lg shadow">
+            <table class="min-w-full w-full whitespace-nowrap">
+                <thead class="bg-slate-100 border-b border-slate-200">
                     <tr>
-                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">PR #</th>
-                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Title</th>
-                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Status</th>
-                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Requested At</th>
-                        <th class="text-left py-2 px-3 text-sm font-semibold text-gray-600">Actions</th>
+                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Type</th>
+                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Identifier / Title</th>
+                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Status</th>
+                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Summary</th>
+                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Requested</th>
+                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Actions</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-gray-200">
-                    {% for req in pr_analysis_requests %}
-                    <tr>
-                        <td class="py-2 px-3 text-sm text-gray-700">{{ req.pr_number }}</td>
-                        <td class="py-2 px-3 text-sm text-gray-700">
-                            <a href="{{ req.pr_github_url or '#' }}" target="_blank" class="hover:text-nv-accent hover:underline" title="View PR on GitHub">
-                                {{ req.pr_title or 'N/A' }}
-                            </a>
+                <tbody class="divide-y divide-slate-200">
+                    {% for item in analysis_history_items %}
+                    <tr class="hover:bg-slate-50 transition-colors duration-150">
+                        <td class="py-3 px-4 text-sm">
+                            {% if item.scan_type == 'pr' %}
+                                <span class="scan-type-badge scan-type-pr">PR Scan</span>
+                            {% elif item.scan_type == 'full' %}
+                                <span class="scan-type-badge scan-type-full">Full Scan</span>
+                            {% else %}
+                                <span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-gray-100 text-gray-700">{{ item.scan_type | capitalize }}</span>
+                            {% endif %}
                         </td>
-                        <td class="py-2 px-3 text-sm">
-                            <span class="px-2 py-1 text-xs font-semibold rounded-full
-                                {% if req.status.value == 'completed' %} bg-green-100 text-green-700
-                                {% elif req.status.value == 'failed' %} bg-red-100 text-red-700
-                                {% elif req.status.value == 'processing' %} bg-yellow-100 text-yellow-700
-                                {% elif req.status.value == 'data_fetched' %} bg-blue-100 text-blue-700
-                                {% else %} bg-gray-100 text-gray-700 {% endif %}">
-                                {{ req.status.value | capitalize }}
+                        <td class="py-3 px-4 text-sm text-slate-700 max-w-xs truncate" title="{{ item.title if item.title else item.identifier }}">
+                            {% if item.scan_type == 'pr' and item.title %}
+                                <div class="font-medium text-slate-800">{{ item.title | truncate(50, True) }}</div>
+                                <div class="text-xs text-slate-500">{{ item.identifier }}</div>
+                            {% else %}
+                                <div class="font-medium text-slate-800">{{ item.identifier }}</div>
+                            {% endif %}
+                        </td>
+
+                        {# Cột Status - Phần class cho badge #}
+                        <td class="py-3 px-4 text-sm">
+                            <span class="status-badge
+                                {% if item.status == 'completed' %} status-completed  {# SO SÁNH TRỰC TIẾP STRING #}
+                                {% elif item.status == 'failed' %} status-failed
+                                {% elif item.status in ['pending', 'processing', 'source_fetched', 'ckg_building', 'analyzing', 'data_fetched'] %} status-in-progress
+                                {% else %} status-pending {% endif %}">
+                                
+                                {# Phần text hiển thị trạng thái #}
+                                {% if item.status == 'pending' %}Pending
+                                {% elif item.status == 'processing' %}Processing...
+                                {% elif item.status == 'data_fetched' %}Data Fetched...
+                                {% elif item.status == 'source_fetched' %}Source Fetched...
+                                {% elif item.status == 'ckg_building' %}Building CKG...
+                                {% elif item.status == 'analyzing' %}Analyzing...
+                                {% elif item.status == 'completed' %}Completed
+                                {% elif item.status == 'failed' %}Failed
+                                {% else %}{{ item.status | replace('_', ' ') | title }}
+                                {% endif %}
                             </span>
                         </td>
-                        <td class="py-2 px-3 text-sm text-gray-700">{{ req.requested_at.strftime('%Y-%m-%d %H:%M') if req.requested_at else 'N/A' }}</td>
-                        <td class="py-2 px-3 text-sm">
-                            <a href="{{ url_for('ui_pr_report_get', request_id_param=req.id) }}"
-                            class="text-white bg-nv-accent hover:bg-nv-accent-dark font-medium rounded-md text-xs px-3 py-1.5 text-center transition duration-150">
-                                View Report
-                            </a>
+
+                        {# Cột Summary #}
+                        <td class="py-3 px-4 text-sm text-slate-700">
+                            {% if item.status == 'completed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                                {% if item.total_errors == 0 and item.total_warnings == 0 and item.total_other_findings == 0 %}
+                                    <span class="text-green-600">No issues</span>
+                                {% else %}
+                                    {% if item.total_errors > 0 %}<span class="font-semibold text-red-600">{{ item.total_errors }}E</span>{% endif %}
+                                    {% if item.total_warnings > 0 %}<span class="font-semibold text-yellow-500 ml-1.5">{{ item.total_warnings }}W</span>{% endif %}
+                                    {% if item.total_other_findings > 0 %}<span class="font-semibold text-sky-600 ml-1.5">{{ item.total_other_findings }}N</span>{% endif %}
+                                {% endif %}
+                            {% elif item.status == 'failed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                                <span class="text-red-500 italic">Failed</span>
+                            {% else %}
+                                <span class="text-gray-500 italic">In Progress...</span>
+                            {% endif %}
                         </td>
+
+                        <td class="py-3 px-4 text-sm text-slate-500">{{ item.requested_at.strftime('%d %b %Y, %H:%M') if item.requested_at else 'N/A' }}</td>
+                        
+                        {# Cột Actions #}
+                        <td class="py-3 px-4 text-sm">
+                            {% if item.report_url and item.status == 'completed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                                <a href="{{ item.report_url }}"
+                                    class="text-white bg-nv-accent hover:bg-nv-accent-dark font-medium rounded-md text-xs px-3 py-1.5 text-center transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-nv-accent">
+                                    View Report
+                                </a>
+                            {% elif item.status != 'completed' and item.status != 'failed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                                {# Hiển thị text cụ thể hơn cho các trạng thái đang xử lý #}
+                                <span class="text-slate-400 italic text-xs">
+                                    {% if item.status == 'pending' %}Queued
+                                    {% elif item.status == 'processing' %}Processing...
+                                    {% elif item.status == 'data_fetched' %}Fetching Data...
+                                    {% elif item.status == 'source_fetched' %}Source Fetched...
+                                    {% elif item.status == 'ckg_building' %}Building CKG...
+                                    {% elif item.status == 'analyzing' %}Analyzing...
+                                    {% else %}{{ item.status | replace('_', ' ') | title }}...
+                                    {% endif %}
+                                </span>
+                            {% else %} {# Mặc định là failed hoặc completed mà không có report_url #}
+                                <span class="text-slate-400 italic text-xs">-</span>
+                            {% endif %}
+                        </td>
+
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
         </div>
     {% else %}
-        <p class="text-gray-600">No Pull Request analysis history found for this project yet.</p>
+        <div class="text-center py-8">
+            <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                <path vector-effect="non-scaling-stroke" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
+            </svg>
+            <h3 class="mt-2 text-sm font-medium text-gray-900">No Analysis History</h3>
+            <p class="mt-1 text-sm text-gray-500">Get started by making a Pull Request or triggering a full project scan.</p>
+        </div>
     {% endif %}
 
-    <div class="mt-8 text-center">
-        <a href="{{ url_for('ui_dashboard_get') }}" class="text-nv-accent hover:underline">&larr; Back to Dashboard</a>
+    <div class="mt-10 text-center">
+        <a href="{{ url_for('ui_dashboard_get') }}" class="text-nv-accent hover:text-nv-accent-dark hover:underline transition-colors duration-150">&larr; Back to Dashboard</a>
     </div>
 </div>
+
+{# Script cho Full Scan Trigger (như đã thảo luận) #}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const triggerBtn = document.getElementById('triggerFullScanBtn');
+    const statusMsg = document.getElementById('fullScanStatusMsg');
+    const projectId = {{ project.id }}; // Lấy project.id từ template
+
+    if (triggerBtn) {
+        triggerBtn.addEventListener('click', function() {
+            if (!confirm('Are you sure you want to start a full project scan for branch \'{{ project.main_branch }}\'? This may take some time and will use your configured LLM resources.')) {
+                return;
+            }
+            statusMsg.textContent = 'Requesting full scan...';
+            statusMsg.className = 'text-sm mt-2 text-blue-600 animate-pulse';
+            triggerBtn.disabled = true;
+            triggerBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+            fetch(`/api/projects/${projectId}/full-scan`, {
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/json',
+                    // Cookie session sẽ tự động được gửi bởi trình duyệt cho các request cùng domain
+                }
+            })
+            .then(response => {
+                // Luôn cố gắng parse JSON, ngay cả khi lỗi, để lấy detail
+                return response.json().then(data => {
+                    if (!response.ok) { // status code không phải 2xx
+                        // Ném một object lỗi tùy chỉnh để catch có thể xử lý
+                        throw { status: response.status, data: data, message: data.detail || `HTTP error ${response.status}` };
+                    }
+                    return data; // Trả về data nếu response.ok
+                });
+            })
+            .then(data => { // Chỉ chạy nếu response.ok
+                statusMsg.textContent = `Full scan request (ID: ${data.id}, Status: ${data.status}) has been queued. The page will reload in a few seconds to reflect changes.`;
+                statusMsg.className = 'text-sm mt-2 text-green-600';
+                // Không disable nút nữa, để user có thể trigger lại nếu muốn (sau khi đã reload)
+                // triggerBtn.disabled = false; 
+                // triggerBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                setTimeout(() => window.location.reload(), 4000); // Tải lại trang để cập nhật trạng thái
+            })
+            .catch(error => {
+                let detailMsg = "An unknown error occurred while triggering the scan.";
+                if (error && error.data && error.data.detail) {
+                    detailMsg = error.data.detail;
+                } else if (error && typeof error.message === 'string') {
+                    detailMsg = error.message;
+                } else if (typeof error === 'string') {
+                    detailMsg = error;
+                }
+                
+                statusMsg.textContent = `Error: ${detailMsg}`;
+                statusMsg.className = 'text-sm mt-2 text-red-600';
+                triggerBtn.disabled = false;
+                triggerBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                console.error('Full scan trigger error:', error);
+            });
+        });
+    }
+});
+</script>
 {% endblock %}
