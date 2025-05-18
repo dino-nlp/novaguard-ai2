@@ -18,35 +18,22 @@ class FullProjectAnalysisRequest(Base):
     __tablename__ = "fullprojectanalysisrequests"
 
     id = Column(Integer, primary_key=True, index=True)
-    # Đây là khóa ngoại mà relationship "project" nên sử dụng
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     branch_name = Column(String(255), nullable=False)
-
-    status = Column(SQLAlchemyEnum(FullProjectAnalysisStatus,
-                                name="full_project_analysis_status_enum", # Đảm bảo tên này khớp với DB
-                                create_type=True, # Sẽ tạo ENUM type nếu chưa có
-                                values_callable=lambda obj: [e.value for e in obj]),
-                    default=FullProjectAnalysisStatus.PENDING,
-                    nullable=False)
-
-    error_message = Column(Text, nullable=True)
-    requested_at = Column(DateTime(timezone=True), server_default=func.now())
-    started_at = Column(DateTime(timezone=True), nullable=True)
-    source_fetched_at = Column(DateTime(timezone=True), nullable=True)
-    ckg_built_at = Column(DateTime(timezone=True), nullable=True)
-    analysis_completed_at = Column(DateTime(timezone=True), nullable=True)
+    # ... (các trường status, error_message, times...)
 
     total_files_analyzed = Column(Integer, nullable=True)
-    total_findings = Column(Integer, nullable=True)
+    total_findings = Column(Integer, nullable=True) # Tổng số phát hiện cho scan này
 
-    # Sửa lại relationship ở đây
     project = relationship(
         "Project",
-        foreign_keys=[project_id], # Chỉ định rõ cột khóa ngoại để join
-        back_populates="full_scan_requests"  # Thêm back_populates nếu Project có một list các full_scan_requests
+        foreign_keys=[project_id],
+        back_populates="full_scan_requests"
     )
-    # Nếu bạn muốn có một list các findings cho full scan:
-    # full_scan_findings = relationship("FullProjectAnalysisFinding", back_populates="full_project_analysis_request")
+    
+    # Thêm relationship này
+    findings = relationship("AnalysisFinding", back_populates="full_project_analysis_request", cascade="all, delete-orphan")
+
 
     def __repr__(self):
         return f"<FullProjectAnalysisRequest(id={self.id}, project_id={self.project_id}, branch='{self.branch_name}', status='{self.status.value}')>"

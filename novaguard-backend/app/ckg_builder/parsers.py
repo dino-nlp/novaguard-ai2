@@ -6,17 +6,18 @@ from tree_sitter_languages import get_language # Sử dụng get_language thay v
 
 logger = logging.getLogger(__name__)
 
-# --- Data Structures (giữ nguyên từ lần trước) ---
+# --- Data Structures ---
 class ExtractedFunction:
-    def __init__(self, name: str, start_line: int, end_line: int, signature: Optional[str] = None, class_name: Optional[str] = None, body_node: Optional[Node] = None, parameters_str: Optional[str] = None): # Thêm parameters_str
+    def __init__(self, name: str, start_line: int, end_line: int, signature: Optional[str] = None, class_name: Optional[str] = None, body_node: Optional[Node] = None, parameters_str: Optional[str] = None):
         self.name = name
         self.start_line = start_line
         self.end_line = end_line
-        self.signature = signature # Có thể là toàn bộ (params) -> returntype
-        self.parameters_str = parameters_str # Chỉ chuỗi parameters
+        self.signature = signature
+        self.parameters_str = parameters_str
         self.class_name = class_name
         self.body_node = body_node
-        self.calls: Set[Tuple[str, Optional[str], Optional[str]]] = set() # (called_name, base_object_name_or_None, call_type ('direct'|'method'))
+        # Tuple: (called_name, base_object_name_or_None, call_type, call_site_line_number)
+        self.calls: Set[Tuple[str, Optional[str], Optional[str], int]] = set()
 
 class ExtractedClass:
     def __init__(self, name: str, start_line: int, end_line: int, body_node: Optional[Node] = None):
@@ -73,6 +74,13 @@ class BaseCodeParser:
             return None
 
     def _extract_entities(self, root_node: Node, result: ParsedFileResult):
+        logger.debug(
+            f"PythonParser Extracted from {result.file_path}: "
+            f"{len(result.imports)} imports, "
+            f"{len(result.classes)} classes ("
+            f"{sum(len(c.methods) for c in result.classes)} methods), "
+            f"{len(result.functions)} global functions."
+        )
         raise NotImplementedError("Subclasses must implement _extract_entities")
 
     def _get_node_text(self, node: Optional[Node]) -> Optional[str]:
@@ -127,6 +135,7 @@ class PythonParser(BaseCodeParser):
                         (attribute object: (subscript) @subscript_obj attribute: (identifier) @method_name)
                         (attribute object: (attribute) @nested_attr_obj attribute: (identifier) @method_name)
                     ]
+                    arguments: (_)? @arguments
                 ) @call_expression
             """)
         }
@@ -200,39 +209,78 @@ class PythonParser(BaseCodeParser):
                             imported_names=imported_items
                         ))
 
-
     def _extract_calls(self, scope_node: Node, current_owner_entity: ExtractedFunction, result: ParsedFileResult):
         if not scope_node: return
         for match_obj in self.queries["calls"].matches(scope_node):
+            # call_expression_node là node (call ...)
+            call_expression_node = None
+            for node_candidate, name_str in match_obj.captures:
+                if name_str == "call_expression":
+                    call_expression_node = node_candidate
+                    break
+            if not call_expression_node:
+                continue
+
             call_name_node = None
-            obj_name_node = None
+            obj_name_node = None # Simple object identifier: obj.method
             method_name_node = None
-            call_type = "direct" # Mặc định
+            # Các node phức tạp hơn cho base object
+            # chained_call_obj_node = None
+            # subscript_obj_node = None
+            # nested_attr_obj_node = None
 
-            # Tìm các capture trong match này
-            for node_captured, name_str in match_obj.captures:
-                if name_str == "func_name": call_name_node = node_captured
-                elif name_str == "obj_name": obj_name_node = node_captured
-                elif name_str == "method_name": method_name_node = node_captured
-                # TODO: Xử lý chained_call_obj, subscript_obj, nested_attr_obj để hiểu base object phức tạp hơn
+            call_type = "unknown"
+            called_name_str: Optional[str] = None
+            base_object_name_str: Optional[str] = None
 
-            called_name = None
-            base_object_name = None
+            # Phân tích các capture trong một match cụ thể
+            for node_captured, capture_name_str in match_obj.captures:
+                # Đảm bảo capture này thuộc về call_expression_node hiện tại
+                # (Cần kiểm tra parent hoặc containment nếu query phức tạp hơn)
+                if capture_name_str == "func_name_direct":
+                    call_name_node = node_captured
+                elif capture_name_str == "obj_name":
+                    obj_name_node = node_captured
+                elif capture_name_str == "method_name":
+                    method_name_node = node_captured
+                # elif capture_name_str == "chained_call_obj":
+                #     chained_call_obj_node = node_captured
+                # elif capture_name_str == "subscript_obj":
+                #     subscript_obj_node = node_captured
+                # elif capture_name_str == "nested_attr_obj":
+                #     nested_attr_obj_node = node_captured
 
-            if method_name_node: # obj.method()
+            if method_name_node: # Ưu tiên method call nếu có method_name
                 call_type = "method"
-                called_name = self._get_node_text(method_name_node)
-                if obj_name_node: # Simple obj.method
-                    base_object_name = self._get_node_text(obj_name_node)
-                # else: complex base object, cần phân tích sâu hơn (chained_call_obj, etc.)
+                called_name_str = self._get_node_text(method_name_node)
+                if obj_name_node: # obj.method()
+                    base_object_name_str = self._get_node_text(obj_name_node)
+                # else: # Base object phức tạp hơn, ví dụ get_obj().method()
+                      # base_object_name_str có thể để là None hoặc cố gắng parse (khá phức tạp)
+                      # Hiện tại, chúng ta sẽ để là None nếu không phải (identifier) đơn giản
+                    # logger.debug(f"CKG Call: Complex base object for method call '{called_name_str}' in '{current_owner_entity.name}'.")
+                    pass
+
             elif call_name_node: # func()
-                call_type = "direct"
-                called_name = self._get_node_text(call_name_node)
+                call_type = "direct" # Hoặc "function"
+                called_name_str = self._get_node_text(call_name_node)
+                base_object_name_str = None # Không có base object cho direct call
 
-            if called_name:
-                current_owner_entity.calls.add((called_name, base_object_name, call_type))
-                logger.debug(f"CKG Call: In '{current_owner_entity.name}' ({result.file_path}), found call: {base_object_name + '.' if base_object_name else ''}{called_name}() type: {call_type}")
+            if called_name_str:
+                # Lấy dòng của lệnh gọi (ví dụ: dòng bắt đầu của node `call_expression_node`)
+                call_site_line = self._get_line_number(call_expression_node)
 
+                current_owner_entity.calls.add(
+                    (called_name_str, base_object_name_str, call_type, call_site_line)
+                )
+                logger.debug(
+                    f"CKG Call: In '{current_owner_entity.name}' (L{current_owner_entity.start_line} in {result.file_path}), "
+                    f"found call at L{call_site_line}: "
+                    f"{base_object_name_str + '.' if base_object_name_str else ''}{called_name_str}() "
+                    f"type: {call_type}"
+                )
+            else:
+                logger.warning(f"CKG Call: Could not determine called_name for a call expression in '{current_owner_entity.name}' (L{current_owner_entity.start_line} in {result.file_path}) at node: {call_expression_node.text.decode('utf8')[:50]}")
 
     def _extract_functions_and_methods(self, scope_node: Node, result: ParsedFileResult, current_class_obj: Optional[ExtractedClass] = None):
         # scope_node có thể là root_node (cho global functions) hoặc class_body_node (cho methods)

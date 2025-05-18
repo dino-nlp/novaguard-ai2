@@ -1,50 +1,54 @@
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
+import json
 
 from app.models import AnalysisFinding, PyAnalysisSeverity # Import từ app.models
 from .schemas_finding import AnalysisFindingCreate # Import từ cùng module
 
 def create_analysis_findings(
     db: Session,
-    pr_analysis_request_id: int,
-    findings_in: List[AnalysisFindingCreate] # findings_in[i].severity là SeverityLevel
+    findings_in: List[AnalysisFindingCreate],
+    pr_analysis_request_id: Optional[int] = None, # Cho phép None
+    full_project_analysis_request_id: Optional[int] = None # Thêm mới, cho phép None
 ) -> List[AnalysisFinding]:
     db_findings = []
     if not findings_in:
         return db_findings
 
+    if not pr_analysis_request_id and not full_project_analysis_request_id:
+        raise ValueError("Either pr_analysis_request_id or full_project_analysis_request_id must be provided.")
+    if pr_analysis_request_id and full_project_analysis_request_id:
+        raise ValueError("Cannot provide both pr_analysis_request_id and full_project_analysis_request_id.")
+
     for finding_in in findings_in:
-        # Chuyển đổi từ Pydantic Enum (SeverityLevel) sang SQLAlchemy Enum (PyAnalysisSeverity)
-        # nếu chúng khác nhau. Nếu chúng giống hệt nhau (cùng tên member và value),
-        # SQLAlchemy có thể tự xử lý. Tuy nhiên, để chắc chắn:
-        db_severity_value: PyAnalysisSeverity
-        try:
-            # finding_in.severity.value là string ('Error', 'Warning', etc.)
-            db_severity_value = PyAnalysisSeverity(finding_in.severity.value)
-        except ValueError:
-            # Xử lý trường hợp giá trị không hợp lệ nếu cần, mặc dù Pydantic validator nên bắt rồi
-            # logger.warning(f"Invalid severity '{finding_in.severity.value}' for DB. Defaulting or skipping.")
-            # continue # Hoặc gán giá trị mặc định
-            # Vì LLMSingleFinding đã validate, bước này chủ yếu là để đảm bảo kiểu đúng
-            # nếu PyAnalysisSeverity và SeverityLevel là hai enum class khác nhau.
-            # Nếu chúng là cùng một class (ví dụ, cả hai import từ một nguồn chung),
-            # thì chỉ cần gán: db_severity_value = finding_in.severity
-            # Nhưng hiện tại, LLMSingleFinding dùng SeverityLevel, AnalysisFinding dùng PyAnalysisSeverity.
-            # Chúng có cùng giá trị string, nên việc chuyển đổi qua value là an toàn.
-            pass # Giả sử validator của Pydantic đã đảm bảo giá trị hợp lệ.
+        db_severity_value = PyAnalysisSeverity(finding_in.severity.value)
+
+        # Lấy các trường mới từ finding_in nếu có
+        finding_level = getattr(finding_in, 'finding_level', 'file') # Mặc định là 'file'
+        module_name = getattr(finding_in, 'module_name', None)
+        meta_data_dict = getattr(finding_in, 'meta_data', None)
+        meta_data_json = json.dumps(meta_data_dict) if meta_data_dict else None
+
 
         db_finding = AnalysisFinding(
             pr_analysis_request_id=pr_analysis_request_id,
+            full_project_analysis_request_id=full_project_analysis_request_id, # Gán giá trị
+            scan_type="pr" if pr_analysis_request_id else "full_project", # Xác định scan_type
+
             file_path=finding_in.file_path,
             line_start=finding_in.line_start,
             line_end=finding_in.line_end,
-            # severity=finding_in.severity, # TRUYỀN TRỰC TIẾP PYTHON ENUM MEMBER
-                                        # SQLAlchemy sẽ lấy .value khi lưu vào DB
-            severity=PyAnalysisSeverity(finding_in.severity.value), # Đảm bảo truyền đúng type PyAnalysisSeverity
+            severity=db_severity_value,
             message=finding_in.message,
             suggestion=finding_in.suggestion,
             agent_name=finding_in.agent_name,
-            code_snippet=finding_in.code_snippet
+            code_snippet=finding_in.code_snippet,
+
+            # Gán các trường mới (cần thêm cột vào model AnalysisFinding và schema.sql)
+            finding_type=getattr(finding_in, 'finding_type', None), # Từ LLMSingleFinding
+            finding_level=finding_level,
+            module_name=module_name,
+            meta_data=meta_data_json # Lưu dưới dạng JSON string
         )
         db_findings.append(db_finding)
 

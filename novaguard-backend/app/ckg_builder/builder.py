@@ -59,26 +59,75 @@ class CKGBuilder:
 
     async def _clear_existing_data_for_file(self, file_path_in_repo: str):
         file_composite_id = f"{self.project_graph_id}:{file_path_in_repo}"
-        queries = [
-            (
-                """
-                MATCH (file_node:File {composite_id: $file_composite_id})
-                OPTIONAL MATCH (file_node)<-[:DEFINED_IN]-(entity)
-                OPTIONAL MATCH (entity)-[r_calls_from:CALLS]->()
-                DELETE r_calls_from
-                WITH file_node, entity
-                DETACH DELETE entity
-                WITH file_node
-                DETACH DELETE file_node
-                """,
-                {"file_composite_id": file_composite_id}
-            )
-        ]
         logger.info(f"CKGBuilder: Clearing existing CKG data for file '{file_path_in_repo}' in project '{self.project_graph_id}'")
-        await self._execute_write_queries(queries)
+
+        # Bước 1: Tìm tất cả các thực thể (Class, Function, Method) được định nghĩa trong file này.
+        # Bước 2: Xóa tất cả các relationship ĐẾN và ĐI TỪ các thực thể này.
+        # Bước 3: Xóa các thực thể này.
+        # Bước 4: Xóa node File và các relationship trực tiếp của nó (IMPORTS_MODULE, PART_OF_PROJECT).
+
+        # Lưu ý: Relationship INHERITS_FROM từ một class trong file này đến một class placeholder
+        # (superclass ở file khác) cũng sẽ bị xóa. Khi parse lại, nó sẽ được tạo lại.
+        # Nếu class cha cũng nằm trong file này, nó sẽ bị xóa và tạo lại cùng lúc.
+
+        query = """
+        MATCH (file_node:File {composite_id: $file_composite_id})
+        OPTIONAL MATCH (entity)-[:DEFINED_IN]->(file_node)
+        WHERE entity:Class OR entity:Function // Chỉ lấy Class và Function/Method
+        WITH file_node, collect(DISTINCT entity) as entities_in_file
+        CALL {
+            WITH entities_in_file
+            UNWIND entities_in_file as e
+            DETACH DELETE e
+            RETURN count(e) as deleted_entities_count
+        }
+        
+        DETACH DELETE file_node
+        RETURN deleted_entities_count, id(file_node) as deleted_file_node_id
+        """
+        # Ghi chú: Query này phức tạp hơn và có thể cần kiểm tra kỹ lưGhi chú: Query này phức tạp hơn và có thể cần kiểm tra kỹ lưỡng về hiệu năng.
+        # Một cách đơn giản hơn nhưng có thể để lại "placeholder" nodes là:
+        # MATCH (f:File {composite_id: $file_composite_id})<-[:DEFINED_IN]-(entity)
+        # DETACH DELETE entity
+        # WITH f
+        # DETACH DELETE f
+
+        params = {"file_composite_id": file_composite_id}
+        try:
+            results = await self._execute_write_queries_with_results([(query, params)])
+            if results and results[0] and results[0][0]: # Kiểm tra có kết quả không
+                deleted_info = results[0][0] # Kết quả của query đầu tiên
+                # logger.debug(f"CKGBuilder: Cleared entities count: {deleted_info.get('deleted_entities_count')}, deleted file node id: {deleted_info.get('deleted_file_node_id')}")
+            logger.info(f"CKGBuilder: Successfully cleared data for file '{file_path_in_repo}'.")
+        except Exception as e:
+            logger.error(f"CKGBuilder: Error clearing data for file '{file_path_in_repo}': {e}", exc_info=True)
+            # Cân nhắc có nên raise lỗi ở đây không
+
+    async def _execute_write_queries_with_results(self, queries_with_params: List[Tuple[str, Dict[str, Any]]]):
+        """ Một phiên bản của _execute_write_queries trả về kết quả (nếu cần cho debug/xác nhận) """
+        if not queries_with_params: return []
+        driver = await self._get_driver()
+        db_name = getattr(driver, 'database', 'neo4j')
+        all_results = []
+        async with driver.session(database=db_name) as session:
+            async with session.begin_transaction() as tx:
+                for query, params in queries_with_params:
+                    try:
+                        result = await tx.run(query, params)
+                        records = [record.data() async for record in result]
+                        summary = await result.consume() # Nên consume để giải phóng tài nguyên
+                        all_results.append(records)
+                        # logger.debug(f"CKG Executed Cypher: {query[:70]}... with params: {params}. Summary: {summary.counters}")
+                    except Exception as e:
+                        logger.error(f"CKGBuilder: Error running Cypher (with results): {query[:150]}... with params {params}. Error: {e}", exc_info=True)
+                        await tx.rollback()
+                        raise
+                await tx.commit()
+        return all_results
 
 
     async def process_file_for_ckg(self, file_path_in_repo: str, file_content: str, language: Optional[str]):
+        logger.info(f"CKGBuilder: Processing CKG for '{file_path_in_repo}' (lang: {language}), project: '{self.project_graph_id}'.")
         if not language:
             logger.debug(f"CKGBuilder: Language not specified for file {file_path_in_repo}, skipping CKG.")
             return
@@ -254,69 +303,77 @@ class CKGBuilder:
             caller_label = ":Method:Function" if defined_entity.class_name else ":Function"
             caller_composite_id = f"{self.project_graph_id}:{file_path_in_repo}:{defined_entity.name}:{defined_entity.start_line}"
 
-            for called_name, base_object_name, call_type in defined_entity.calls:
+            for called_name, base_object_name, call_type, call_site_line in defined_entity.calls: # Thêm call_site_line
                 call_params = {
                     "caller_composite_id": caller_composite_id,
                     "callee_name": called_name,
                     "project_graph_id": self.project_graph_id,
                     "caller_file_path_for_local_search": file_path_in_repo,
                     "call_type_prop": call_type,
-                    "base_object_prop": base_object_name
-                    # "current_class_name_if_any": defined_entity.class_name # Để tìm method trong cùng class
+                    "base_object_prop": base_object_name,
+                    "call_site_line_prop": call_site_line # Thêm tham số cho query
                 }
 
-                # Cypher query để tìm callee và tạo CALLS relationship.
+                # Query Cypher để tìm callee và tạo CALLS relationship.
                 # Ưu tiên tìm trong cùng file, sau đó trong cùng class (nếu caller là method), rồi mới đến toàn project.
                 # Node callee được tìm thấy sẽ có composite_id của nó.
-                resolve_query = f"""
+                # TÁCH BIỆT QUERY TÌM CALLEE VÀ MERGE RELATIONSHIP ĐỂ DỄ DEBUG HƠN
+                resolve_and_link_query = f"""
                 MATCH (caller{caller_label} {{composite_id: $caller_composite_id}})
 
                 // Attempt 1: Callee is a function/method in the same file as the caller
+                // and has the Function label (covers global functions and methods if methods also have :Function)
                 OPTIONAL MATCH (callee_same_file:Function {{
                     name: $callee_name,
                     file_path: $caller_file_path_for_local_search,
                     project_graph_id: $project_graph_id
                 }})
+                // We need to be careful if callee_name is a common method name like 'append' or 'init'
+                // and base_object_prop is set (indicating it's likely a method call on an instance).
+                // In such cases, callee_same_file might wrongly match a global function with the same name.
+
                 WITH caller, callee_same_file
 
                 // Attempt 2: If caller is a method, try to find callee as another method in the same class or a superclass method.
-                // This is a simplified version. True resolution would require walking the MRO.
+                // This is a simplified version for now. True resolution would require walking the MRO.
                 OPTIONAL MATCH (caller)-[:DEFINED_IN_CLASS]->(caller_class:Class)
-                WHERE $call_type_prop = "method" AND callee_same_file IS NULL // Only if method call and not found yet
-                OPTIONAL MATCH (callee_in_same_or_superclass:Method {{
+                WHERE ($call_type_prop = "method" OR $base_object_prop IS NOT NULL) AND callee_same_file IS NULL // Only if method call and not found yet
+                OPTIONAL MATCH (callee_in_same_or_superclass:Method {{ // Assuming methods have :Method label
                     name: $callee_name,
                     project_graph_id: $project_graph_id
                 }})
-                WHERE (callee_in_same_or_superclass)-[:DEFINED_IN_CLASS]->(caller_class) OR 
+                WHERE (callee_in_same_or_superclass)-[:DEFINED_IN_CLASS]->(caller_class) OR
                       ( (caller_class)-[:INHERITS_FROM*0..5]->(:Class)<-[:DEFINED_IN_CLASS]-(callee_in_same_or_superclass) AND
                         callee_in_same_or_superclass.name = $callee_name ) // Check name explicitly for superclass methods
-                WITH caller, callee_same_file, COALESCE(callee_same_file, callee_in_same_or_superclass) as callee_local_or_class_level
+                WITH caller, COALESCE(callee_same_file, callee_in_same_or_superclass) as callee_local_or_class_level
 
                 // Attempt 3: Callee is any function/method in the project if not found by previous, more specific attempts
-                OPTIONAL MATCH (callee_in_project:Function {{
+                // This is a broad match and might lead to incorrect links if names are not unique.
+                // Consider adding more context (e.g., from imports) if possible.
+                OPTIONAL MATCH (callee_in_project:Function {{ // Assuming global functions and methods are :Function
                     name: $callee_name,
                     project_graph_id: $project_graph_id
                 }})
-                WHERE callee_local_or_class_level IS NULL // Only if not found by more specific matches
+                WHERE callee_local_or_class_level IS NULL AND $base_object_prop IS NULL // Only if not found and likely a direct global call
 
-                // Final Callee: Prioritize matches: same_file > same_class/superclass > any_in_project
-                WITH caller, COALESCE(callee_local_or_class_level, callee_in_project) AS callee
+                // Final Callee: Prioritize matches: same_file (and same class) > any_in_project
+                WITH caller, COALESCE(callee_local_or_class_level, callee_in_project) AS final_callee
                 
-                WHERE callee IS NOT NULL // Proceed only if a callee is found
-                MERGE (caller)-[r:CALLS {{
-                    type: $call_type_prop,
-                    base_object: $base_object_prop
-                    // Thêm line number của call site nếu parser cung cấp
-                    // call_site_line: $call_site_line_param
-                }}]->(callee)
+                WHERE final_callee IS NOT NULL // Proceed only if a callee is found
+                MERGE (caller)-[r:CALLS]->(final_callee)
+                SET r.type = $call_type_prop,
+                    r.base_object = $base_object_prop,
+                    r.call_site_line = $call_site_line_prop
+                // RETURN caller.name as CallerName, final_callee.name as CalleeName, r.type as CallType // For debugging
                 """
-                call_link_queries_batch.append((resolve_query, call_params))
+                call_link_queries_batch.append((resolve_and_link_query, call_params))
 
         if call_link_queries_batch:
             logger.debug(f"CKGBuilder: Executing batch of {len(call_link_queries_batch)} CALLS link queries for file {file_path_in_repo}.")
             await self._execute_write_queries(call_link_queries_batch)
 
         logger.info(f"CKGBuilder: Finished CKG processing for file '{file_path_in_repo}'.")
+
 
     async def build_for_project_from_path(self, repo_local_path: str):
         logger.info(f"CKGBuilder: Starting CKG build for project '{self.project_graph_id}' from path: {repo_local_path}")
