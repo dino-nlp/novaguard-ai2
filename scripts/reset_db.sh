@@ -41,8 +41,8 @@ fi
 
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 echo "WARNING: This script will completely WIPE all data in the database"
-echo "'${DB_NAME}' by dropping all known tables, custom types, and functions,"
-echo "then re-applying the schema from '${SCHEMA_FILE}'."
+echo "${DB_NAME} by dropping all known tables, custom types, and functions,"
+echo "then re-applying the schema from ${SCHEMA_FILE}."
 echo "This action is IRREVERSIBLE."
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 read -p "Are you absolutely sure you want to reset the database '${DB_NAME}'? (Type 'yes' to confirm): " confirmation
@@ -69,41 +69,14 @@ echo "Proceeding with database reset for '${DB_NAME}'..."
 # From project_model.py: name="project_last_full_scan_status_enum" (create_type=False, so it uses the one from FullProjectAnalysisStatus)
 
 DROP_COMMANDS=$(cat <<EOF
--- Drop tables in an order that respects FKs, or use CASCADE.
--- With CASCADE, the order is less critical, but it's good practice.
-
--- Foreign keys in 'projects' might reference 'fullprojectanalysisrequests'.
--- 'analysisfindings' references 'pranalysisrequests'.
--- 'pranalysisrequests' references 'projects'.
--- 'projects' references 'users' and 'fullprojectanalysisrequests'.
--- 'fullprojectanalysisrequests' references 'projects'.
--- This creates a cycle if projects.last_full_scan_request_id is FK to fullprojectanalysisrequests.id
--- and fullprojectanalysisrequests.project_id is FK to projects.id.
--- Using CASCADE will handle this.
-
 DROP TABLE IF EXISTS "analysisfindings" CASCADE;
 DROP TABLE IF EXISTS "pranalysisrequests" CASCADE;
--- DROP TABLE IF EXISTS "projects" CASCADE; -- Will be dropped due to CASCADE from fullprojectanalysisrequests if cycle exists, or needs to be after fullprojectanalysisrequests
-DROP TABLE IF EXISTS "fullprojectanalysisrequests" CASCADE; -- Drop this first if projects refers to it
-DROP TABLE IF EXISTS "projects" CASCADE; -- Now drop projects (if not already dropped by cascade)
+DROP TABLE IF EXISTS "fullprojectanalysisrequests" CASCADE;
+DROP TABLE IF EXISTS "projects" CASCADE;
 DROP TABLE IF EXISTS "users" CASCADE;
-
--- Drop custom ENUM types created by SQLAlchemy.
--- Check your database for the exact names if unsure.
--- SQLAlchemy usually lowercases them.
 DROP TYPE IF EXISTS pr_analysis_status_enum CASCADE;
 DROP TYPE IF EXISTS full_project_analysis_status_enum CASCADE;
--- The project_last_full_scan_status_enum uses the same type as full_project_analysis_status_enum
--- so dropping full_project_analysis_status_enum should be sufficient.
--- If you defined other ENUMs directly in schema.sql with CREATE TYPE, add them here.
-
--- Drop functions (if any custom ones besides the trigger)
 DROP FUNCTION IF EXISTS trigger_set_timestamp() CASCADE;
-
--- If you were using Alembic, you might also drop its version table:
--- DROP TABLE IF EXISTS alembic_version CASCADE;
-
--- Add any other custom sequences, views, or objects here if necessary.
 EOF
 )
 
@@ -120,7 +93,7 @@ echo "Applying schema from $SCHEMA_FILE..."
 cat "$SCHEMA_FILE" | docker compose exec -T "${DB_SERVICE_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1
 
 if [ $? -eq 0 ]; then
-    echo "Database '${DB_NAME}' has been successfully reset and schema applied."
+    echo "Database ${DB_NAME} has been successfully reset and schema applied."
 else
     echo "Failed to apply schema during reset. Check the output above."
     exit 1

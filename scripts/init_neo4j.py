@@ -2,10 +2,25 @@
 import asyncio
 import os
 from pathlib import Path
-# Cần cấu hình sys.path để import từ app, hoặc copy/paste hàm get_async_neo4j_driver, settings
-# Tạm thời giả sử settings có thể import trực tiếp nếu PYTHONPATH được set đúng
+
 from app.core.config import settings
 from app.core.graph_db import get_async_neo4j_driver, close_async_neo4j_driver
+
+
+# --- BEGIN DEBUG ---
+print(f"DEBUG: Current working directory: {Path.cwd()}")
+# Xóa cache của get_settings để đảm bảo nó đọc lại file .env mỗi lần chạy script này (cho mục đích debug)
+# Tuy nhiên, settings = get_settings() ở cuối config.py đã được gọi một lần khi module config được import.
+# Để chắc chắn, chúng ta có thể tạo một instance Settings mới.
+# get_settings.cache_clear() # Xóa cache nếu get_settings được gọi lại
+# fresh_settings = Settings() # Tạo instance mới, không qua cache get_settings
+# print(f"DEBUG: ACCESS_TOKEN_EXPIRE_MINUTES from fresh_settings: {fresh_settings.ACCESS_TOKEN_EXPIRE_MINUTES} (Type: {type(fresh_settings.ACCESS_TOKEN_EXPIRE_MINUTES)})")
+# print(f"DEBUG: TEST_ENV_VAR_INIT_NEO4J from fresh_settings: {getattr(fresh_settings, 'TEST_ENV_VAR_INIT_NEO4J', 'NOT_FOUND')}")
+
+# Cách tốt hơn để kiểm tra là xem instance `settings` đã được import:
+print(f"DEBUG: ACCESS_TOKEN_EXPIRE_MINUTES from imported settings: {settings.ACCESS_TOKEN_EXPIRE_MINUTES} (Type: {type(settings.ACCESS_TOKEN_EXPIRE_MINUTES)})")
+print(f"DEBUG: TEST_ENV_VAR_INIT_NEO4J from imported settings: {getattr(settings, 'TEST_ENV_VAR_INIT_NEO4J', 'NOT_FOUND')}")
+# --- END DEBUG ---
 
 NEO4J_SCHEMA_FILE = Path(__file__).parent.parent / "novaguard-backend" / "database" / "neo4j_schema.cypher"
 
@@ -61,3 +76,4 @@ if __name__ == "__main__":
 # Từ thư mục gốc novaguard-ai2
 # export PYTHONPATH=$(pwd)/novaguard-backend:$PYTHONPATH (nếu chưa set)
 # python scripts/init_neo4j.py
+# NEO4J_URI="neo4j://localhost:7687" NEO4J_USER="neo4j" NEO4J_PASSWORD="yourStrongPassword" python scripts/init_neo4j.py
