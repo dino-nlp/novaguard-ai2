@@ -103,9 +103,7 @@
                 <div class="grid grid-cols-3 gap-2">
                     <dt class="font-medium text-gray-500">LLM Provider:</dt>
                     <dd class="col-span-2 text-gray-800">
-                        {% if project.llm_provider %}
-                            {{ project.llm_provider.value | capitalize }} {# project.llm_provider là Pydantic schema, đã có .value #}
-                        {% elif default_settings.DEFAULT_LLM_PROVIDER %}
+                        {% if project.llm_provider %}  {{ project.llm_provider.value | capitalize }} {% elif default_settings.DEFAULT_LLM_PROVIDER %}
                             {{ default_settings.DEFAULT_LLM_PROVIDER | capitalize }} (Server Default)
                         {% else %}
                             N/A
@@ -160,6 +158,7 @@
                         {% if not project.output_language %}(Server Default){% endif %}
                     </dd>
                 </div>
+
             </dl>
         </div>
     </div>

@@ -566,6 +566,10 @@ async def project_detail_page_ui_get(
     logger.info(f"Serving project detail page for project ID: {project_id_path}, user: {current_user.email}")
     
     project_db_model = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
+    logger.info(f"DB model - project_id: {project_db_model.id}, llm_provider from DB: {project_db_model.llm_provider}, type: {type(project_db_model.llm_provider)}")
+    if hasattr(project_db_model.llm_provider, 'value'):
+        logger.info(f"DB model - llm_provider.value: {project_db_model.llm_provider.value}")
+
     
     if not project_db_model:
         logger.warning(f"Project ID {project_id_path} not found or not owned by user {current_user.email}.")
@@ -576,6 +580,10 @@ async def project_detail_page_ui_get(
 
     # Chuyển Project model sang Pydantic schema ProjectPublic để dễ dàng truy cập và thêm trường llm_api_key_override_is_set
     project_public_data = project_schemas.ProjectPublic.model_validate(project_db_model)
+    logger.info(f"Pydantic model - project_public_data.llm_provider: {project_public_data.llm_provider}, type: {type(project_public_data.llm_provider)}")
+    if hasattr(project_public_data.llm_provider, 'value'):
+        logger.info(f"Pydantic model - project_public_data.llm_provider.value: {project_public_data.llm_provider.value}")
+
     if project_db_model.llm_api_key_override_encrypted:
         project_public_data.llm_api_key_override_is_set = True
     else:
@@ -589,6 +597,10 @@ async def project_detail_page_ui_get(
         "LLM_DEFAULT_TEMPERATURE": getattr(settings, 'LLM_DEFAULT_TEMPERATURE', 0.1),
         "DEFAULT_OUTPUT_LANGUAGE": getattr(settings, 'DEFAULT_OUTPUT_LANGUAGE', 'en')
     }
+    
+    # Kiểm tra cả default_settings một lần nữa cho chắc chắn
+    logger.info(f"Template default_settings - DEFAULT_LLM_PROVIDER: {default_settings_for_template['DEFAULT_LLM_PROVIDER']}")
+
 
     # Lấy lịch sử phân tích (giới hạn 10 cho mỗi loại)
     pr_scans_db = pr_crud.get_pr_analysis_requests_by_project_id(db, project_id=project_id_path, limit=10)
@@ -668,6 +680,14 @@ async def project_detail_page_ui_get(
     analysis_history.sort(key=lambda item: item.requested_at, reverse=True)
     # Giới hạn số lượng item hiển thị (ví dụ: 20 gần nhất)
     analysis_history = analysis_history[:20] 
+    
+    debug_info = {
+        "db_llm_provider_type": str(type(project_db_model.llm_provider)),
+        "db_llm_provider_value": str(project_db_model.llm_provider.value) if hasattr(project_db_model.llm_provider, 'value') else str(project_db_model.llm_provider),
+        "pydantic_llm_provider_type": str(type(project_public_data.llm_provider)),
+        "pydantic_llm_provider_value": str(project_public_data.llm_provider.value) if hasattr(project_public_data.llm_provider, 'value') else str(project_public_data.llm_provider),
+        "default_llm_provider_from_settings": str(default_settings_for_template['DEFAULT_LLM_PROVIDER'])
+    }
 
     return templates.TemplateResponse("pages/projects/project_detail.html", {
         "request": request,
@@ -676,6 +696,7 @@ async def project_detail_page_ui_get(
         "project": project_public_data,
         "default_settings": default_settings_for_template, # << Đảm bảo được truyền
         "analysis_history_items": analysis_history,
+        "debug_info": debug_info,
         "current_year": datetime.now().year
     })
 

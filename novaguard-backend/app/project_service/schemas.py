@@ -30,7 +30,11 @@ class ProjectBase(BaseModel):
     # Validator cho các trường optional string để chuyển "" thành None
     _normalize_language = field_validator('language', 'llm_model_name', 'custom_project_notes', mode='before')(empty_str_to_none)
     _normalize_llm_model_name = field_validator('llm_model_name', mode='before')(empty_str_to_none) 
-
+    
+    class Config: # Đây là Config của ProjectBase
+        # from_attributes = True
+        # use_enum_values = True
+        pass
 
 # Schema cho việc tạo Project (input từ API)
 class ProjectCreate(ProjectBase):
@@ -84,7 +88,7 @@ class ProjectPublic(ProjectBase): # Kế thừa từ ProjectBase để có các 
 
     class Config:
         from_attributes = True
-        use_enum_values = True # Để khi serialize, giá trị của Enum được dùng (ví dụ: "ollama")
+        # use_enum_values = True # Để khi serialize, giá trị của Enum được dùng (ví dụ: "ollama")
 
 
 # Schema để trả về danh sách Project

@@ -125,12 +125,11 @@ async def invoke_llm_analysis_chain(
         prompt_input_values = dynamic_context_values.copy()
         prompt_input_values["format_instructions"] = pydantic_parser.get_format_instructions()
 
+        chat_prompt_template_obj = ChatPromptTemplate.from_template(template=prompt_template_str)
+        
         # === LOGGING PROMPT CUỐI CÙNG ===
         if logger.isEnabledFor(logging.DEBUG):
             try:
-                # ChatPromptTemplate.from_template(...).format_prompt(...) trả về một PromptValue
-                # mà có thể convert sang messages hoặc string.
-                chat_prompt_template_obj = ChatPromptTemplate.from_template(template=prompt_template_str)
                 # Tạo prompt messages
                 prompt_messages = chat_prompt_template_obj.format_messages(**prompt_input_values)
                 

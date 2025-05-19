@@ -526,7 +526,7 @@ async def run_full_project_analysis_agents(
     logger.info(f"Worker: Running Full Project Analysis Agents for project: {project_name_for_log}")
 
     final_project_analysis_output = LLMProjectAnalysisOutput(
-        project_summary=None, project_level_findings=[], granular_findings=[]
+        project_summary="", project_level_findings=[], granular_findings=[]
     )
     
     # === LẤY CẤU HÌNH LLM TỪ PROJECT HOẶC SETTINGS ===
@@ -608,9 +608,19 @@ async def run_full_project_analysis_agents(
     # và gộp kết quả của chúng vào final_project_analysis_output
 
     if not final_project_analysis_output.project_level_findings and \
-       not final_project_analysis_output.granular_findings and \
-       not final_project_analysis_output.project_summary :
-        final_project_analysis_output.project_summary = f"NovaGuard AI full project analysis (agent: {agent_name_architect}) completed. No specific issues or summary were reported by the agent for this project."
+        not final_project_analysis_output.granular_findings and \
+        (not final_project_analysis_output.project_summary or final_project_analysis_output.project_summary.strip() == ""):
+        # Lấy agent_name từ context hoặc một cách nào đó nếu cần
+        agent_name_for_summary = "Configured Agents" # Hoặc agent_name_architect nếu chỉ có 1 agent
+        final_project_analysis_output.project_summary = f"NovaGuard AI full project analysis (using {agent_name_for_summary}) completed. No specific issues or summary were explicitly reported."
+        logger.info(f"Full project analysis for '{project_name_for_log}' by {agent_name_for_summary} completed with no explicit findings or summary.")
+    elif not final_project_analysis_output.project_level_findings and \
+        not final_project_analysis_output.granular_findings and \
+        final_project_analysis_output.project_summary and \
+        "error" not in final_project_analysis_output.project_summary.lower() and \
+        "failed" not in final_project_analysis_output.project_summary.lower():
+        logger.info(f"Full project analysis for '{project_name_for_log}' completed with a summary but no explicit findings: {final_project_analysis_output.project_summary}")
+
 
     return final_project_analysis_output
 

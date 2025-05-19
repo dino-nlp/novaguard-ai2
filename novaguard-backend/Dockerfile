@@ -5,8 +5,12 @@ FROM python:3.11-slim
 WORKDIR /app
 
 USER root
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-# USER app 
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 # Sao chép file requirements vào thư mục làm việc
 COPY ./requirements.txt /app/requirements.txt
