@@ -31,7 +31,7 @@ class CKGBuilder:
         driver = await self._get_driver()
         db_name = getattr(driver, 'database', 'neo4j')
         async with driver.session(database=db_name) as session:
-            async with session.begin_transaction() as tx:
+            async with await session.begin_transaction() as tx:
                 for query, params in queries_with_params:
                     try:
                         # logger.debug(f"CKG Executing Cypher: {query} with params: {params}")
@@ -110,7 +110,7 @@ class CKGBuilder:
         db_name = getattr(driver, 'database', 'neo4j')
         all_results = []
         async with driver.session(database=db_name) as session:
-            async with session.begin_transaction() as tx:
+            async with await session.begin_transaction() as tx:
                 for query, params in queries_with_params:
                     try:
                         result = await tx.run(query, params)

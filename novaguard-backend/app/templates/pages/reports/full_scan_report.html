@@ -1,0 +1,216 @@
+{% extends "layout/base.html" %}
+
+{% block head_extra %}
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    <style>
+        .finding-card {
+            border-left-width: 5px;
+            border-left-style: solid;
+            margin-bottom: 1.5rem; /* Tailwind: mb-6 */
+        }
+        .finding-severity-error { border-left-color: #ef4444; /* Tailwind: border-red-500 */ }
+        .finding-severity-warning { border-left-color: #f59e0b; /* Tailwind: border-amber-500 */ }
+        .finding-severity-note { border-left-color: #38bdf8; /* Tailwind: border-sky-500 */ }
+        .finding-severity-info { border-left-color: #6b7280; /* Tailwind: border-gray-500 */ }
+
+        .severity-badge {
+            padding: 0.25rem 0.6rem; /* Tương đương px-2.5 py-1 */
+            font-size: 0.75rem; /* text-xs */
+            font-weight: 600; /* font-semibold */
+            border-radius: 9999px; /* rounded-full */
+            display: inline-block;
+            line-height: 1;
+        }
+        .severity-badge-error { background-color: #ef4444; color: white; }
+        .severity-badge-warning { background-color: #f59e0b; color: black; }
+        .severity-badge-note { background-color: #38bdf8; color: black; }
+        .severity-badge-info { background-color: #6b7280; color: white; }
+
+        pre code.hljs {
+            padding: 1em;
+            border-radius: 0.375rem; /* rounded-md */
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .finding-title {
+            font-size: 1.1rem; /* Gần bằng text-lg */
+            font-weight: 600; /* font-semibold */
+        }
+        .meta-data-json {
+            background-color: #f3f4f6; /* gray-100 */
+            padding: 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.8rem;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+    </style>
+{% endblock %}
+
+{% block content %}
+<div class="bg-white p-6 rounded-lg shadow-xl">
+    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 pb-4 border-b border-gray-200">
+        <div class="mb-3 sm:mb-0">
+            <h1 class="text-2xl font-semibold text-nv-dark">
+                Full Project Scan Report
+            </h1>
+            <p class="text-sm text-gray-600">
+                Project: <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" class="text-nv-accent hover:underline">{{ project.repo_name }}</a>
+            </p>
+            <p class="text-lg font-medium text-gray-800 mt-1">
+                Branch: {{ scan_request_details.branch_name }}
+            </p>
+        </div>
+        <a href="{{ url_for('ui_project_detail_get', project_id_path=project.id) }}" 
+           class="text-sm bg-gray-200 hover:bg-gray-300 text-gray-800 font-semibold py-2 px-4 rounded-md transition duration-150 self-start sm:self-center">
+            &larr; Back to Project Details
+        </a>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 text-sm">
+        <div class="bg-gray-50 p-3 rounded-md shadow-sm"><strong>Status:</strong> 
+            <span class="px-2 py-0.5 text-xs font-semibold rounded-full
+                {% if scan_request_details.status.value == 'completed' %} bg-green-100 text-green-700
+                {% elif scan_request_details.status.value == 'failed' %} bg-red-100 text-red-700
+                {% elif scan_request_details.status.value in ['processing', 'source_fetched', 'ckg_building', 'analyzing'] %} bg-yellow-100 text-yellow-700
+                {% else %} bg-gray-200 text-gray-700 {% endif %}">
+                {{ scan_request_details.status.value | replace('_', ' ') | title }}
+            </span>
+        </div>
+        <div class="bg-gray-50 p-3 rounded-md shadow-sm"><strong>Requested At:</strong> 
+            {{ scan_request_details.requested_at.strftime('%d %b %Y, %H:%M') if scan_request_details.requested_at else 'N/A' }}
+        </div>
+        <div class="bg-gray-50 p-3 rounded-md shadow-sm"><strong>Completed At:</strong> 
+            {{ scan_request_details.analysis_completed_at.strftime('%d %b %Y, %H:%M') if scan_request_details.analysis_completed_at else 'N/A' }}
+        </div>
+    </div>
+
+    {% if scan_request_details.status.value == 'failed' and project_summary %}
+        <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded-md" role="alert">
+            <p class="font-bold">Analysis Failed</p>
+            <pre class="whitespace-pre-wrap text-sm">{{ project_summary }}</pre> {# Hiển thị lỗi nếu là lỗi thực sự #}
+        </div>
+    {% elif project_summary %}
+        <div class="mb-8 p-4 bg-sky-50 border border-sky-200 rounded-md shadow">
+            <h3 class="text-lg font-semibold text-sky-800 mb-2">Project Analysis Summary</h3>
+            <p class="text-sm text-sky-700 whitespace-pre-wrap">{{ project_summary }}</p>
+        </div>
+    {% endif %}
+
+
+    {% if project_level_findings or granular_findings %}
+        {# Project-Level Findings #}
+        {% if project_level_findings %}
+            <h2 class="text-xl font-semibold text-nv-dark mt-8 mb-4">Project-Level & Architectural Findings ({{ project_level_findings | length }})</h2>
+            {% for finding in project_level_findings %}
+            <div class="finding-card finding-severity-{{ finding.severity.value | lower }} bg-white border border-gray-200 rounded-lg shadow-md mb-6">
+                <div class="p-4 border-b border-gray-200 flex justify-between items-center">
+                    <span class="finding-title text-gray-800">{{ finding.module_name or finding.message | truncate(80, True) }}</span>
+                    <span class="severity-badge severity-badge-{{ finding.severity.value | lower }}">{{ finding.severity.value | capitalize }}</span>
+                </div>
+                <div class="p-4 space-y-3 text-sm">
+                    <div>
+                        <p class="font-semibold text-gray-700">Description:</p>
+                        <p class="text-gray-600 whitespace-pre-wrap">{{ finding.message }}</p>
+                    </div>
+                    {% if finding.suggestion %}
+                    <div class="mt-2">
+                        <p class="font-semibold text-gray-700">Recommendation/Suggestion:</p>
+                        <p class="text-gray-600 whitespace-pre-wrap">{{ finding.suggestion }}</p>
+                    </div>
+                    {% endif %}
+                    {% if finding.code_snippet %} {# code_snippet có thể chứa "Relevant Components" #}
+                    <div class="mt-2">
+                        <p class="font-semibold text-gray-700">Details/Relevant Components:</p>
+                        <p class="text-gray-600 whitespace-pre-wrap">{{ finding.code_snippet }}</p>
+                    </div>
+                    {% endif %}
+                     {% if finding.meta_data %}
+                    <div class="mt-2">
+                        <p class="font-semibold text-gray-700">Additional Data:</p>
+                        <pre class="meta-data-json">{{ finding.meta_data | tojson(indent=2) }}</pre>
+                    </div>
+                    {% endif %}
+                    <p class="text-xs text-gray-500 mt-2">Agent: {{ finding.agent_name or "NovaGuard FullScan Agent" }} | Type: {{ finding.finding_type or "N/A" }}</p>
+                </div>
+            </div>
+            {% endfor %}
+        {% endif %}
+
+        {# Granular (File-Specific) Findings #}
+        {% if granular_findings %}
+            <h2 class="text-xl font-semibold text-nv-dark mt-10 mb-4">Specific Code Findings ({{ granular_findings | length }})</h2>
+            {% for finding in granular_findings %}
+            <div class="finding-card finding-severity-{{ finding.severity.value | lower }} bg-white border border-gray-200 rounded-lg shadow-md mb-6">
+                <div class="p-4 border-b border-gray-200 flex justify-between items-center">
+                    <span class="finding-title text-gray-800">{{ finding.message | truncate(80, True) }}</span>
+                    <span class="severity-badge severity-badge-{{ finding.severity.value | lower }}">{{ finding.severity.value | capitalize }}</span>
+                </div>
+                <div class="p-4 space-y-3 text-sm">
+                    <p><strong>File:</strong> 
+                        {% if finding.file_path and finding.file_path != "N/A" %}
+                        <code class="text-nv-med-dark bg-gray-100 px-1.5 py-0.5 rounded-md text-xs">{{ finding.file_path }}</code>
+                        {% else %}
+                        <span class="text-gray-500 italic">N/A</span>
+                        {% endif %}
+                       {% if finding.line_start %}
+                         <span class="text-gray-500 ml-1">(Line{{ "s" if finding.line_end and finding.line_start != finding.line_end else "" }}
+                         {{ finding.line_start }}{% if finding.line_end and finding.line_start != finding.line_end %}-{{ finding.line_end }}{% endif %})</span>
+                       {% endif %}
+                    </p>
+                    
+                    <div>
+                        <p class="font-semibold text-gray-700">Full Description:</p>
+                        <p class="text-gray-600 whitespace-pre-wrap">{{ finding.message }}</p>
+                    </div>
+                    
+                    {% if finding.suggestion %}
+                    <div class="mt-2">
+                        <p class="font-semibold text-gray-700">Suggestion:</p>
+                        <p class="text-gray-600 whitespace-pre-wrap">{{ finding.suggestion }}</p>
+                    </div>
+                    {% endif %}
+
+                    {% if finding.code_snippet %}
+                    <div class="mt-3">
+                        <p class="font-semibold text-gray-700 mb-1">Relevant Code Snippet:</p>
+                        {% set lang = finding.file_path.split('.')[-1] if finding.file_path and '.' in finding.file_path else 'plaintext' %}
+                        <pre><code class="language-{{ lang }} hljs">{{- finding.code_snippet -}}</code></pre>
+                    </div>
+                    {% endif %}
+                    {% if finding.meta_data %}
+                    <div class="mt-2">
+                        <p class="font-semibold text-gray-700">Additional Data:</p>
+                        <pre class="meta-data-json">{{ finding.meta_data | tojson(indent=2) }}</pre>
+                    </div>
+                    {% endif %}
+                    <p class="text-xs text-gray-500 mt-2">Agent: {{ finding.agent_name or "NovaGuard FullScan Agent" }} | Type: {{ finding.finding_type or "N/A" }}</p>
+                </div>
+            </div>
+            {% endfor %}
+        {% endif %}
+
+    {% elif scan_request_details.status.value == 'completed' %}
+        <div class="bg-sky-50 border-l-4 border-sky-400 text-sky-700 p-4 rounded-md" role="alert">
+            <p class="font-bold">No Specific Issues Reported</p>
+            <p>NovaGuard AI completed the full project scan. If a summary is provided above, it contains the main observations. No specific project-level or granular code issues were explicitly reported by the configured agents for this scan.</p>
+        </div>
+    {% elif scan_request_details.status.value not in ['failed', 'completed'] %}
+        <div class="bg-yellow-50 border-l-4 border-yellow-400 text-yellow-700 p-4 rounded-md" role="alert">
+            <p class="font-bold">Analysis In Progress</p>
+            <p>The full project scan is currently {{ scan_request_details.status.value | replace('_', ' ') }}. Please check back later for results.</p>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts_extra %}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script>
+    document.addEventListener('DOMContentLoaded', (event) => {
+        document.querySelectorAll('pre code.hljs').forEach((el) => {
+            hljs.highlightElement(el);
+        });
+    });
+    </script>
+{% endblock %}

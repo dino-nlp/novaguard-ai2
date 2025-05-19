@@ -6,6 +6,7 @@ import tarfile
 import zipfile
 import io # Để làm việc với bytes stream
 from pathlib import Path
+import mimetypes
 
 logger = logging.getLogger(__name__)
 
@@ -192,57 +193,122 @@ class GitHubAPIClient:
         logger.info(f"Downloading archive from {archive_url} and extracting to {extract_to_path}")
         Path(extract_to_path).mkdir(parents=True, exist_ok=True)
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=300.0) as client: # Theo dõi redirect cho URL archive, tăng timeout
+        async with httpx.AsyncClient(follow_redirects=True, timeout=300.0) as client:
             try:
                 response = await client.get(archive_url)
                 response.raise_for_status()
                 content_bytes = response.content
-
                 archive_stream = io.BytesIO(content_bytes)
 
-                if archive_url.endswith(".zip") or "zipball" in archive_url:
-                    logger.debug("Extracting ZIP archive...")
+                # === CẬP NHẬT LOGIC XÁC ĐỊNH ĐỊNH DẠNG ===
+                is_zip = False
+                is_tar_gz = False
+
+                # Cố gắng xác định từ content-type header nếu có
+                content_type = response.headers.get("content-type", "").lower()
+                logger.debug(f"Archive download response content-type: {content_type}")
+
+                if "application/zip" in content_type or "application/x-zip-compressed" in content_type:
+                    is_zip = True
+                elif "application/gzip" in content_type or "application/x-gzip" in content_type or \
+                    "application/x-tar" in content_type or "application/tar+gzip" in content_type:
+                    is_tar_gz = True
+                
+                # Nếu content-type không rõ ràng, thử đoán từ URL
+                if not is_zip and not is_tar_gz:
+                    logger.debug(f"Content-type did not clearly indicate archive type. Guessing from URL: {archive_url}")
+                    url_lower = archive_url.lower()
+                    if url_lower.endswith(".zip") or "zipball" in url_lower:
+                        is_zip = True
+                    elif url_lower.endswith(".tar.gz") or "tarball" in url_lower or ".tgz" in url_lower:
+                        is_tar_gz = True
+                
+                # THÊM: Thử đoán từ phần mở rộng của phần path trong URL nếu có
+                if not is_zip and not is_tar_gz:
+                    try:
+                        from urllib.parse import urlparse
+                        parsed_url_path = urlparse(archive_url).path
+                        # Lấy phần mở rộng cuối cùng, ví dụ /legacy.tar.gz/refs/heads/main -> .gz
+                        # Hoặc nếu path là /archive.zip -> .zip
+                        path_suffix = Path(parsed_url_path).suffix.lower()
+                        if path_suffix == ".zip":
+                            is_zip = True
+                        elif path_suffix == ".gz": # Nếu là .gz, giả định là .tar.gz
+                            is_tar_gz = True
+                        elif path_suffix == ".tgz":
+                            is_tar_gz = True
+                        logger.debug(f"Guessed from URL path suffix '{path_suffix}': is_zip={is_zip}, is_tar_gz={is_tar_gz}")
+                    except Exception as e_parse_url:
+                        logger.warning(f"Could not parse URL path for suffix guessing: {e_parse_url}")
+
+                if is_zip:
+                    logger.info("Detected ZIP archive format.")
+                    archive_stream.seek(0)
                     with zipfile.ZipFile(archive_stream, 'r') as zip_ref:
-                        # GitHub zipballs thường có một thư mục gốc bên trong
-                        # Ví dụ: owner-repo-commitsha/
-                        # Chúng ta muốn giải nén nội dung của thư mục gốc đó ra extract_to_path
-                        # mà không tạo thêm thư mục gốc đó.
                         members = zip_ref.namelist()
                         root_folder_name = ""
                         if members and '/' in members[0] and members[0].count('/') == 1 and members[0].endswith('/'):
                             root_folder_name = members[0]
-
                         for member_info in zip_ref.infolist():
                             if root_folder_name and member_info.filename.startswith(root_folder_name):
-                                # Loại bỏ thư mục gốc khỏi đường dẫn đích
-                                target_path = Path(extract_to_path) / member_info.filename[len(root_folder_name):]
+                                target_path_str = member_info.filename[len(root_folder_name):]
+                                if not target_path_str: continue # Bỏ qua entry thư mục gốc rỗng
+                                target_path = Path(extract_to_path) / target_path_str
                             else:
                                 target_path = Path(extract_to_path) / member_info.filename
-
-                            if member_info.is_dir():
-                                target_path.mkdir(parents=True, exist_ok=True)
-                            else:
-                                target_path.parent.mkdir(parents=True, exist_ok=True)
+                            
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            if not member_info.is_dir(): # Chỉ ghi file, không ghi thư mục trống
                                 with open(target_path, "wb") as f_out:
                                     f_out.write(zip_ref.read(member_info.filename))
                     logger.info("ZIP archive extracted successfully.")
 
-                elif archive_url.endswith(".tar.gz") or "tarball" in archive_url:
-                    logger.debug("Extracting TAR.GZ archive...")
-                    archive_stream.seek(0) # Reset stream position
+                elif is_tar_gz:
+                    logger.info("Detected TAR.GZ archive format.")
+                    archive_stream.seek(0)
                     with tarfile.open(fileobj=archive_stream, mode="r:gz") as tar_ref:
-                        # Tương tự như zip, loại bỏ thư mục gốc nếu có
+                        # Logic _members_without_root để loại bỏ thư mục gốc
                         members_to_extract = []
-                        root_folder_name = ""
-                        # Lấy member đầu tiên để kiểm tra thư mục gốc
-                        first_member = tar_ref.next()
-                        if first_member and first_member.isdir() and first_member.name.count('/') == 0 :
-                            root_folder_name = first_member.name + "/" # ví dụ "owner-repo-commitsha/"
-                            logger.debug(f"Detected root folder in tar: {root_folder_name}")
-                        tar_ref.extractall(path=extract_to_path, members=self._members_without_root(tar_ref, root_folder_name))
+                        all_tar_members = tar_ref.getmembers() # Lấy tất cả members một lần
+                        
+                        root_folder_name_tar = ""
+                        if all_tar_members and all_tar_members[0].isdir():
+                            # Kiểm tra xem tên member đầu tiên có phải là thư mục gốc không
+                            # Thư mục gốc thường có dạng "owner-repo-commitsha/"
+                            # Ta chỉ cần kiểm tra xem nó có '/' ở cuối và không có '/' nào khác trước đó không
+                            first_member_name = all_tar_members[0].name
+                            if first_member_name.endswith('/') and first_member_name.count('/') == 1:
+                                root_folder_name_tar = first_member_name
+                                logger.debug(f"Detected root folder in tar: {root_folder_name_tar}")
+
+                        for member in all_tar_members:
+                            if root_folder_name_tar and member.path.startswith(root_folder_name_tar):
+                                original_path = member.path
+                                member.path = member.path[len(root_folder_name_tar):]
+                                if not member.path: # Bỏ qua entry thư mục gốc sau khi strip
+                                    continue
+                                # logger.debug(f"Adjusted tar member path from '{original_path}' to '{member.path}'")
+                            
+                            # Chỉ thêm vào extract list nếu path không rỗng sau khi strip
+                            if member.path:
+                                members_to_extract.append(member)
+                        
+                        # tar_ref.extractall(path=extract_to_path, members=self._members_without_root(tar_ref, root_folder_name_tar)) # Sử dụng hàm helper cũ
+                        if members_to_extract: # Chỉ extract nếu có member hợp lệ
+                            def filter_members(members_list_to_filter):
+                                for m in members_list_to_filter:
+                                    # An toàn hơn, đảm bảo không giải nén các file tuyệt đối hoặc ../
+                                    if not m.name.startswith("/") and ".." not in m.name:
+                                        yield m
+                            tar_ref.extractall(path=extract_to_path, members=list(filter_members(members_to_extract)))
+                        else:
+                            logger.warning("No valid members found to extract from tar archive after stripping root folder.")
 
                     logger.info("TAR.GZ archive extracted successfully.")
                 else:
+                    # Nếu vẫn không xác định được, log thêm thông tin
+                    logger.error(f"Could not determine archive type. URL: {archive_url}, Content-Type: {content_type}")
+                    logger.error(f"First 100 bytes of content (if available): {content_bytes[:100] if content_bytes else 'N/A'}")
                     raise ValueError(f"Unsupported archive format or could not determine format from URL: {archive_url}")
 
             except httpx.HTTPStatusError as e_download:
@@ -254,19 +320,6 @@ class GitHubAPIClient:
             except Exception as e:
                 logger.exception(f"Unexpected error downloading/extracting archive {archive_url}")
                 raise
-    
-    def _members_without_root(self, tf: tarfile.TarFile, root_folder_name: str):
-        """Helper for tarfile extraction to strip the top-level directory."""
-        if not root_folder_name:
-            for member in tf.getmembers():
-                yield member
-            return
-
-        for member in tf.getmembers():
-            if member.path.startswith(root_folder_name):
-                member.path = member.path[len(root_folder_name):]
-                if member.path: # Không yield entry rỗng (thư mục gốc sau khi strip)
-                    yield member
     
     async def get_file_content(self, owner: str, repo: str, file_path: str, ref: Optional[str] = None) -> Optional[str]:
         """

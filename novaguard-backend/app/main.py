@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Any, Union
 import httpx
 from urllib.parse import urlencode
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException, status, APIRouter, Query
 from fastapi.staticfiles import StaticFiles
@@ -38,8 +38,9 @@ from app.core.db import get_db
 from app.models import User, Project, PRAnalysisRequest, AnalysisFinding, FullProjectAnalysisRequest, PyAnalysisSeverity
 from app.models.pr_analysis_request_model import PRAnalysisStatus
 from app.models.full_project_analysis_request_model import FullProjectAnalysisStatus
+from app.models.analysis_finding_model import PyFindingLevel # Nếu bạn dùng trực tiếp Enum này để filter
 from app.core.graph_db import close_async_neo4j_driver, get_async_neo4j_driver # Import các hàm Neo4j
-
+from app.common.message_queue.kafka_producer import send_pr_analysis_task # Đảm bảo import này
 
 
 
@@ -409,6 +410,78 @@ async def add_project_page_ui_post(
     request.session["_flash_messages"] = flash_messages
     return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
 
+@ui_project_router.post("/{project_id_path}/trigger-full-scan", name="ui_trigger_full_scan_post")
+async def ui_trigger_full_scan_for_project_post(
+    request: Request, # Cần request object cho flash messages hoặc session
+    project_id_path: int,
+    db: Session = Depends(get_db),
+    current_user: auth_schemas.UserPublic = Depends(get_current_ui_user) # Sử dụng session auth
+):
+    if not current_user:
+        # JavaScript client sẽ nhận lỗi JSON, không phải redirect HTML trực tiếp từ đây
+        # nếu nó là một AJAX request.
+        # Tuy nhiên, với POST từ form thuần túy (không JS), redirect sẽ hoạt động.
+        # Vì JS đang gọi, chúng ta nên trả về lỗi JSON.
+        logger.warning(f"UI Trigger Full Scan: Unauthorized attempt for project ID {project_id_path}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated. Please login.")
+
+    logger.info(f"UI: User {current_user.email} triggering full project scan for project ID: {project_id_path}")
+    db_project = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
+    if not db_project:
+        logger.warning(f"UI Trigger Full Scan: Project ID {project_id_path} not found or not owned by user {current_user.email}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found or not owned by user")
+
+    # Kiểm tra xem có scan nào đang chạy không (tái sử dụng logic từ API)
+    existing_scans = db.query(FullProjectAnalysisRequest).filter(
+        FullProjectAnalysisRequest.project_id == project_id_path,
+        FullProjectAnalysisRequest.status.in_([
+            FullProjectAnalysisStatus.PENDING, FullProjectAnalysisStatus.PROCESSING,
+            FullProjectAnalysisStatus.SOURCE_FETCHED, FullProjectAnalysisStatus.CKG_BUILDING,
+            FullProjectAnalysisStatus.ANALYZING
+        ])
+    ).first()
+    if existing_scans:
+        logger.warning(f"UI Trigger Full Scan: Scan already in progress for project ID {project_id_path} (Request ID: {existing_scans.id})")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A full project scan is already in progress or pending (ID: {existing_scans.id}, Status: {existing_scans.status.value})."
+        )
+
+    try:
+        scan_request = crud_full_scan.create_full_scan_request(
+            db=db, project_id=db_project.id, branch_name=db_project.main_branch
+        )
+        logger.info(f"UI Trigger Full Scan: Created FullProjectAnalysisRequest ID: {scan_request.id} for project {db_project.repo_name}")
+
+        kafka_task_data = {
+            "task_type": "full_project_scan",
+            "full_project_analysis_request_id": scan_request.id,
+            "project_id": db_project.id,
+            "user_id": current_user.id,
+            "github_repo_id": db_project.github_repo_id,
+            "repo_full_name": db_project.repo_name,
+            "branch_to_scan": db_project.main_branch,
+        }
+        
+        success_kafka = await send_pr_analysis_task(kafka_task_data) # Đảm bảo hàm này là async hoặc chạy trong thread executor nếu blocking
+        
+        if success_kafka:
+            logger.info(f"UI Trigger Full Scan: Task for FullProjectAnalysisRequest ID {scan_request.id} sent to Kafka.")
+            # Trả về JSON response cho JavaScript client
+            return {
+                "message": f"Full scan request (ID: {scan_request.id}) for branch '{db_project.main_branch}' has been successfully queued.",
+                "id": scan_request.id,
+                "status": scan_request.status.value
+            }
+        else:
+            logger.error(f"UI Trigger Full Scan: Failed to send task for FullProjectAnalysisRequest ID {scan_request.id} to Kafka.")
+            crud_full_scan.update_full_scan_request_status(db, scan_request.id, FullProjectAnalysisStatus.FAILED, "Kafka send error")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to queue analysis task due to Kafka issue.")
+
+    except Exception as e:
+        logger.exception(f"UI Trigger Full Scan: Error triggering full scan for project ID {project_id_path}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
+
 
 @ui_project_router.get(
     "/list-gh-repos-for-ui", 
@@ -459,7 +532,6 @@ async def project_detail_page_ui_get(
     current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
 ):
     if not current_user:
-        # ... (redirect nếu chưa login)
         flash_messages = request.session.get("_flash_messages", [])
         flash_messages.append({"category": "warning", "message": "Please login to view project details."})
         request.session["_flash_messages"] = flash_messages
@@ -482,123 +554,144 @@ async def project_detail_page_ui_get(
 
     # Xử lý PR Scans
     for pr_req_db in pr_scans_db:
-        errors = 0
-        warnings = 0
-        others = 0
-        # Đảm bảo bạn query findings *sau khi* worker đã commit vào DB.
-        # Trạng thái pr_req_db.status nên là trạng thái mới nhất từ DB.
+        errors, warnings, others = 0, 0, 0
         if pr_req_db.status == PRAnalysisStatus.COMPLETED:
-            # Query cột severity từ bảng analysisfindings
-            findings_severities_tuples = db.query(AnalysisFinding.severity)\
-                                           .filter(AnalysisFinding.pr_analysis_request_id == pr_req_db.id)\
-                                           .all()
-            # findings_severities_tuples sẽ là list các tuple, ví dụ: [(<PyAnalysisSeverity.ERROR: 'Error'>,), (<PyAnalysisSeverity.WARNING: 'Warning'>,)]
-            # Cần lấy giá trị Enum từ tuple
-            for severity_tuple in findings_severities_tuples:
-                severity_enum_member = severity_tuple[0] # Lấy phần tử đầu tiên của tuple
+            findings_severities = db.query(AnalysisFinding.severity)\
+                                    .filter(AnalysisFinding.pr_analysis_request_id == pr_req_db.id)\
+                                    .all()
+            for severity_tuple in findings_severities:
+                severity_enum_member = severity_tuple[0]
                 if severity_enum_member == PyAnalysisSeverity.ERROR: errors += 1
                 elif severity_enum_member == PyAnalysisSeverity.WARNING: warnings += 1
-                else: others += 1 # Bao gồm Note, Info
-
+                else: others += 1
+        
         report_url_str = None
         try:
-            # Đảm bảo request_id_param là tên đúng của path parameter trong route ui_pr_report_get
             report_url_str = str(request.url_for('ui_pr_report_get', request_id_param=pr_req_db.id))
         except Exception as e:
             logger.warning(f"Could not generate report URL for PR scan {pr_req_db.id}: {e}")
 
         analysis_history.append(
             AnalysisHistoryItem(
-                id=pr_req_db.id,
-                scan_type="pr",
-                identifier=f"PR #{pr_req_db.pr_number}",
-                title=pr_req_db.pr_title,
-                status=pr_req_db.status, # pr_req_db.status là Enum object (PRAnalysisStatus)
-                requested_at=pr_req_db.requested_at,
-                report_url=report_url_str,
-                total_errors=errors,
-                total_warnings=warnings,
-                total_other_findings=others
+                id=pr_req_db.id, scan_type="pr",
+                identifier=f"PR #{pr_req_db.pr_number}", title=pr_req_db.pr_title,
+                status=pr_req_db.status.value, # Truyền string value của Enum
+                requested_at=pr_req_db.requested_at, report_url=report_url_str,
+                total_errors=errors, total_warnings=warnings, total_other_findings=others
             )
         )
         
     # Xử lý Full Project Scans
     for full_req_db in full_scans_db:
-        errors_full = 0
-        warnings_full = 0
-        others_full = 0 # total_other_findings
-        
-        # TODO: Logic để đếm error/warning cho full scan khi có bảng findings cho full scan
-        # Hiện tại, total_findings trong full_req_db là tổng chung (nếu worker đã cập nhật)
+        errors_full, warnings_full, others_full = 0, 0, 0
         if full_req_db.status == FullProjectAnalysisStatus.COMPLETED:
-            # Giả sử bạn sẽ có một bảng tương tự analysisfindings cho full scans,
-            # hoặc bạn cập nhật total_errors, total_warnings trực tiếp vào fullprojectanalysisrequests
-            # Ví dụ, nếu bạn thêm cột total_errors, total_warnings vào model FullProjectAnalysisRequest:
-            # errors_full = full_req_db.total_errors or 0
-            # warnings_full = full_req_db.total_warnings or 0
-            # others_full = (full_req_db.total_findings or 0) - errors_full - warnings_full
-            pass # Để trống cho đến khi có logic cụ thể
-
+            # Đếm findings cho full scan
+            findings_severities_full = db.query(AnalysisFinding.severity)\
+                                         .filter(AnalysisFinding.full_project_analysis_request_id == full_req_db.id)\
+                                         .all()
+            for severity_tuple in findings_severities_full:
+                severity_enum_member = severity_tuple[0]
+                if severity_enum_member == PyAnalysisSeverity.ERROR: errors_full += 1
+                elif severity_enum_member == PyAnalysisSeverity.WARNING: warnings_full += 1
+                else: others_full += 1
+        
         report_url_full_scan_str = None
-        # TODO: Tạo route và trang report cho full scan
-        # Ví dụ: name='ui_full_scan_report_get'
-        # try:
-        #     report_url_full_scan_str = str(request.url_for('ui_full_scan_report_get', request_id_param=full_req_db.id)) # Đảm bảo tên route và param đúng
-        # except Exception as e:
-        #     logger.warning(f"Could not generate report URL for full scan {full_req_db.id}: {e}")
+        try:
+            # Tạo URL cho route mới sẽ được định nghĩa bên dưới
+            report_url_full_scan_str = str(request.url_for('ui_full_scan_report_get', request_id_param=full_req_db.id))
+        except Exception as e:
+            logger.warning(f"Could not generate report URL for full scan {full_req_db.id}: {e}")
 
         analysis_history.append(
             AnalysisHistoryItem(
-                id=full_req_db.id,
-                scan_type="full",
-                identifier=f"Branch: {full_req_db.branch_name}",
-                title=f"Full Scan - {full_req_db.branch_name}",
-                status=full_req_db.status, # full_req_db.status là Enum object (FullProjectAnalysisStatus)
-                requested_at=full_req_db.requested_at,
-                report_url=report_url_full_scan_str,
-                total_errors=errors_full,
-                total_warnings=warnings_full,
-                total_other_findings=full_req_db.total_findings if full_req_db.total_findings is not None and (errors_full + warnings_full == 0) else others_full
+                id=full_req_db.id, scan_type="full",
+                identifier=f"Branch: {full_req_db.branch_name}", title=f"Full Scan - {full_req_db.branch_name}",
+                status=full_req_db.status.value, # Truyền string value của Enum
+                requested_at=full_req_db.requested_at, report_url=report_url_full_scan_str,
+                total_errors=errors_full, total_warnings=warnings_full, total_other_findings=others_full
             )
         )
 
     analysis_history.sort(key=lambda item: item.requested_at, reverse=True)
-    analysis_history = analysis_history[:20]
-
-    # LOGGING ĐỂ DEBUG (đã có từ lần trước, giữ lại)
-    logger.debug(f"--- Debug analysis_history_items for Project ID {project_id_path} ---")
-    for idx, history_item in enumerate(analysis_history):
-        # Kiểm tra xem status có phải là Enum object không
-        status_value_to_log = history_item.status
-        if hasattr(history_item.status, 'value'):
-            status_value_to_log = history_item.status.value
-        
-        logger.debug(
-            f"Item {idx}: id={history_item.id}, type={history_item.scan_type}, "
-            f"identifier='{history_item.identifier}', title='{history_item.title}', "
-            f"status='{status_value_to_log}', " # In ra value của Enum
-            f"req_at='{history_item.requested_at}', "
-            f"report_url='{history_item.report_url}', "
-            f"errors={history_item.total_errors}, warnings={history_item.total_warnings}, others={history_item.total_other_findings}"
-        )
-        # Tìm item cụ thể gây lỗi (ví dụ PR ID 5)
-        if history_item.id == 5 and history_item.scan_type == 'pr': # Thay 5 bằng ID bạn đang debug
-            logger.info(f"Specific check for PR Scan ID {history_item.id}: Status in history_item is '{status_value_to_log}' (type: {type(history_item.status)})")
-            # Kiểm tra giá trị gốc từ DB object (nếu có thể)
-            original_db_object = next((pr for pr in pr_scans_db if pr.id == history_item.id), None)
-            if original_db_object:
-                logger.info(f"Original DB status for PR Scan ID {original_db_object.id} was '{original_db_object.status.value}' (type: {type(original_db_object.status)})")
-
-    logger.debug("--- End Debug analysis_history_items ---")
+    analysis_history = analysis_history[:20] # Giới hạn số lượng hiển thị
 
     return templates.TemplateResponse("pages/projects/project_detail.html", {
         "request": request,
         "page_title": f"Project: {project_details.repo_name}",
         "current_user": current_user,
         "project": project_details,
-        "analysis_history_items": analysis_history,
+        "analysis_history_items": analysis_history, # Đã được cập nhật
         "current_year": datetime.now().year
     })
+    
+@ui_report_router.get("/full-scan/{request_id_param}/report", response_class=HTMLResponse, name="ui_full_scan_report_get")
+async def ui_full_scan_report_page(
+    request: Request,
+    request_id_param: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
+):
+    if not current_user:
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "warning", "message": "Please login to view reports."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
+
+    logger.info(f"User {current_user.email} requesting Full Scan Report for Request ID: {request_id_param}")
+
+    # Lấy FullProjectAnalysisRequest từ DB
+    full_scan_request_db = crud_full_scan.get_full_scan_request_by_id(db, request_id=request_id_param)
+    
+    if not full_scan_request_db:
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "Full Project Scan Request not found."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    # Kiểm tra quyền sở hữu project
+    project_of_scan = project_crud.get_project_by_id(db, project_id=full_scan_request_db.project_id, user_id=current_user.id)
+    if not project_of_scan:
+        flash_messages = request.session.get("_flash_messages", [])
+        flash_messages.append({"category": "error", "message": "You do not have permission to view this scan report."})
+        request.session["_flash_messages"] = flash_messages
+        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
+    # Lấy danh sách findings cho Full Scan Request này
+    # finding_crud.get_findings_by_request_id đã được cập nhật để có thể query theo full_project_analysis_request_id (cần kiểm tra lại)
+    # Hoặc tạo một hàm mới/cập nhật hàm cũ
+    # Giả sử crud_finding.get_findings_by_full_scan_request_id(db, full_scan_id)
+    
+    # Hiện tại, chúng ta sẽ query trực tiếp ở đây để rõ ràng
+    all_findings_for_full_scan = db.query(AnalysisFinding)\
+                                    .filter(AnalysisFinding.full_project_analysis_request_id == request_id_param)\
+                                    .order_by(AnalysisFinding.severity, AnalysisFinding.file_path, AnalysisFinding.line_start)\
+                                    .all()
+    
+    project_level_findings = [f for f in all_findings_for_full_scan if f.finding_level == PyFindingLevel.PROJECT or f.finding_level == PyFindingLevel.MODULE]
+    granular_findings = [f for f in all_findings_for_full_scan if f.finding_level == PyFindingLevel.FILE]
+
+    # Lấy project_summary từ error_message của full_scan_request_db (như đã lưu ở worker)
+    # Hoặc nếu bạn đã thêm trường `summary` riêng thì dùng trường đó.
+    project_summary_from_db = full_scan_request_db.error_message if full_scan_request_db.status == FullProjectAnalysisStatus.COMPLETED else None
+    if full_scan_request_db.status == FullProjectAnalysisStatus.FAILED and full_scan_request_db.error_message:
+        # Nếu failed, error_message thực sự là lỗi, không phải summary
+        project_summary_from_db = f"Analysis failed: {full_scan_request_db.error_message}"
+
+
+    return templates.TemplateResponse(
+        "pages/reports/full_scan_report.html", # Template mới sẽ được tạo ở bước sau
+        {
+            "request": request,
+            "page_title": f"Full Scan Report: {project_of_scan.repo_name} ({full_scan_request_db.branch_name})",
+            "current_user": current_user,
+            "project": project_of_scan, 
+            "scan_request_details": full_scan_request_db, # Chi tiết của FullProjectAnalysisRequest
+            "project_summary": project_summary_from_db, # Summary từ LLM (nếu có)
+            "project_level_findings": project_level_findings,
+            "granular_findings": granular_findings,
+            "current_year": datetime.now().year
+        }
+    )
 
 @ui_project_router.get("/{project_id}/settings", response_class=HTMLResponse, name="ui_project_settings_get")
 async def project_settings_page_ui_get(

@@ -24,7 +24,11 @@ class Project(Base):
     # Khóa ngoại trỏ đến bản ghi full scan cuối cùng
     last_full_scan_request_id = Column(Integer, ForeignKey("fullprojectanalysisrequests.id", ondelete="SET NULL"), nullable=True)
     # Kiểu ENUM này sử dụng lại type đã tạo bởi FullProjectAnalysisRequest, nên create_type=False là đúng
-    last_full_scan_status = Column(SQLAlchemyEnum(FullProjectAnalysisStatus, name="full_project_analysis_status_enum", create_type=False), nullable=True)
+    last_full_scan_status = Column(SQLAlchemyEnum(FullProjectAnalysisStatus,
+                                            name="full_project_analysis_status_enum",
+                                            create_type=False,
+                                            values_callable=lambda obj: [e.value for e in obj]),
+                            nullable=True)
     last_full_scan_at = Column(DateTime(timezone=True), nullable=True)
 
     owner = relationship("User", back_populates="projects")
