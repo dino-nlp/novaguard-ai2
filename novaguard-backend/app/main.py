@@ -41,6 +41,7 @@ from app.models.full_project_analysis_request_model import FullProjectAnalysisSt
 from app.models.analysis_finding_model import PyFindingLevel # Nếu bạn dùng trực tiếp Enum này để filter
 from app.core.graph_db import close_async_neo4j_driver, get_async_neo4j_driver # Import các hàm Neo4j
 from app.common.message_queue.kafka_producer import send_pr_analysis_task # Đảm bảo import này
+from app.models.project_model import LLMProviderEnum, OutputLanguageEnum 
 
 
 
@@ -283,12 +284,13 @@ async def logout_page_get(request: Request):
         
 @ui_project_router.get("/add", response_class=HTMLResponse, name="ui_add_project_get")
 async def add_project_page_ui_get(
-    request: Request,                                      # 1.
-    gh_repo_id: Optional[str] = Query(None),                # 2. Query param (NO ALIAS)
-    gh_repo_name: Optional[str] = Query(None),              # 3. Query param (NO ALIAS)
-    gh_main_branch: Optional[str] = Query(None),            # 4. Query param (NO ALIAS)
-    db: Session = Depends(get_db),                          # 5. Dependency
-    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user) # 6. Dependency
+    request: Request,
+    gh_repo_id: Optional[str] = Query(None),
+    gh_repo_name: Optional[str] = Query(None),
+    gh_main_branch: Optional[str] = Query(None),
+    gh_language: Optional[str] = Query(None), # Thêm nếu bạn muốn prefill ngôn ngữ code
+    db: Session = Depends(get_db),
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
 ):
     logger.debug(
         f"HANDLER add_project_page_ui_get - Received query: "
@@ -306,31 +308,49 @@ async def add_project_page_ui_get(
     if db_user_full and db_user_full.github_access_token_encrypted:
         github_connected = True
     else:
-        error_message_github = "GitHub account not connected. If you add a project manually, webhooks might not be created automatically. Please connect your GitHub account via the Dashboard."
+        error_message_github = "GitHub account not connected. Webhooks might not be created automatically. Please connect your GitHub account via the Dashboard."
     
     prefill_data = {
         "repo_id": gh_repo_id,
         "repo_name": gh_repo_name,
-        "main_branch": gh_main_branch if gh_main_branch else "main"
+        "main_branch": gh_main_branch if gh_main_branch else "main",
+        "language": gh_language # Ngôn ngữ code của project (nếu có từ query param)
+        # custom_project_notes không thường được prefill từ URL
+    }
+    
+    default_settings_for_template = {
+        "DEFAULT_LLM_PROVIDER": settings.DEFAULT_LLM_PROVIDER,
+        "OLLAMA_DEFAULT_MODEL": settings.OLLAMA_DEFAULT_MODEL, # Để hiển thị placeholder
+        "OPENAI_DEFAULT_MODEL": settings.OPENAI_DEFAULT_MODEL,
+        "GEMINI_DEFAULT_MODEL": settings.GEMINI_DEFAULT_MODEL,
+        "LLM_DEFAULT_TEMPERATURE": getattr(settings, 'LLM_DEFAULT_TEMPERATURE', 0.1),
+        "DEFAULT_OUTPUT_LANGUAGE": getattr(settings, 'DEFAULT_OUTPUT_LANGUAGE', 'en')
     }
     
     return templates.TemplateResponse("pages/projects/add_project.html", {
         "request": request, "page_title": "Add New Project", "current_user": current_user,
         "github_connected": github_connected,
         "error_github": error_message_github, 
-        "prefill_data": prefill_data, 
+        "prefill_data": prefill_data,
+        "default_settings": default_settings_for_template, # Truyền default settings
         "current_year": datetime.now().year
     })
 
 @ui_project_router.post("/add", response_class=RedirectResponse, name="ui_add_project_post")
 async def add_project_page_ui_post(
     request: Request, 
-    # Các Form fields đứng trước Dependencies
+    # Project Identification
     github_repo_id: str = Form(...), 
     repo_name: str = Form(...),
     main_branch: str = Form(...),
-    language: Optional[str] = Form(None),
+    language: Optional[str] = Form(None), # Ngôn ngữ code
     custom_project_notes: Optional[str] = Form(None),
+    # LLM & Analysis Language Configuration
+    llm_provider: Optional[LLMProviderEnum] = Form(LLMProviderEnum.OLLAMA), # Mặc định nếu không được gửi
+    llm_model_name: Optional[str] = Form(None),
+    llm_temperature: Optional[float] = Form(0.1), # Mặc định nếu không được gửi
+    llm_api_key_override: Optional[str] = Form(None),
+    output_language: Optional[OutputLanguageEnum] = Form(OutputLanguageEnum.ENGLISH), # Mặc định
     # Dependencies
     db: Session = Depends(get_db), 
     current_user: auth_schemas.UserPublic = Depends(get_current_ui_user)
@@ -338,21 +358,29 @@ async def add_project_page_ui_post(
     if not current_user: # Redundant if Depends(get_current_ui_user) handles unauthenticated
         return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
 
-    logger.info(f"UI: User {current_user.email} submitting new project: Repo Name '{repo_name}', GitHub Repo ID '{github_repo_id}'")
+    logger.info(f"UI: User {current_user.email} submitting new project: Repo '{repo_name}', Provider '{llm_provider.value if llm_provider else 'default'}'")
     flash_messages = request.session.get("_flash_messages", [])
 
     project_create_schema = project_schemas.ProjectCreate(
         github_repo_id=github_repo_id, repo_name=repo_name, main_branch=main_branch,
-        language=language, custom_project_notes=custom_project_notes
+        language=language, custom_project_notes=custom_project_notes,
+        llm_provider=llm_provider,
+        llm_model_name=llm_model_name, # CRUD sẽ xử lý None/empty
+        llm_temperature=llm_temperature,
+        llm_api_key_override=llm_api_key_override, # CRUD sẽ mã hóa
+        output_language=output_language
     )
     db_project = project_crud.create_project(db=db, project_in=project_create_schema, user_id=current_user.id)
 
     if not db_project:
         flash_messages.append({"category": "error", "message": "Failed to add project. It might already exist or there was a database issue."})
         request.session["_flash_messages"] = flash_messages
+        # Redirect lại trang add với các giá trị đã nhập nếu có lỗi, điều này phức tạp hơn.
+        # Tạm thời redirect về trang add trống.
         return RedirectResponse(url=request.url_for("ui_add_project_get"), status_code=status.HTTP_302_FOUND)
     
     logger.info(f"UI: Project '{db_project.repo_name}' (ID: {db_project.id}) created in DB for user {current_user.email}.")
+
 
     db_user_full = db.query(User).filter(User.id == current_user.id).first()
     webhook_created_successfully = False # Cờ để kiểm tra trạng thái webhook
@@ -369,22 +397,19 @@ async def add_project_page_ui_post(
             
             webhook_id_on_github: Optional[str] = None
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client: # Thêm timeout
+                async with httpx.AsyncClient(timeout=15.0) as client:
                     hook_response = await client.post(create_hook_url, json=github_hook_data, headers=headers_gh)
                     if hook_response.status_code == 201:
                         webhook_id_on_github = str(hook_response.json().get("id"))
                         db_project.github_webhook_id = webhook_id_on_github
-                        db.commit()
-                        db.refresh(db_project)
+                        db.commit(); db.refresh(db_project)
                         webhook_created_successfully = True
                         logger.info(f"Successfully created webhook (ID: {webhook_id_on_github}) for project '{db_project.repo_name}' and saved to DB.")
                     elif hook_response.status_code == 422 and "Hook already exists" in hook_response.text:
                         logger.warning(f"Webhook already exists for '{db_project.repo_name}'. Assuming it's correctly configured.")
-                        # Bạn có thể muốn thử lấy ID của hook đã tồn tại và lưu lại ở đây nếu chưa có.
-                        webhook_created_successfully = True # Coi như thành công nếu đã tồn tại
+                        webhook_created_successfully = True 
                     else:
                         logger.error(f"Failed to create webhook (Status {hook_response.status_code}): {hook_response.text} for {db_project.repo_name}")
-                        hook_response.raise_for_status() # Sẽ raise lỗi và đi vào except httpx.HTTPStatusError
             except httpx.HTTPStatusError as e_http_hook:
                 error_detail = e_http_hook.response.json().get('message', str(e_http_hook)) if e_http_hook.response.content else str(e_http_hook)
                 logger.error(f"HTTP error creating GitHub webhook for '{db_project.repo_name}': {e_http_hook.response.status_code} - {error_detail}")
@@ -396,19 +421,20 @@ async def add_project_page_ui_post(
         elif not github_token:
             flash_messages.append({"category": "error", "message": f"Project '{db_project.repo_name}' added, but GitHub token decryption failed. Webhook not created."})
         elif not settings.NOVAGUARD_PUBLIC_URL:
-             flash_messages.append({"category": "warning", "message": f"Project '{db_project.repo_name}' added, but server's public URL for webhooks is not configured. Webhook setup skipped."})
+            flash_messages.append({"category": "warning", "message": f"Project '{db_project.repo_name}' added, but server's public URL for webhooks is not configured. Webhook setup skipped."})
         elif '/' not in db_project.repo_name: # Đã kiểm tra ở project_service.api nhưng để an toàn
             flash_messages.append({"category": "error", "message": f"Project '{db_project.repo_name}' added, but repository name format is invalid ('owner/repo'). Webhook not created."})
     else:
         flash_messages.append({"category": "warning", "message": f"Project '{db_project.repo_name}' added, but GitHub account is not connected or token is missing. Webhook setup skipped. Please connect/reconnect GitHub via Dashboard."})
 
-    if webhook_created_successfully: # Chỉ thêm message success nếu webhook thực sự OK
-         flash_messages.append({"category": "success", "message": f"Project '{db_project.repo_name}' added and webhook integration is set up!"})
-    elif not any(fm["category"] == "error" or fm["category"] == "warning" for fm in flash_messages): # Nếu không có lỗi/cảnh báo nào về webhook
-        flash_messages.append({"category": "success", "message": f"Project '{db_project.repo_name}' added."}) # Message chung
+    if webhook_created_successfully:
+        flash_messages.append({"category": "success", "message": f"Project '{db_project.repo_name}' added and webhook integration is set up!"})
+    elif not any(fm["category"] == "error" or fm["category"] == "warning" for fm in flash_messages):
+        flash_messages.append({"category": "success", "message": f"Project '{db_project.repo_name}' added."})
     
     request.session["_flash_messages"] = flash_messages
     return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
+
 
 @ui_project_router.post("/{project_id_path}/trigger-full-scan", name="ui_trigger_full_scan_post")
 async def ui_trigger_full_scan_for_project_post(
@@ -529,7 +555,7 @@ async def project_detail_page_ui_get(
     request: Request,
     project_id_path: int,
     db: Session = Depends(get_db),
-    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user) # Sử dụng get_current_ui_user
 ):
     if not current_user:
         flash_messages = request.session.get("_flash_messages", [])
@@ -538,18 +564,36 @@ async def project_detail_page_ui_get(
         return RedirectResponse(url=request.url_for("ui_login_get"), status_code=status.HTTP_302_FOUND)
 
     logger.info(f"Serving project detail page for project ID: {project_id_path}, user: {current_user.email}")
-    project_details = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
     
-    if not project_details:
-        # ... (xử lý project không tìm thấy)
+    project_db_model = project_crud.get_project_by_id(db, project_id=project_id_path, user_id=current_user.id)
+    
+    if not project_db_model:
         logger.warning(f"Project ID {project_id_path} not found or not owned by user {current_user.email}.")
         flash_messages = request.session.get("_flash_messages", [])
         flash_messages.append({"category": "error", "message": "Project not found or you do not have access."})
         request.session["_flash_messages"] = flash_messages
         return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
 
+    # Chuyển Project model sang Pydantic schema ProjectPublic để dễ dàng truy cập và thêm trường llm_api_key_override_is_set
+    project_public_data = project_schemas.ProjectPublic.model_validate(project_db_model)
+    if project_db_model.llm_api_key_override_encrypted:
+        project_public_data.llm_api_key_override_is_set = True
+    else:
+        project_public_data.llm_api_key_override_is_set = False
+
+    default_settings_for_template = {
+        "DEFAULT_LLM_PROVIDER": settings.DEFAULT_LLM_PROVIDER, # << Đảm bảo settings.DEFAULT_LLM_PROVIDER có giá trị
+        "OLLAMA_DEFAULT_MODEL": settings.OLLAMA_DEFAULT_MODEL,
+        "OPENAI_DEFAULT_MODEL": settings.OPENAI_DEFAULT_MODEL,
+        "GEMINI_DEFAULT_MODEL": settings.GEMINI_DEFAULT_MODEL,
+        "LLM_DEFAULT_TEMPERATURE": getattr(settings, 'LLM_DEFAULT_TEMPERATURE', 0.1),
+        "DEFAULT_OUTPUT_LANGUAGE": getattr(settings, 'DEFAULT_OUTPUT_LANGUAGE', 'en')
+    }
+
+    # Lấy lịch sử phân tích (giới hạn 10 cho mỗi loại)
     pr_scans_db = pr_crud.get_pr_analysis_requests_by_project_id(db, project_id=project_id_path, limit=10)
     full_scans_db = crud_full_scan.get_full_scan_requests_for_project(db, project_id=project_id_path, limit=10)
+    
     analysis_history: List[AnalysisHistoryItem] = []
 
     # Xử lý PR Scans
@@ -560,24 +604,29 @@ async def project_detail_page_ui_get(
                                     .filter(AnalysisFinding.pr_analysis_request_id == pr_req_db.id)\
                                     .all()
             for severity_tuple in findings_severities:
-                severity_enum_member = severity_tuple[0]
+                severity_enum_member = severity_tuple[0] # severity là phần tử đầu tiên của tuple
                 if severity_enum_member == PyAnalysisSeverity.ERROR: errors += 1
                 elif severity_enum_member == PyAnalysisSeverity.WARNING: warnings += 1
-                else: others += 1
+                else: others += 1 # Bao gồm Note, Info
         
         report_url_str = None
         try:
             report_url_str = str(request.url_for('ui_pr_report_get', request_id_param=pr_req_db.id))
         except Exception as e:
-            logger.warning(f"Could not generate report URL for PR scan {pr_req_db.id}: {e}")
+            logger.warning(f"Could not generate report URL for PR scan ID {pr_req_db.id}: {e}")
 
         analysis_history.append(
             AnalysisHistoryItem(
-                id=pr_req_db.id, scan_type="pr",
-                identifier=f"PR #{pr_req_db.pr_number}", title=pr_req_db.pr_title,
+                id=pr_req_db.id, 
+                scan_type="pr",
+                identifier=f"PR #{pr_req_db.pr_number}", 
+                title=pr_req_db.pr_title,
                 status=pr_req_db.status.value, # Truyền string value của Enum
-                requested_at=pr_req_db.requested_at, report_url=report_url_str,
-                total_errors=errors, total_warnings=warnings, total_other_findings=others
+                requested_at=pr_req_db.requested_at, 
+                report_url=report_url_str, # Đã là string hoặc None
+                total_errors=errors, 
+                total_warnings=warnings, 
+                total_other_findings=others
             )
         )
         
@@ -585,10 +634,9 @@ async def project_detail_page_ui_get(
     for full_req_db in full_scans_db:
         errors_full, warnings_full, others_full = 0, 0, 0
         if full_req_db.status == FullProjectAnalysisStatus.COMPLETED:
-            # Đếm findings cho full scan
             findings_severities_full = db.query(AnalysisFinding.severity)\
-                                         .filter(AnalysisFinding.full_project_analysis_request_id == full_req_db.id)\
-                                         .all()
+                                        .filter(AnalysisFinding.full_project_analysis_request_id == full_req_db.id)\
+                                        .all()
             for severity_tuple in findings_severities_full:
                 severity_enum_member = severity_tuple[0]
                 if severity_enum_member == PyAnalysisSeverity.ERROR: errors_full += 1
@@ -597,33 +645,40 @@ async def project_detail_page_ui_get(
         
         report_url_full_scan_str = None
         try:
-            # Tạo URL cho route mới sẽ được định nghĩa bên dưới
             report_url_full_scan_str = str(request.url_for('ui_full_scan_report_get', request_id_param=full_req_db.id))
         except Exception as e:
-            logger.warning(f"Could not generate report URL for full scan {full_req_db.id}: {e}")
+            logger.warning(f"Could not generate report URL for full scan ID {full_req_db.id}: {e}")
 
         analysis_history.append(
             AnalysisHistoryItem(
-                id=full_req_db.id, scan_type="full",
-                identifier=f"Branch: {full_req_db.branch_name}", title=f"Full Scan - {full_req_db.branch_name}",
+                id=full_req_db.id, 
+                scan_type="full",
+                identifier=f"Branch: {full_req_db.branch_name}", 
+                title=f"Full Scan - {full_req_db.branch_name}",
                 status=full_req_db.status.value, # Truyền string value của Enum
-                requested_at=full_req_db.requested_at, report_url=report_url_full_scan_str,
-                total_errors=errors_full, total_warnings=warnings_full, total_other_findings=others_full
+                requested_at=full_req_db.requested_at, 
+                report_url=report_url_full_scan_str, # Đã là string hoặc None
+                total_errors=errors_full, 
+                total_warnings=warnings_full, 
+                total_other_findings=others_full
             )
         )
 
+    # Sắp xếp lịch sử phân tích theo thời gian yêu cầu giảm dần
     analysis_history.sort(key=lambda item: item.requested_at, reverse=True)
-    analysis_history = analysis_history[:20] # Giới hạn số lượng hiển thị
+    # Giới hạn số lượng item hiển thị (ví dụ: 20 gần nhất)
+    analysis_history = analysis_history[:20] 
 
     return templates.TemplateResponse("pages/projects/project_detail.html", {
         "request": request,
-        "page_title": f"Project: {project_details.repo_name}",
+        "page_title": f"Project: {project_public_data.repo_name}",
         "current_user": current_user,
-        "project": project_details,
-        "analysis_history_items": analysis_history, # Đã được cập nhật
+        "project": project_public_data,
+        "default_settings": default_settings_for_template, # << Đảm bảo được truyền
+        "analysis_history_items": analysis_history,
         "current_year": datetime.now().year
     })
-    
+
 @ui_report_router.get("/full-scan/{request_id_param}/report", response_class=HTMLResponse, name="ui_full_scan_report_get")
 async def ui_full_scan_report_page(
     request: Request,
@@ -694,11 +749,11 @@ async def ui_full_scan_report_page(
     )
 
 @ui_project_router.get("/{project_id}/settings", response_class=HTMLResponse, name="ui_project_settings_get")
-async def project_settings_page_ui_get(
+async def project_settings_page_ui_get( # Đổi tên project_id thành project_id để nhất quán với path param
     request: Request,
-    project_id: int, # Path parameter
+    project_id: int, # Path parameter (khớp với {project_id} trong decorator)
     db: Session = Depends(get_db),
-    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
+    current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user) # Sử dụng get_current_ui_user
 ):
     if not current_user:
         flash_messages = request.session.get("_flash_messages", [])
@@ -708,31 +763,64 @@ async def project_settings_page_ui_get(
 
     logger.info(f"Serving project settings page for project ID: {project_id}, user: {current_user.email}")
 
-    project = project_crud.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
-    if not project:
+    # Lấy project từ DB bằng project_id và user_id để đảm bảo quyền sở hữu
+    # Đây chính là "project_db_model" mà bạn đề cập
+    project_from_db = project_crud.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
+    
+    if not project_from_db:
         logger.warning(f"Project settings: Project ID {project_id} not found or not owned by user {current_user.email}.")
         flash_messages = request.session.get("_flash_messages", [])
         flash_messages.append({"category": "error", "message": "Project not found or you do not have access to its settings."})
         request.session["_flash_messages"] = flash_messages
         return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
 
+    # Chuyển Project model (SQLAlchemy) sang Pydantic schema (ProjectPublic)
+    # để dễ dàng truy cập trong template và xử lý logic hiển thị
+    project_public_data = project_schemas.ProjectPublic.model_validate(project_from_db)
+    
+    # Kiểm tra xem API key override có được set không và cập nhật Pydantic schema
+    if project_from_db.llm_api_key_override_encrypted:
+        project_public_data.llm_api_key_override_is_set = True
+    else:
+        project_public_data.llm_api_key_override_is_set = False
+    
+    # Lấy các giá trị mặc định từ settings để hiển thị trong template
+    # nếu project chưa có cấu hình riêng hoặc để làm placeholder.
+    default_settings_for_template = {
+        "DEFAULT_LLM_PROVIDER": settings.DEFAULT_LLM_PROVIDER,
+        "OLLAMA_DEFAULT_MODEL": settings.OLLAMA_DEFAULT_MODEL,
+        "OPENAI_DEFAULT_MODEL": settings.OPENAI_DEFAULT_MODEL,
+        "GEMINI_DEFAULT_MODEL": settings.GEMINI_DEFAULT_MODEL,
+        "LLM_DEFAULT_TEMPERATURE": getattr(settings, 'LLM_DEFAULT_TEMPERATURE', 0.1), # Giả sử bạn có thể thêm biến này vào Settings
+        "DEFAULT_OUTPUT_LANGUAGE": getattr(settings, 'DEFAULT_OUTPUT_LANGUAGE', 'en') # Giả sử có thể thêm biến này
+    }
+
     return templates.TemplateResponse("pages/projects/project_settings.html", {
         "request": request,
-        "page_title": f"Settings: {project.repo_name}",
+        "page_title": f"Settings: {project_public_data.repo_name}", # Sử dụng từ Pydantic schema
         "current_user": current_user,
-        "project": project, # Truyền project object (SQLAlchemy model)
-        "current_year": datetime.now().year
+        "project": project_public_data, # Truyền Pydantic schema vào template
+        "default_settings": default_settings_for_template,
+        "current_year": datetime.now().year,
+        # Truyền Enum classes để template có thể dùng (ví dụ, nếu bạn muốn render dropdown từ Enum)
+        # Mặc dù template hiện tại đang hardcode các options.
+        "LLMProviderEnum": LLMProviderEnum,
+        "OutputLanguageEnum": OutputLanguageEnum,
     })
 
 @ui_project_router.post("/{project_id}/settings", response_class=RedirectResponse, name="ui_project_settings_post")
 async def project_settings_page_ui_post(
     request: Request,
-    project_id: int, # Path parameter
-    # Form data
-    repo_name: str = Form(...), # Bạn có thể quyết định cho phép sửa tên repo hay không
+    project_id: int,
+    # Form data - đảm bảo tên khớp với các thuộc tính trong ProjectUpdate và các input fields
     main_branch: str = Form(...),
-    language: Optional[str] = Form(None),
+    language: Optional[str] = Form(None), # Ngôn ngữ code của project
     custom_project_notes: Optional[str] = Form(None),
+    llm_provider: Optional[LLMProviderEnum] = Form(None), # Sẽ nhận string value từ form, Pydantic convert sang Enum
+    llm_model_name: Optional[str] = Form(None),
+    llm_temperature: Optional[float] = Form(None),
+    llm_api_key_override: Optional[str] = Form(None), # Nhận là string
+    output_language: Optional[OutputLanguageEnum] = Form(None), # Sẽ nhận string value
     # Dependencies
     db: Session = Depends(get_db),
     current_user: Optional[auth_schemas.UserPublic] = Depends(get_current_ui_user)
@@ -742,26 +830,19 @@ async def project_settings_page_ui_post(
         # Nếu không, redirect về login
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
-    logger.info(f"Processing update for project ID: {project_id} by user: {current_user.email}")
+    logger.info(f"Processing update for project ID: {project_id} by user: {current_user.email} with settings: "
+                f"provider={llm_provider}, model={llm_model_name}, temp={llm_temperature}, lang_out={output_language}")
 
-    # Lấy project hiện tại để đảm bảo user sở hữu nó trước khi cập nhật
-    # và để có thể lấy github_repo_id (nếu repo_name không được phép sửa và không được gửi từ form)
-    existing_project = project_crud.get_project_by_id(db, project_id=project_id, user_id=current_user.id)
-    if not existing_project:
-        flash_messages = request.session.get("_flash_messages", [])
-        flash_messages.append({"category": "error", "message": "Project not found or you do not have permission to update."})
-        request.session["_flash_messages"] = flash_messages
-        return RedirectResponse(url=request.url_for("ui_dashboard_get"), status_code=status.HTTP_302_FOUND)
-
-
+    # Tạo Pydantic model từ Form data
     project_update_data = project_schemas.ProjectUpdate(
-        # Nếu không cho sửa repo_name từ form, bạn có thể bỏ nó khỏi ProjectUpdate
-        # hoặc lấy giá trị hiện tại từ existing_project.repo_name
-        # Tạm thời, giả sử repo_name được gửi từ form và có thể thay đổi
-        repo_name=repo_name,
         main_branch=main_branch,
-        language=language if language and language.strip() else None, # Đảm bảo None nếu là chuỗi rỗng
-        custom_project_notes=custom_project_notes if custom_project_notes and custom_project_notes.strip() else None
+        language=language, # Sẽ được xử lý thành None nếu rỗng bởi Pydantic validator
+        custom_project_notes=custom_project_notes, # Tương tự
+        llm_provider=llm_provider,
+        llm_model_name=llm_model_name, # Sẽ được xử lý thành None nếu rỗng
+        llm_temperature=llm_temperature,
+        llm_api_key_override=llm_api_key_override, # Xử lý rỗng/None trong CRUD
+        output_language=output_language
     )
     
     updated_project = project_crud.update_project(
@@ -772,11 +853,9 @@ async def project_settings_page_ui_post(
     if updated_project:
         flash_messages.append({"category": "success", "message": "Project settings updated successfully."})
     else:
-        # Điều này không nên xảy ra nếu get_project_by_id ở trên đã thành công
-        flash_messages.append({"category": "error", "message": "Failed to update project settings."})
+        flash_messages.append({"category": "error", "message": "Failed to update project settings. Project not found or permission denied."})
     request.session["_flash_messages"] = flash_messages
     
-    # Redirect về trang chi tiết dự án sau khi cập nhật
     return RedirectResponse(url=request.url_for("ui_project_detail_get", project_id_path=project_id), status_code=status.HTTP_302_FOUND)
 
 @ui_report_router.get("/pr-analysis/{request_id_param}/report", response_class=HTMLResponse, name="ui_pr_report_get")

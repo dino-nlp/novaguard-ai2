@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS fullprojectanalysisrequests (
     total_findings INT 
 );
 
+-- Thêm ENUM types mới cho Project settings
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'project_llm_provider_enum') THEN
+        CREATE TYPE project_llm_provider_enum AS ENUM ('ollama', 'openai', 'gemini');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'project_output_language_enum') THEN
+        CREATE TYPE project_output_language_enum AS ENUM ('en', 'vi', 'ko');
+    END IF;
+END$$;
+
 -- Thêm FOREIGN KEY cho projects.last_full_scan_request_id sau khi fullprojectanalysisrequests đã được tạo
 ALTER TABLE projects
 ADD CONSTRAINT fk_projects_last_full_scan
@@ -76,6 +86,12 @@ ALTER TABLE projects
 ALTER COLUMN last_full_scan_status TYPE full_project_analysis_status_enum
 USING last_full_scan_status::full_project_analysis_status_enum;
 
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS llm_provider project_llm_provider_enum DEFAULT 'ollama',
+    ADD COLUMN IF NOT EXISTS llm_model_name VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS llm_temperature FLOAT DEFAULT 0.1,
+    ADD COLUMN IF NOT EXISTS llm_api_key_override_encrypted TEXT,
+    ADD COLUMN IF NOT EXISTS output_language project_output_language_enum DEFAULT 'en';
 
 -- ENUM type cho PRAnalysisStatus
 DO $$
@@ -106,7 +122,6 @@ CREATE TABLE IF NOT EXISTS pranalysisrequests (
     completed_at TIMESTAMPTZ
 );
 
--- ENUM types mới cho bảng analysisfindings (nếu chưa tồn tại)
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'analysis_severity_enum') THEN
         CREATE TYPE analysis_severity_enum AS ENUM ('Error', 'Warning', 'Note', 'Info');
@@ -162,6 +177,13 @@ COMMENT ON COLUMN analysisfindings.finding_type IS 'Type of finding, e.g., code_
 COMMENT ON COLUMN analysisfindings.finding_level IS 'Level of finding: file, module, or project';
 COMMENT ON COLUMN analysisfindings.module_name IS 'Module name if finding is module-level';
 COMMENT ON COLUMN analysisfindings.meta_data IS 'Additional structured data as JSONB for better querying and details';
+COMMENT ON COLUMN projects.language IS 'Primary programming language of the project code itself';
+COMMENT ON COLUMN projects.llm_provider IS 'Selected LLM provider for this project (ollama, openai, gemini)';
+COMMENT ON COLUMN projects.llm_model_name IS 'Specific LLM model name chosen for this project';
+COMMENT ON COLUMN projects.llm_temperature IS 'LLM temperature setting for this project';
+COMMENT ON COLUMN projects.llm_api_key_override_encrypted IS 'Encrypted API key to override global settings for this project';
+COMMENT ON COLUMN projects.output_language IS 'Desired language for analysis results (en, vi, ko)';
+
 
 
 -- Optional: Tạo trigger để tự động cập nhật trường updated_at cho users và projects

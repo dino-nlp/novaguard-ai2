@@ -11,7 +11,7 @@ import shutil   # Để xóa thư mục
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker  # Đảm bảo import Session
-# from kafka import KafkaConsumer, KafkaError # KafkaConsumer, KafkaError được dùng trong hàm main_worker
+from app.models.project_model import LLMProviderEnum, OutputLanguageEnum # Import các Enum này nếu cần so sánh
 
 from app.llm_service import (
     invoke_llm_analysis_chain,
@@ -182,9 +182,10 @@ def create_dynamic_project_context(
         "formatted_changed_files_with_content": "\n".join(formatted_changed_files_str_list) if formatted_changed_files_str_list else "No relevant file content available for analysis.",
         "project_language": project_model.language or "Undefined",
         "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided.",
+        "requested_output_language": project_model.output_language.value if project_model.output_language else OutputLanguageEnum.ENGLISH.value,
         "raw_pr_data_changed_files": raw_pr_data.get("changed_files", [])
     }
-    logger.debug(f"Dynamic context created for PR ID {pr_model.id}. Title: {context['pr_title']}")
+    logger.debug(f"Dynamic context for PR ID {pr_model.id} includes requested_output_language: {context['requested_output_language']}")
     return context
 
 def load_prompt_template_str(template_name: str) -> str: # Đổi tên hàm để rõ là trả về string
@@ -197,52 +198,46 @@ def load_prompt_template_str(template_name: str) -> str: # Đổi tên hàm đ�
 
 async def run_code_analysis_agent_v1(
     dynamic_context: Dict[str, Any], # dynamic_context chứa tất cả các giá trị cần cho prompt
-    settings_obj: Settings # settings object từ get_settings()
+    settings_obj: Settings, # settings object từ get_settings()
+    project_model: Project # Thêm project_model để lấy cấu hình LLM
 ) -> List[am_schemas.AnalysisFindingCreate]:
     pr_title_for_log = dynamic_context.get('pr_title', 'N/A')
-    logger.info(f"Worker: Running Code Analysis Agent for PR: {pr_title_for_log} using centralized LLMService.")
+    logger.info(f"Worker: Running Code Analysis Agent (PR) for: {pr_title_for_log} using centralized LLMService.")
 
     try:
         # 1. Load Prompt Template String (giữ nguyên)
         prompt_template_str = load_prompt_template_str("deep_logic_bug_hunter_v1.md")
+        invoke_payload = dynamic_context # dynamic_context đã chứa requested_output_language
 
-        # 2. Chuẩn bị payload cho prompt (dynamic_context đã chứa các giá trị này)
-        #    `invoke_payload` là `dynamic_context` đã được chuẩn bị
-        #    (Kiểm tra các key cần thiết đã có trong `dynamic_context` trước khi gọi)
-        invoke_payload = {
-            key: dynamic_context[key]
-            for key in dynamic_context # Lọc ra các key cần thiết cho prompt nếu cần
-            # Ví dụ: nếu prompt chỉ cần một subset các key từ dynamic_context
-        }
-        # IMPORTANT: dynamic_context cần phải chứa tất cả các placeholder mà prompt template mong đợi,
-        # ngoại trừ `format_instructions` sẽ được llm_service xử lý.
-        # Kiểm tra này có thể thực hiện ở đây hoặc trong llm_service.
+        # === LẤY CẤU HÌNH LLM TỪ PROJECT HOẶC SETTINGS ===
+        llm_provider = project_model.llm_provider.value if project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER
+        llm_model = project_model.llm_model_name if project_model.llm_model_name and project_model.llm_model_name.strip() else None
+        llm_temp = project_model.llm_temperature if project_model.llm_temperature is not None else (settings_obj.LLM_DEFAULT_TEMPERATURE if hasattr(settings_obj, 'LLM_DEFAULT_TEMPERATURE') else 0.1) # Giả sử có default temp trong settings
 
-        # 3. Tạo cấu hình LLM cho llm_service
-        # Lấy provider và model mặc định từ settings
-        # Trong tương lai, có thể lấy từ project-specific config
+        decrypted_api_key_override = None
+        if project_model.llm_api_key_override_encrypted:
+            decrypted_api_key_override = decrypt_data(project_model.llm_api_key_override_encrypted)
+            if not decrypted_api_key_override:
+                logger.warning(f"Failed to decrypt API key override for project {project_model.id}. Using default provider key if any.")
+
         current_llm_provider_config = LLMProviderConfig(
-            provider_name=settings_obj.DEFAULT_LLM_PROVIDER,
-            # model_name sẽ được llm_service xác định dựa trên provider và settings_obj.OPENAI_DEFAULT_MODEL etc.
-            # Hoặc bạn có thể xác định model_name ở đây nếu muốn logic đó nằm trong worker:
-            # model_name = (
-            #     settings_obj.OPENAI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "openai"
-            #     else settings_obj.GEMINI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "gemini"
-            #     else settings_obj.OLLAMA_DEFAULT_MODEL
-            # ),
-            temperature=0.1, # Hoặc lấy từ settings_obj
-            # api_key không cần truyền ở đây, llm_service sẽ tự lấy từ settings_obj
+            provider_name=llm_provider,
+            model_name=llm_model,
+            temperature=llm_temp,
+            api_key=decrypted_api_key_override
         )
+        agent_identifier = f"NovaGuardAgent_PR_{current_llm_provider_config.provider_name}"
+        if llm_model: agent_identifier += f"_{llm_model.replace(':', '_')}"
 
-        logger.info(f"Worker: Invoking LLMService with provider config: {current_llm_provider_config.provider_name}")
+        logger.info(f"Worker (PR): Invoking LLMService with provider: {current_llm_provider_config.provider_name}, model: {current_llm_provider_config.model_name or 'provider_default'}")
 
         # 4. Gọi LLM Service
         structured_llm_output: LLMStructuredOutput = await invoke_llm_analysis_chain(
             prompt_template_str=prompt_template_str,
-            dynamic_context_values=invoke_payload, # Đây là dict các giá trị để điền vào prompt
-            output_pydantic_model_class=LLMStructuredOutput, # Schema Pydantic cho output
+            dynamic_context_values=invoke_payload,
+            output_pydantic_model_class=LLMStructuredOutput,
             llm_provider_config=current_llm_provider_config,
-            settings_obj=settings_obj # llm_service dùng để lấy API keys, default models
+            settings_obj=settings_obj
         )
 
         num_findings_from_llm = len(structured_llm_output.findings) if structured_llm_output and structured_llm_output.findings else 0
@@ -310,14 +305,16 @@ async def run_code_analysis_agent_v1(
 
 
                 finding_for_db = am_schemas.AnalysisFindingCreate(
-                    file_path=llm_finding.file_path,
+                    file_path=llm_finding.file_path or "N/A", # Đảm bảo có giá trị
                     line_start=llm_finding.line_start,
                     line_end=llm_finding.line_end,
-                    severity=llm_finding.severity,
+                    severity=llm_finding.severity, # Đây là SeverityLevel từ llm_schemas
                     message=llm_finding.message,
                     suggestion=llm_finding.suggestion,
-                    agent_name=f"NovaGuardAgent_v1_{current_llm_provider_config.provider_name}", # Tên agent có thể kèm provider
-                    code_snippet=code_snippet_text
+                    agent_name=llm_finding.meta_data.get("agent_name_from_llm") if llm_finding.meta_data and llm_finding.meta_data.get("agent_name_from_llm") else agent_identifier, # Cập nhật agent_name
+                    code_snippet=code_snippet_text,
+                    finding_type=llm_finding.finding_type, # Từ llm_schemas
+                    meta_data=llm_finding.meta_data
                 )
                 analysis_findings_to_create.append(finding_for_db)
         
@@ -334,7 +331,7 @@ async def run_code_analysis_agent_v1(
         logger.error(f"Worker: KeyError formatting prompt for PR '{pr_title_for_log}': {e_key}. Check dynamic_context and prompt template.")
         return []
     except Exception as e: # Các lỗi không mong muốn khác trong worker
-        logger.exception(f"Worker: Unexpected error during code analysis agent execution for PR '{pr_title_for_log}': {type(e).__name__} - {e}")
+        logger.exception(f"Worker (PR): Unexpected error during code analysis agent for PR '{pr_title_for_log}': {e}")
         return []
 
 async def query_ckg_for_project_summary(
@@ -477,6 +474,7 @@ async def create_full_project_dynamic_context(
         "project_language": project_model.language or "N/A",
         "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided.",
         "main_branch": project_model.main_branch,
+        "requested_output_language": project_model.output_language.value if project_model.output_language else OutputLanguageEnum.ENGLISH.value,
     }
 
     # 2. Thông tin tóm tắt từ CKG
@@ -517,7 +515,8 @@ async def create_full_project_dynamic_context(
 
 async def run_full_project_analysis_agents(
     full_project_context: Dict[str, Any],
-    settings_obj: Settings
+    settings_obj: Settings,
+    project_model: Project
 ) -> LLMProjectAnalysisOutput: # Trả về schema output mới
     """
     Thực thi các agent LLM để phân tích toàn bộ dự án.
@@ -526,51 +525,67 @@ async def run_full_project_analysis_agents(
     project_name_for_log = full_project_context.get('project_name', 'N/A')
     logger.info(f"Worker: Running Full Project Analysis Agents for project: {project_name_for_log}")
 
-    # Output tổng hợp từ tất cả các agent
     final_project_analysis_output = LLMProjectAnalysisOutput(
-        project_summary=None,
-        project_level_findings=[],
-        granular_findings=[]
+        project_summary=None, project_level_findings=[], granular_findings=[]
     )
+    
+    # === LẤY CẤU HÌNH LLM TỪ PROJECT HOẶC SETTINGS ===
+    llm_provider = project_model.llm_provider.value if project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER
+    llm_model = project_model.llm_model_name if project_model.llm_model_name and project_model.llm_model_name.strip() else None
+    llm_temp = project_model.llm_temperature if project_model.llm_temperature is not None else (settings_obj.LLM_DEFAULT_TEMPERATURE if hasattr(settings_obj, 'LLM_DEFAULT_TEMPERATURE') else 0.1)
+
+    decrypted_api_key_override = None
+    if project_model.llm_api_key_override_encrypted:
+        decrypted_api_key_override = decrypt_data(project_model.llm_api_key_override_encrypted)
+        if not decrypted_api_key_override:
+            logger.warning(f"Failed to decrypt API key override for project {project_model.id} (Full Scan). Using default provider key.")
+
+    # Sử dụng model cụ thể cho agent kiến trúc nếu có, nếu không thì dùng model chung đã lấy ở trên
+    architectural_model_name = project_model.llm_model_name if project_model.llm_model_name and project_model.llm_model_name.strip() else llm_model # Hoặc một model cụ thể cho kiến trúc
+    
+    agent_name_architect = f"NovaGuard_ArchitectFullScan_{llm_provider}"
+    if architectural_model_name: agent_name_architect += f"_{architectural_model_name.replace(':', '_')}"
 
     # === Agent 1: Architectural Analyst ===
-    agent_name_architect = f"NovaGuard_ArchitecturalAnalyst_{settings_obj.DEFAULT_LLM_PROVIDER}"
     try:
         arch_prompt_template_str = load_prompt_template_str("architectural_analyst_full_project_v1.md")
+        
+        # full_project_context đã chứa "requested_output_language"
+        # và các thông tin khác như ckg_summary
 
-        # Cấu hình LLM (có thể tùy chỉnh cho từng agent nếu cần)
         llm_config_architect = LLMProviderConfig(
-            provider_name=settings_obj.DEFAULT_LLM_PROVIDER,
-            # model_name=settings_obj.OLLAMA_DEFAULT_MODEL, # Ví dụ, hoặc để llm_service tự quyết
-            temperature=0.1, # Thường thấp hơn để output ổn định hơn cho phân tích
+            provider_name=llm_provider,
+            model_name=architectural_model_name, # Có thể là model chung hoặc model riêng cho kiến trúc
+            temperature=llm_temp, # Hoặc một temp riêng cho agent này
+            api_key=decrypted_api_key_override
         )
-        logger.info(f"Worker (Full Scan - Arch): Invoking LLMService with provider: {llm_config_architect.provider_name}")
+        logger.info(f"Worker (Full Scan - Arch): Invoking LLMService with provider: {llm_config_architect.provider_name}, model: {llm_config_architect.model_name or 'provider_default'}")
 
-        # Gọi LLM service
-        # full_project_context đã được chuẩn bị bởi create_full_project_dynamic_context
-        # và chứa ckg_summary, important_files_preview, directory_listing_top_level
         architectural_llm_result: LLMProjectAnalysisOutput = await invoke_llm_analysis_chain(
             prompt_template_str=arch_prompt_template_str,
-            dynamic_context_values=full_project_context, # Truyền toàn bộ context đã chuẩn bị
-            output_pydantic_model_class=LLMProjectAnalysisOutput, # Yêu cầu LLM trả về theo schema này
+            dynamic_context_values=full_project_context,
+            output_pydantic_model_class=LLMProjectAnalysisOutput,
             llm_provider_config=llm_config_architect,
             settings_obj=settings_obj
         )
 
         if architectural_llm_result:
-            logger.info(f"Architectural analysis agent for '{project_name_for_log}' completed.")
+            logger.info(f"Architectural analysis agent for '{project_name_for_log}' (model: {architectural_model_name or 'default'}) completed.")
             if architectural_llm_result.project_summary:
                 final_project_analysis_output.project_summary = architectural_llm_result.project_summary
             
             if architectural_llm_result.project_level_findings:
-                logger.info(f"Found {len(architectural_llm_result.project_level_findings)} project-level architectural findings.")
                 final_project_analysis_output.project_level_findings.extend(architectural_llm_result.project_level_findings)
             
-            if architectural_llm_result.granular_findings: # Nếu agent này cũng trả về granular findings
-                logger.info(f"Found {len(architectural_llm_result.granular_findings)} granular findings from architectural agent.")
+            if architectural_llm_result.granular_findings:
+                # Gán agent_name cho granular findings nếu LLM không tự điền
+                for finding in architectural_llm_result.granular_findings:
+                    if not finding.agent_name:
+                        finding.agent_name = agent_name_architect # Agent đã tạo ra nó
                 final_project_analysis_output.granular_findings.extend(architectural_llm_result.granular_findings)
         else:
-            logger.warning(f"Architectural analysis agent for '{project_name_for_log}' returned no result (None).")
+            logger.warning(f"Architectural analysis agent for '{project_name_for_log}' returned no result.")
+
 
 
     except LLMServiceError as e_llm_service:
@@ -584,25 +599,18 @@ async def run_full_project_analysis_agents(
         final_project_analysis_output.project_summary = (final_project_analysis_output.project_summary + "\n" + error_summary).strip()
     except Exception as e:
         logger.exception(f"Worker (Full Scan - Arch): Unexpected error for project '{project_name_for_log}': {e}")
-        error_summary = f"Architectural analysis failed due to an unexpected error."
-        final_project_analysis_output.project_summary = (final_project_analysis_output.project_summary + "\n" + error_summary).strip()
+        error_summary = f"Architectural analysis failed due to an unexpected error: {str(e)}"
+        current_summary = final_project_analysis_output.project_summary or ""
+        final_project_analysis_output.project_summary = (current_summary + "\n" + error_summary).strip()
+
 
     # TODO: Thêm các agent khác nếu cần (ví dụ: Security Agent, Technical Debt Agent)
     # và gộp kết quả của chúng vào final_project_analysis_output
 
     if not final_project_analysis_output.project_level_findings and \
-        not final_project_analysis_output.granular_findings and \
-        not final_project_analysis_output.project_summary: # Nếu không có gì cả
-        final_project_analysis_output.project_summary = "NovaGuard AI full project analysis completed. No specific issues or summary were reported by the configured analysis agents for this project."
-        logger.info(f"Full project analysis for '{project_name_for_log}' completed with no explicit findings or summary.")
-    elif not final_project_analysis_output.project_level_findings and \
-        not final_project_analysis_output.granular_findings and \
-        final_project_analysis_output.project_summary and \
-        "error" not in final_project_analysis_output.project_summary.lower() and \
-        "failed" not in final_project_analysis_output.project_summary.lower():
-        # Nếu có summary nhưng không có findings và summary không báo lỗi
-        logger.info(f"Full project analysis for '{project_name_for_log}' completed with a summary but no explicit findings: {final_project_analysis_output.project_summary}")
-
+       not final_project_analysis_output.granular_findings and \
+       not final_project_analysis_output.project_summary :
+        final_project_analysis_output.project_summary = f"NovaGuard AI full project analysis (agent: {agent_name_architect}) completed. No specific issues or summary were reported by the agent for this project."
 
     return final_project_analysis_output
 
@@ -677,7 +685,8 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
             logger.info(f"PML (PR): Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
             analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
                 dynamic_context=dynamic_context,
-                settings_obj=settings_obj
+                settings_obj=settings_obj,
+                project_model=db_project
             )
             
             if analysis_findings_create_schemas:
@@ -935,7 +944,7 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
                 db_project_model, repo_clone_dir_path_str, ckg_builder_instance
             )
             llm_analysis_output: LLMProjectAnalysisOutput = await run_full_project_analysis_agents(
-                full_project_context, settings_obj
+                full_project_context, settings_obj, project_model=db_project_model
             )
             
             all_findings_to_create_db: List[am_schemas.AnalysisFindingCreate] = []
@@ -945,7 +954,7 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
                         file_path=f"Project Level: {proj_finding.finding_category}",
                         severity=proj_finding.severity, message=proj_finding.description,
                         suggestion=proj_finding.recommendation,
-                        agent_name=f"NovaGuard_ProjectAgent_{settings_obj.DEFAULT_LLM_PROVIDER}",
+                        agent_name=f"NovaGuard_ProjectAgent_{db_project_model.llm_provider.value if db_project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER}",
                         code_snippet=f"Relevant: {', '.join(proj_finding.relevant_components)}" if proj_finding.relevant_components else None,
                         finding_level="project", module_name=proj_finding.finding_category,
                         meta_data=proj_finding.meta_data,
@@ -958,7 +967,7 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
                         line_start=granular_finding.line_start, line_end=granular_finding.line_end,
                         severity=granular_finding.severity, message=granular_finding.message,
                         suggestion=granular_finding.suggestion,
-                        agent_name=f"NovaGuard_FullScanDetailAgent_{settings_obj.DEFAULT_LLM_PROVIDER}",
+                        agent_name=granular_finding.agent_name or f"NovaGuard_FullScanDetailAgent_{db_project_model.llm_provider.value if db_project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER}",
                         finding_level="file", meta_data=granular_finding.meta_data,
                         finding_type=granular_finding.finding_type
                     ))

@@ -122,3 +122,4 @@ Adhere **STRICTLY** to the JSON schema instructions provided by
 {format_instructions}
 ```
 
+- **Language for Analysis Output**: Please provide all your findings (messages, suggestions, summaries) strictly in **{requested_output_language}**. Ensure all text you generate is in this language.

@@ -97,6 +97,70 @@
             {% else %}
             <p class="text-sm text-gray-500 mt-4 italic">No custom project notes provided.</p>
             {% endif %}
+
+            <h3 class="text-lg font-semibold text-nv-dark mb-2 border-b pb-1">LLM & Analysis Configuration</h3>
+            <dl class="space-y-2 text-sm">
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">LLM Provider:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.llm_provider %}
+                            {{ project.llm_provider.value | capitalize }} {# project.llm_provider là Pydantic schema, đã có .value #}
+                        {% elif default_settings.DEFAULT_LLM_PROVIDER %}
+                            {{ default_settings.DEFAULT_LLM_PROVIDER | capitalize }} (Server Default)
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">LLM Model:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.llm_model_name %}
+                            {{ project.llm_model_name }}
+                        {% else %}
+                            {# Hiển thị model mặc định dựa trên provider của project hoặc provider mặc định của server #}
+                            {% set current_provider = project.llm_provider.value if project.llm_provider else default_settings.DEFAULT_LLM_PROVIDER %}
+                            {% if current_provider == 'ollama' %}
+                                {{ default_settings.OLLAMA_DEFAULT_MODEL }} (Default for Ollama)
+                            {% elif current_provider == 'openai' %}
+                                {{ default_settings.OPENAI_DEFAULT_MODEL }} (Default for OpenAI)
+                            {% elif current_provider == 'gemini' %}
+                                {{ default_settings.GEMINI_DEFAULT_MODEL }} (Default for Gemini)
+                            {% else %}
+                                Provider Default
+                            {% endif %}
+                        {% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Temperature:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {{ "%.1f" | format(project.llm_temperature if project.llm_temperature is not none else default_settings.get('LLM_DEFAULT_TEMPERATURE', 0.1)) }}
+                        {% if project.llm_temperature is none %}(Default){% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">API Key Override:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.llm_api_key_override_is_set %}
+                            <span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-700">Custom Key Set</span>
+                        {% else %}
+                            <span class="text-gray-500">Using Server Default</span>
+                        {% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Output Language:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.output_language == 'en' %}English
+                        {% elif project.output_language == 'vi' %}Tiếng Việt
+                        {% elif project.output_language == 'ko' %}한국어
+                        {% else %}{{ default_settings.DEFAULT_OUTPUT_LANGUAGE | capitalize if default_settings.DEFAULT_OUTPUT_LANGUAGE == 'en' else 'English' }}
+                        {% endif %}
+                        {% if not project.output_language %}(Server Default){% endif %}
+                    </dd>
+                </div>
+            </dl>
         </div>
     </div>
 
