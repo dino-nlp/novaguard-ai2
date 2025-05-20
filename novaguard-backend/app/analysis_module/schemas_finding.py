@@ -4,13 +4,14 @@ from typing import Optional, List # Đảm bảo List đã được import
 from datetime import datetime
 
 # Import các schema cần thiết từ các module khác
-from app.webhook_service.schemas_pr_analysis import PRAnalysisRequestPublic # << IMPORT SCHEMA NÀY
+from app.webhook_service.schemas_pr_analysis import PRAnalysisRequestPublic 
+from app.analysis_worker.llm_schemas import SeverityLevel
 
 class AnalysisFindingBase(BaseModel):
     file_path: str = Field(..., max_length=1024)
     line_start: Optional[int] = None
     line_end: Optional[int] = None
-    severity: str = Field(..., max_length=50)
+    severity: SeverityLevel
     message: str
     suggestion: Optional[str] = None
     agent_name: Optional[str] = Field(None, max_length=100)
@@ -26,6 +27,7 @@ class AnalysisFindingPublic(AnalysisFindingBase):
 
     class Config:
         from_attributes = True
+        use_enum_values = True
 
 
 class PRAnalysisReportDetail(BaseModel):

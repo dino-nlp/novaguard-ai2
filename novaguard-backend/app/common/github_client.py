@@ -2,6 +2,11 @@
 import httpx
 import logging
 from typing import List, Dict, Any, Optional
+import tarfile
+import zipfile
+import io # Để làm việc với bytes stream
+from pathlib import Path
+import mimetypes
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +142,185 @@ class GitHubAPIClient:
             logger.error(f"Failed to create comment on PR {owner}/{repo}#{pr_number}: {e}")
             return None
 
+    async def get_repository_archive_link(
+        self, owner: str, repo: str, archive_format: str = "tarball", ref: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Lấy URL để tải xuống một archive (tarball hoặc zipball) của repository.
+        API này trả về một Redirect (302) đến URL thực tế của archive.
+        archive_format: "tarball" hoặc "zipball"
+        ref: Git ref (branch, tag, commit SHA)
+        """
+        if ref is None: # Nếu không có ref, GitHub mặc định là default branch
+            endpoint_ref_part = ""
+        else:
+            endpoint_ref_part = f"/{ref}"
+
+        # Chú ý: GitHub API trả về 302 Redirect, client cần theo dõi redirect
+        url = f"{GITHUB_API_BASE_URL}/repos/{owner}/{repo}/{archive_format}{endpoint_ref_part}"
+        logger.info(f"Requesting archive link: {url} (expecting 302 redirect)")
+
+        async with httpx.AsyncClient(follow_redirects=False) as client: # Không tự động follow redirect
+            try:
+                # Truyền headers của client, vì đây vẫn là GitHub API endpoint
+                response = await client.get(url, headers=self.default_json_headers, timeout=30.0)
+                if response.status_code == 302: # Found (Redirect)
+                    archive_url = response.headers.get("Location")
+                    if archive_url:
+                        logger.info(f"Obtained archive download URL: {archive_url}")
+                        return archive_url
+                    else:
+                        logger.error("GitHub API returned 302 for archive link, but no Location header found.")
+                        return None
+                else:
+                    # Nếu không phải 302, có thể là lỗi (404 nếu repo/ref không tồn tại)
+                    logger.error(f"GitHub API did not redirect for archive link. Status: {response.status_code}, Response: {response.text[:200]}")
+                    response.raise_for_status() # Để raise lỗi nếu là 4xx/5xx
+                    return None # Sẽ không đến đây nếu raise_for_status() hoạt động
+            except httpx.HTTPStatusError as e:
+                error_details = e.response.text[:500]
+                logger.error(f"GitHub API Error getting archive link: {e.response.status_code} - {e.request.url} - Response: {error_details}")
+                return None
+            except Exception as e:
+                logger.exception(f"Unexpected error getting archive link from {url}")
+                return None
+    
+    async def download_and_extract_archive(self, archive_url: str, extract_to_path: str):
+        """
+        Tải xuống archive từ URL và giải nén vào extract_to_path.
+        Xử lý cả tar.gz và .zip.
+        """
+        logger.info(f"Downloading archive from {archive_url} and extracting to {extract_to_path}")
+        Path(extract_to_path).mkdir(parents=True, exist_ok=True)
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=300.0) as client:
+            try:
+                response = await client.get(archive_url)
+                response.raise_for_status()
+                content_bytes = response.content
+                archive_stream = io.BytesIO(content_bytes)
+
+                # === CẬP NHẬT LOGIC XÁC ĐỊNH ĐỊNH DẠNG ===
+                is_zip = False
+                is_tar_gz = False
+
+                # Cố gắng xác định từ content-type header nếu có
+                content_type = response.headers.get("content-type", "").lower()
+                logger.debug(f"Archive download response content-type: {content_type}")
+
+                if "application/zip" in content_type or "application/x-zip-compressed" in content_type:
+                    is_zip = True
+                elif "application/gzip" in content_type or "application/x-gzip" in content_type or \
+                    "application/x-tar" in content_type or "application/tar+gzip" in content_type:
+                    is_tar_gz = True
+                
+                # Nếu content-type không rõ ràng, thử đoán từ URL
+                if not is_zip and not is_tar_gz:
+                    logger.debug(f"Content-type did not clearly indicate archive type. Guessing from URL: {archive_url}")
+                    url_lower = archive_url.lower()
+                    if url_lower.endswith(".zip") or "zipball" in url_lower:
+                        is_zip = True
+                    elif url_lower.endswith(".tar.gz") or "tarball" in url_lower or ".tgz" in url_lower:
+                        is_tar_gz = True
+                
+                # THÊM: Thử đoán từ phần mở rộng của phần path trong URL nếu có
+                if not is_zip and not is_tar_gz:
+                    try:
+                        from urllib.parse import urlparse
+                        parsed_url_path = urlparse(archive_url).path
+                        # Lấy phần mở rộng cuối cùng, ví dụ /legacy.tar.gz/refs/heads/main -> .gz
+                        # Hoặc nếu path là /archive.zip -> .zip
+                        path_suffix = Path(parsed_url_path).suffix.lower()
+                        if path_suffix == ".zip":
+                            is_zip = True
+                        elif path_suffix == ".gz": # Nếu là .gz, giả định là .tar.gz
+                            is_tar_gz = True
+                        elif path_suffix == ".tgz":
+                            is_tar_gz = True
+                        logger.debug(f"Guessed from URL path suffix '{path_suffix}': is_zip={is_zip}, is_tar_gz={is_tar_gz}")
+                    except Exception as e_parse_url:
+                        logger.warning(f"Could not parse URL path for suffix guessing: {e_parse_url}")
+
+                if is_zip:
+                    logger.info("Detected ZIP archive format.")
+                    archive_stream.seek(0)
+                    with zipfile.ZipFile(archive_stream, 'r') as zip_ref:
+                        members = zip_ref.namelist()
+                        root_folder_name = ""
+                        if members and '/' in members[0] and members[0].count('/') == 1 and members[0].endswith('/'):
+                            root_folder_name = members[0]
+                        for member_info in zip_ref.infolist():
+                            if root_folder_name and member_info.filename.startswith(root_folder_name):
+                                target_path_str = member_info.filename[len(root_folder_name):]
+                                if not target_path_str: continue # Bỏ qua entry thư mục gốc rỗng
+                                target_path = Path(extract_to_path) / target_path_str
+                            else:
+                                target_path = Path(extract_to_path) / member_info.filename
+                            
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            if not member_info.is_dir(): # Chỉ ghi file, không ghi thư mục trống
+                                with open(target_path, "wb") as f_out:
+                                    f_out.write(zip_ref.read(member_info.filename))
+                    logger.info("ZIP archive extracted successfully.")
+
+                elif is_tar_gz:
+                    logger.info("Detected TAR.GZ archive format.")
+                    archive_stream.seek(0)
+                    with tarfile.open(fileobj=archive_stream, mode="r:gz") as tar_ref:
+                        # Logic _members_without_root để loại bỏ thư mục gốc
+                        members_to_extract = []
+                        all_tar_members = tar_ref.getmembers() # Lấy tất cả members một lần
+                        
+                        root_folder_name_tar = ""
+                        if all_tar_members and all_tar_members[0].isdir():
+                            # Kiểm tra xem tên member đầu tiên có phải là thư mục gốc không
+                            # Thư mục gốc thường có dạng "owner-repo-commitsha/"
+                            # Ta chỉ cần kiểm tra xem nó có '/' ở cuối và không có '/' nào khác trước đó không
+                            first_member_name = all_tar_members[0].name
+                            if first_member_name.endswith('/') and first_member_name.count('/') == 1:
+                                root_folder_name_tar = first_member_name
+                                logger.debug(f"Detected root folder in tar: {root_folder_name_tar}")
+
+                        for member in all_tar_members:
+                            if root_folder_name_tar and member.path.startswith(root_folder_name_tar):
+                                original_path = member.path
+                                member.path = member.path[len(root_folder_name_tar):]
+                                if not member.path: # Bỏ qua entry thư mục gốc sau khi strip
+                                    continue
+                                # logger.debug(f"Adjusted tar member path from '{original_path}' to '{member.path}'")
+                            
+                            # Chỉ thêm vào extract list nếu path không rỗng sau khi strip
+                            if member.path:
+                                members_to_extract.append(member)
+                        
+                        # tar_ref.extractall(path=extract_to_path, members=self._members_without_root(tar_ref, root_folder_name_tar)) # Sử dụng hàm helper cũ
+                        if members_to_extract: # Chỉ extract nếu có member hợp lệ
+                            def filter_members(members_list_to_filter):
+                                for m in members_list_to_filter:
+                                    # An toàn hơn, đảm bảo không giải nén các file tuyệt đối hoặc ../
+                                    if not m.name.startswith("/") and ".." not in m.name:
+                                        yield m
+                            tar_ref.extractall(path=extract_to_path, members=list(filter_members(members_to_extract)))
+                        else:
+                            logger.warning("No valid members found to extract from tar archive after stripping root folder.")
+
+                    logger.info("TAR.GZ archive extracted successfully.")
+                else:
+                    # Nếu vẫn không xác định được, log thêm thông tin
+                    logger.error(f"Could not determine archive type. URL: {archive_url}, Content-Type: {content_type}")
+                    logger.error(f"First 100 bytes of content (if available): {content_bytes[:100] if content_bytes else 'N/A'}")
+                    raise ValueError(f"Unsupported archive format or could not determine format from URL: {archive_url}")
+
+            except httpx.HTTPStatusError as e_download:
+                logger.error(f"HTTP error downloading archive {archive_url}: {e_download.response.status_code}")
+                raise
+            except (zipfile.BadZipFile, tarfile.TarError) as e_extract:
+                logger.error(f"Error extracting archive {archive_url}: {e_extract}")
+                raise
+            except Exception as e:
+                logger.exception(f"Unexpected error downloading/extracting archive {archive_url}")
+                raise
+    
     async def get_file_content(self, owner: str, repo: str, file_path: str, ref: Optional[str] = None) -> Optional[str]:
         """
         Lấy nội dung của một file cụ thể từ repository tại một ref (commit SHA, branch, tag).

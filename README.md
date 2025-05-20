@@ -159,6 +159,7 @@ If you haven't pulled the LLM model for Ollama yet, or want to ensure it's avail
 
 ```bash
 docker compose exec ollama ollama pull codellama:7b-instruct-q4_K_M
+docker compose exec ollama ollama pull qwen2.5-coder:7b-instruct
 ```
 
 (Replace `codellama:7b-instruct-q4_K_M` with your desired default model if different, and ensure `OLLAMA_DEFAULT_MODEL` in `.env` matches.)
@@ -322,3 +323,4 @@ Details on contributing will be added here. (Standard contribution guidelines: f
 ## License
 
 MIT
+

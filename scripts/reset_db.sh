@@ -12,7 +12,6 @@ DB_NAME="novaguard_db"        # Tên database
 
 # --- Function to check if docker compose service is running ---
 is_db_service_running() {
-    # Versuche, den Container-Namen auf verschiedene Arten zu finden
     local container_name
     container_name=$(docker compose ps -q "${DB_SERVICE_NAME}" 2>/dev/null)
 
@@ -42,8 +41,8 @@ fi
 
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 echo "WARNING: This script will completely WIPE all data in the database"
-echo "'${DB_NAME}' by dropping all known tables, custom types, and functions,"
-echo "then re-applying the schema from '${SCHEMA_FILE}'."
+echo "${DB_NAME} by dropping all known tables, custom types, and functions,"
+echo "then re-applying the schema from ${SCHEMA_FILE}."
 echo "This action is IRREVERSIBLE."
 echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 read -p "Are you absolutely sure you want to reset the database '${DB_NAME}'? (Type 'yes' to confirm): " confirmation
@@ -57,36 +56,27 @@ echo "Proceeding with database reset for '${DB_NAME}'..."
 
 # SQL commands to drop all known objects.
 # Order is important for objects that depend on each other, unless CASCADE is used.
-# Using fully qualified names (e.g., public.tablename) is safer if not default schema.
-# PostgreSQL table names are case-sensitive if quoted during creation,
-# but typically lowercased if not. Your schema.sql uses mixed case with quotes for tables.
-# The ENUM type created by SQLAlchemy will be lowercase.
+# The 'projects' table now has a foreign key to 'fullprojectanalysisrequests'
+# (last_full_scan_request_id), so 'projects' might need to be dropped before
+# 'fullprojectanalysisrequests' if not using CASCADE, OR 'fullprojectanalysisrequests'
+# should be dropped with CASCADE if 'projects' still references it.
+# Using CASCADE is generally safer for a full reset.
+
+# ENUM type names from your SQLAlchemy models (case-sensitive if defined so,
+# but typically lowercased by SQLAlchemy when creating in DB if not quoted in name='...').
+# From pr_analysis_request_model.py: name="pr_analysis_status_enum"
+# From full_project_analysis_request_model.py: name="full_project_analysis_status_enum"
+# From project_model.py: name="project_last_full_scan_status_enum" (create_type=False, so it uses the one from FullProjectAnalysisStatus)
 
 DROP_COMMANDS=$(cat <<EOF
--- Drop tables in reverse order of dependency, or use CASCADE
--- If a table has a foreign key referencing another, the referenced table should be dropped later,
--- or the referencing table should be dropped with CASCADE.
-
 DROP TABLE IF EXISTS "analysisfindings" CASCADE;
 DROP TABLE IF EXISTS "pranalysisrequests" CASCADE;
+DROP TABLE IF EXISTS "fullprojectanalysisrequests" CASCADE;
 DROP TABLE IF EXISTS "projects" CASCADE;
 DROP TABLE IF EXISTS "users" CASCADE;
-
--- Drop custom ENUM types created by SQLAlchemy or defined in schema.sql
--- The name of the enum type is 'pr_analysis_status_enum' as defined in your model
--- and `status VARCHAR(20) CHECK \(status IN (...)\)` in schema.sql is a CHECK constraint, not a named ENUM type.
--- If SQLAlchemy's SQLAlchemyEnum(..., name='pr_analysis_status_enum', create_type=True)
--- actually created a PostgreSQL ENUM type, you'd drop it like this:
 DROP TYPE IF EXISTS pr_analysis_status_enum CASCADE;
--- Add other custom ENUM types here if you have them.
-
--- Drop functions
+DROP TYPE IF EXISTS full_project_analysis_status_enum CASCADE;
 DROP FUNCTION IF EXISTS trigger_set_timestamp() CASCADE;
-
--- If you were using Alembic, you might also drop its version table:
--- DROP TABLE IF EXISTS alembic_version CASCADE;
-
--- Add any other custom sequences, views, or objects here if necessary.
 EOF
 )
 
@@ -103,7 +93,7 @@ echo "Applying schema from $SCHEMA_FILE..."
 cat "$SCHEMA_FILE" | docker compose exec -T "${DB_SERVICE_NAME}" psql -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1
 
 if [ $? -eq 0 ]; then
-    echo "Database '${DB_NAME}' has been successfully reset and schema applied."
+    echo "Database ${DB_NAME} has been successfully reset and schema applied."
 else
     echo "Failed to apply schema during reset. Check the output above."
     exit 1

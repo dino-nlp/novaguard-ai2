@@ -20,3 +20,8 @@ langchain-openai
 langchain-google-genai
 # langgraph (nếu bạn muốn sử dụng ngay, nhưng có thể thêm sau khi có nhiều agent)
 # PyYAML (nếu bạn định dùng file prompt YAML, cho .txt thì không cần)
+GitPython
+neo4j>=5.0
+tree-sitter==0.21.0
+# tree-sitter-languages==1.10.2
+tree-sitter-languages==1.9.1

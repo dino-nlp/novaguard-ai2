@@ -4,13 +4,19 @@ FROM python:3.11-slim
 # Thiết lập thư mục làm việc trong container
 WORKDIR /app
 
-# Cài đặt các dependencies hệ thống nếu cần (ví dụ: build-essential cho một số thư viện)
-# RUN apt-get update && apt-get install -y --no-install-recommends build-essential
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 # Sao chép file requirements vào thư mục làm việc
 COPY ./requirements.txt /app/requirements.txt
 
 # Cài đặt các Python dependencies
+RUN pip uninstall tree-sitter tree-sitter-languages
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
