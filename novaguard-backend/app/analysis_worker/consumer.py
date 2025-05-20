@@ -3,16 +3,15 @@ import logging
 import time
 import re
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 
 import tempfile # Để tạo thư mục tạm
 import shutil   # Để xóa thư mục
-import git      # Nếu dùng GitPython
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker  # Đảm bảo import Session
-# from kafka import KafkaConsumer, KafkaError # KafkaConsumer, KafkaError được dùng trong hàm main_worker
+from app.models.project_model import LLMProviderEnum, OutputLanguageEnum # Import các Enum này nếu cần so sánh
 
 from app.llm_service import (
     invoke_llm_analysis_chain,
@@ -30,14 +29,11 @@ from app.common.github_client import GitHubAPIClient
 from app.project_service import crud_full_scan
 from app.models import FullProjectAnalysisStatus # Import Enum
 from app.ckg_builder import CKGBuilder
+from .llm_schemas import LLMSingleFinding, LLMStructuredOutput, LLMProjectLevelFinding, LLMProjectAnalysisOutput # Thêm schema mới
 
-
-# Import Pydantic models cho LLM output
-from .llm_schemas import  LLMStructuredOutput
 
 # --- Logging Setup ---
 # logger đã được định nghĩa và cấu hình ở phần trước, sử dụng tên "AnalysisWorker"
-logger = logging.getLogger("AnalysisWorker")
 logger = logging.getLogger("AnalysisWorker")
 if not logger.handlers: # Kiểm tra để tránh thêm handler nhiều lần nếu module được reload
     handler = logging.StreamHandler()
@@ -138,7 +134,7 @@ async def fetch_pr_data_from_github(
                 content = await gh_client.get_file_content(owner, repo_slug, file_path, ref=actual_head_sha)
                 current_file_data["content"] = content if content is not None else "" # Ensure string
             else:
-                 logger.info(f"Skipping file '{file_path}' with unhandled status '{status}' for content fetching.")
+                logger.info(f"Skipping file '{file_path}' with unhandled status '{status}' for content fetching.")
             fetched_files_content.append(current_file_data)
             
     return {
@@ -186,9 +182,10 @@ def create_dynamic_project_context(
         "formatted_changed_files_with_content": "\n".join(formatted_changed_files_str_list) if formatted_changed_files_str_list else "No relevant file content available for analysis.",
         "project_language": project_model.language or "Undefined",
         "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided.",
+        "requested_output_language": project_model.output_language.value if project_model.output_language else OutputLanguageEnum.ENGLISH.value,
         "raw_pr_data_changed_files": raw_pr_data.get("changed_files", [])
     }
-    logger.debug(f"Dynamic context created for PR ID {pr_model.id}. Title: {context['pr_title']}")
+    logger.debug(f"Dynamic context for PR ID {pr_model.id} includes requested_output_language: {context['requested_output_language']}")
     return context
 
 def load_prompt_template_str(template_name: str) -> str: # Đổi tên hàm để rõ là trả về string
@@ -201,52 +198,46 @@ def load_prompt_template_str(template_name: str) -> str: # Đổi tên hàm đ�
 
 async def run_code_analysis_agent_v1(
     dynamic_context: Dict[str, Any], # dynamic_context chứa tất cả các giá trị cần cho prompt
-    settings_obj: Settings # settings object từ get_settings()
+    settings_obj: Settings, # settings object từ get_settings()
+    project_model: Project # Thêm project_model để lấy cấu hình LLM
 ) -> List[am_schemas.AnalysisFindingCreate]:
     pr_title_for_log = dynamic_context.get('pr_title', 'N/A')
-    logger.info(f"Worker: Running Code Analysis Agent for PR: {pr_title_for_log} using centralized LLMService.")
+    logger.info(f"Worker: Running Code Analysis Agent (PR) for: {pr_title_for_log} using centralized LLMService.")
 
     try:
         # 1. Load Prompt Template String (giữ nguyên)
         prompt_template_str = load_prompt_template_str("deep_logic_bug_hunter_v1.md")
+        invoke_payload = dynamic_context # dynamic_context đã chứa requested_output_language
 
-        # 2. Chuẩn bị payload cho prompt (dynamic_context đã chứa các giá trị này)
-        #    `invoke_payload` là `dynamic_context` đã được chuẩn bị
-        #    (Kiểm tra các key cần thiết đã có trong `dynamic_context` trước khi gọi)
-        invoke_payload = {
-            key: dynamic_context[key]
-            for key in dynamic_context # Lọc ra các key cần thiết cho prompt nếu cần
-            # Ví dụ: nếu prompt chỉ cần một subset các key từ dynamic_context
-        }
-        # IMPORTANT: dynamic_context cần phải chứa tất cả các placeholder mà prompt template mong đợi,
-        # ngoại trừ `format_instructions` sẽ được llm_service xử lý.
-        # Kiểm tra này có thể thực hiện ở đây hoặc trong llm_service.
+        # === LẤY CẤU HÌNH LLM TỪ PROJECT HOẶC SETTINGS ===
+        llm_provider = project_model.llm_provider.value if project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER
+        llm_model = project_model.llm_model_name if project_model.llm_model_name and project_model.llm_model_name.strip() else None
+        llm_temp = project_model.llm_temperature if project_model.llm_temperature is not None else (settings_obj.LLM_DEFAULT_TEMPERATURE if hasattr(settings_obj, 'LLM_DEFAULT_TEMPERATURE') else 0.1) # Giả sử có default temp trong settings
 
-        # 3. Tạo cấu hình LLM cho llm_service
-        # Lấy provider và model mặc định từ settings
-        # Trong tương lai, có thể lấy từ project-specific config
+        decrypted_api_key_override = None
+        if project_model.llm_api_key_override_encrypted:
+            decrypted_api_key_override = decrypt_data(project_model.llm_api_key_override_encrypted)
+            if not decrypted_api_key_override:
+                logger.warning(f"Failed to decrypt API key override for project {project_model.id}. Using default provider key if any.")
+
         current_llm_provider_config = LLMProviderConfig(
-            provider_name=settings_obj.DEFAULT_LLM_PROVIDER,
-            # model_name sẽ được llm_service xác định dựa trên provider và settings_obj.OPENAI_DEFAULT_MODEL etc.
-            # Hoặc bạn có thể xác định model_name ở đây nếu muốn logic đó nằm trong worker:
-            # model_name = (
-            #     settings_obj.OPENAI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "openai"
-            #     else settings_obj.GEMINI_DEFAULT_MODEL if settings_obj.DEFAULT_LLM_PROVIDER == "gemini"
-            #     else settings_obj.OLLAMA_DEFAULT_MODEL
-            # ),
-            temperature=0.1, # Hoặc lấy từ settings_obj
-            # api_key không cần truyền ở đây, llm_service sẽ tự lấy từ settings_obj
+            provider_name=llm_provider,
+            model_name=llm_model,
+            temperature=llm_temp,
+            api_key=decrypted_api_key_override
         )
+        agent_identifier = f"NovaGuardAgent_PR_{current_llm_provider_config.provider_name}"
+        if llm_model: agent_identifier += f"_{llm_model.replace(':', '_')}"
 
-        logger.info(f"Worker: Invoking LLMService with provider config: {current_llm_provider_config.provider_name}")
+        logger.info(f"Worker (PR): Invoking LLMService with provider: {current_llm_provider_config.provider_name}, model: {current_llm_provider_config.model_name or 'provider_default'}")
 
         # 4. Gọi LLM Service
         structured_llm_output: LLMStructuredOutput = await invoke_llm_analysis_chain(
             prompt_template_str=prompt_template_str,
-            dynamic_context_values=invoke_payload, # Đây là dict các giá trị để điền vào prompt
-            output_pydantic_model_class=LLMStructuredOutput, # Schema Pydantic cho output
+            dynamic_context_values=invoke_payload,
+            output_pydantic_model_class=LLMStructuredOutput,
             llm_provider_config=current_llm_provider_config,
-            settings_obj=settings_obj # llm_service dùng để lấy API keys, default models
+            settings_obj=settings_obj
         )
 
         num_findings_from_llm = len(structured_llm_output.findings) if structured_llm_output and structured_llm_output.findings else 0
@@ -314,14 +305,16 @@ async def run_code_analysis_agent_v1(
 
 
                 finding_for_db = am_schemas.AnalysisFindingCreate(
-                    file_path=llm_finding.file_path,
+                    file_path=llm_finding.file_path or "N/A", # Đảm bảo có giá trị
                     line_start=llm_finding.line_start,
                     line_end=llm_finding.line_end,
-                    severity=llm_finding.severity,
+                    severity=llm_finding.severity, # Đây là SeverityLevel từ llm_schemas
                     message=llm_finding.message,
                     suggestion=llm_finding.suggestion,
-                    agent_name=f"NovaGuardAgent_v1_{current_llm_provider_config.provider_name}", # Tên agent có thể kèm provider
-                    code_snippet=code_snippet_text
+                    agent_name=llm_finding.meta_data.get("agent_name_from_llm") if llm_finding.meta_data and llm_finding.meta_data.get("agent_name_from_llm") else agent_identifier, # Cập nhật agent_name
+                    code_snippet=code_snippet_text,
+                    finding_type=llm_finding.finding_type, # Từ llm_schemas
+                    meta_data=llm_finding.meta_data
                 )
                 analysis_findings_to_create.append(finding_for_db)
         
@@ -338,117 +331,387 @@ async def run_code_analysis_agent_v1(
         logger.error(f"Worker: KeyError formatting prompt for PR '{pr_title_for_log}': {e_key}. Check dynamic_context and prompt template.")
         return []
     except Exception as e: # Các lỗi không mong muốn khác trong worker
-        logger.exception(f"Worker: Unexpected error during code analysis agent execution for PR '{pr_title_for_log}': {type(e).__name__} - {e}")
+        logger.exception(f"Worker (PR): Unexpected error during code analysis agent for PR '{pr_title_for_log}': {e}")
         return []
 
+async def query_ckg_for_project_summary(
+    project_graph_id: str,
+    ckg_builder: CKGBuilder # Hoặc trực tiếp driver nếu CKGBuilder không có hàm query tiện lợi
+) -> Dict[str, Any]:
+    """
+    Hàm helper để truy vấn CKG và lấy thông tin tóm tắt về dự án.
+    Đây là ví dụ, bạn cần điều chỉnh query Cypher cho phù hợp.
+    """
+    summary = {
+        "total_files": 0,
+        "total_classes": 0,
+        "total_functions_methods": 0,
+        "main_modules": [], # List of file paths
+        "average_functions_per_file": 0,
+        "top_5_most_called_functions": [], # list of {"name": "func_name", "file_path": "path", "call_count": X}
+        "top_5_largest_classes_by_methods": [], # list of {"name": "class_name", "file_path": "path", "method_count": X}
+    }
+    logger.info(f"Querying CKG for project summary: {project_graph_id}")
+
+    # Cần instance của CKGBuilder để dùng _get_driver() hoặc truyền driver trực tiếp
+    # Nếu CKGBuilder không có hàm query, bạn có thể lấy driver trực tiếp:
+    # from app.core.graph_db import get_async_neo4j_driver
+    # neo4j_driver = await get_async_neo4j_driver()
+    # if not neo4j_driver:
+    #     logger.error("Cannot query CKG: Neo4j driver not available.")
+    #     return summary
+
+    driver = await ckg_builder._get_driver() # Sử dụng driver từ CKGBuilder
+    if not driver:
+        logger.error("Cannot query CKG: Neo4j driver not available via CKGBuilder.")
+        return summary
+
+    db_name_to_use = getattr(driver, 'database', 'neo4j')
+
+    async with driver.session(database=db_name_to_use) as session:
+        try:
+            # Query 1: Tổng số file, class, function
+            result_counts = await session.run(
+                """
+                MATCH (p:Project {graph_id: $project_graph_id})
+                OPTIONAL MATCH (f:File)-[:PART_OF_PROJECT]->(p)
+                OPTIONAL MATCH (c:Class)-[:DEFINED_IN]->(f)
+                OPTIONAL MATCH (func:Function)-[:DEFINED_IN]->(f) // Bao gồm cả Method nếu có label Function
+                RETURN count(DISTINCT f) as total_files,
+                       count(DISTINCT c) as total_classes,
+                       count(DISTINCT func) as total_functions_methods
+                """,
+                {"project_graph_id": project_graph_id}
+            )
+            counts_record = await result_counts.single()
+            if counts_record:
+                summary["total_files"] = counts_record.get("total_files", 0)
+                summary["total_classes"] = counts_record.get("total_classes", 0)
+                summary["total_functions_methods"] = counts_record.get("total_functions_methods", 0)
+                if summary["total_files"] > 0:
+                    summary["average_functions_per_file"] = round(summary["total_functions_methods"] / summary["total_files"], 2)
+
+
+            # Query 2: Top 5 most called functions/methods
+            result_top_called = await session.run(
+                """
+                MATCH (p:Project {graph_id: $project_graph_id})<-[:PART_OF_PROJECT]-(:File)<-[:DEFINED_IN]-(callee:Function)
+                WHERE EXISTS((:Function)-[:CALLS]->(callee)) // Chỉ lấy các function được gọi
+                WITH callee, size([(caller:Function)-[:CALLS]->(callee) | caller]) AS call_count
+                WHERE call_count > 0
+                RETURN callee.name AS name, callee.file_path AS file_path, callee.class_name as class_name, call_count
+                ORDER BY call_count DESC
+                LIMIT 5
+                """,
+                {"project_graph_id": project_graph_id}
+            )
+            async for record in result_top_called:
+                func_name = record.get("name")
+                if record.get("class_name"): # Nếu là method
+                    func_name = f"{record.get('class_name')}.{func_name}"
+                summary["top_5_most_called_functions"].append({
+                    "name": func_name,
+                    "file_path": record.get("file_path"),
+                    "call_count": record.get("call_count")
+                })
+
+            # Query 3: Top 5 largest classes by method count
+            result_largest_classes = await session.run(
+                """
+                MATCH (p:Project {graph_id: $project_graph_id})<-[:PART_OF_PROJECT]-(f:File)<-[:DEFINED_IN]-(cls:Class)
+                OPTIONAL MATCH (method:Method)-[:DEFINED_IN_CLASS]->(cls)
+                WITH cls, f.path AS file_path, count(method) AS method_count
+                WHERE method_count > 0
+                RETURN cls.name AS name, file_path, method_count
+                ORDER BY method_count DESC
+                LIMIT 5
+                """,
+                 {"project_graph_id": project_graph_id}
+            )
+            async for record in result_largest_classes:
+                 summary["top_5_largest_classes_by_methods"].append({
+                    "name": record.get("name"),
+                    "file_path": record.get("file_path"),
+                    "method_count": record.get("method_count")
+                })
+
+            # Query 4: Lấy một vài file làm "main_modules" (ví dụ: file có nhiều class/function)
+            # Đây là một heuristic đơn giản
+            result_main_files = await session.run(
+                """
+                MATCH (p:Project {graph_id: $project_graph_id})<-[:PART_OF_PROJECT]-(f:File)
+                OPTIONAL MATCH (entity)-[:DEFINED_IN]->(f)
+                WHERE entity:Class OR entity:Function
+                WITH f, count(entity) as entity_count
+                ORDER BY entity_count DESC
+                LIMIT 5
+                RETURN f.path as file_path
+                """,
+                {"project_graph_id": project_graph_id}
+            )
+            summary["main_modules"] = [record.get("file_path") async for record in result_main_files]
+
+            logger.info(f"CKG Summary for {project_graph_id}: {summary}")
+
+        except Exception as e:
+            logger.error(f"Error querying CKG for project summary {project_graph_id}: {e}", exc_info=True)
+    return summary
+
+async def create_full_project_dynamic_context(
+    project_model: Project,
+    project_code_local_path: str, # Đường dẫn đến source code đã clone
+    ckg_builder: CKGBuilder # Để truy cập CKG
+) -> Dict[str, Any]:
+    """
+    Tạo DynamicProjectContext cho việc phân tích toàn bộ dự án.
+    """
+    logger.info(f"Creating dynamic project context for FULL SCAN of project ID: {project_model.id} ({project_model.repo_name})")
+
+    # 1. Thông tin cơ bản từ Project model
+    context = {
+        "project_id": project_model.id,
+        "project_name": project_model.repo_name,
+        "project_language": project_model.language or "N/A",
+        "project_custom_notes": project_model.custom_project_notes or "No custom project notes provided.",
+        "main_branch": project_model.main_branch,
+        "requested_output_language": project_model.output_language.value if project_model.output_language else OutputLanguageEnum.ENGLISH.value,
+    }
+
+    # 2. Thông tin tóm tắt từ CKG
+    project_graph_id = ckg_builder.project_graph_id # Lấy từ CKGBuilder instance
+    ckg_summary = await query_ckg_for_project_summary(project_graph_id, ckg_builder)
+    context["ckg_summary"] = ckg_summary # Đưa toàn bộ dictionary tóm tắt vào
+
+    # 3. (Tùy chọn) Thêm một số nội dung file quan trọng
+    # Ví dụ: Lấy nội dung của các file trong "main_modules" từ CKG summary
+    # Cẩn thận với context window của LLM.
+    important_files_content = {}
+    if ckg_summary.get("main_modules"):
+        for file_rel_path in ckg_summary["main_modules"][:2]: # Lấy tối đa 2 file cho demo
+            try:
+                full_file_path = Path(project_code_local_path) / file_rel_path
+                if full_file_path.is_file():
+                    content = full_file_path.read_text(encoding='utf-8', errors='ignore')[:5000] # Giới hạn 5000 ký tự
+                    important_files_content[file_rel_path] = content
+            except Exception as e:
+                logger.warning(f"Could not read content for important file {file_rel_path}: {e}")
+    context["important_files_preview"] = important_files_content
+
+
+    # 4. Cấu trúc thư mục (đơn giản)
+    directory_structure = []
+    project_path_obj = Path(project_code_local_path)
+    for item in project_path_obj.glob('*'): # Chỉ lấy thư mục/file ở cấp 1
+        if item.is_dir():
+            directory_structure.append(f"[DIR] {item.name}")
+        else:
+            directory_structure.append(f"[FILE] {item.name}")
+    context["directory_listing_top_level"] = "\n".join(directory_structure[:20]) # Giới hạn 20 dòng
+
+
+    logger.debug(f"Full project dynamic context for project ID {project_model.id} created. Keys: {list(context.keys())}")
+    # logger.debug(f"CKG Summary in context: {context.get('ckg_summary')}")
+    return context
+
+async def run_full_project_analysis_agents(
+    full_project_context: Dict[str, Any],
+    settings_obj: Settings,
+    project_model: Project
+) -> LLMProjectAnalysisOutput: # Trả về schema output mới
+    """
+    Thực thi các agent LLM để phân tích toàn bộ dự án.
+    Hiện tại, chúng ta sẽ implement một agent chính: Architectural Analyst.
+    """
+    project_name_for_log = full_project_context.get('project_name', 'N/A')
+    logger.info(f"Worker: Running Full Project Analysis Agents for project: {project_name_for_log}")
+
+    final_project_analysis_output = LLMProjectAnalysisOutput(
+        project_summary="", project_level_findings=[], granular_findings=[]
+    )
+    
+    # === LẤY CẤU HÌNH LLM TỪ PROJECT HOẶC SETTINGS ===
+    llm_provider = project_model.llm_provider.value if project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER
+    llm_model = project_model.llm_model_name if project_model.llm_model_name and project_model.llm_model_name.strip() else None
+    llm_temp = project_model.llm_temperature if project_model.llm_temperature is not None else (settings_obj.LLM_DEFAULT_TEMPERATURE if hasattr(settings_obj, 'LLM_DEFAULT_TEMPERATURE') else 0.1)
+
+    decrypted_api_key_override = None
+    if project_model.llm_api_key_override_encrypted:
+        decrypted_api_key_override = decrypt_data(project_model.llm_api_key_override_encrypted)
+        if not decrypted_api_key_override:
+            logger.warning(f"Failed to decrypt API key override for project {project_model.id} (Full Scan). Using default provider key.")
+
+    # Sử dụng model cụ thể cho agent kiến trúc nếu có, nếu không thì dùng model chung đã lấy ở trên
+    architectural_model_name = project_model.llm_model_name if project_model.llm_model_name and project_model.llm_model_name.strip() else llm_model # Hoặc một model cụ thể cho kiến trúc
+    
+    agent_name_architect = f"NovaGuard_ArchitectFullScan_{llm_provider}"
+    if architectural_model_name: agent_name_architect += f"_{architectural_model_name.replace(':', '_')}"
+
+    # === Agent 1: Architectural Analyst ===
+    try:
+        arch_prompt_template_str = load_prompt_template_str("architectural_analyst_full_project_v1.md")
+        
+        # full_project_context đã chứa "requested_output_language"
+        # và các thông tin khác như ckg_summary
+
+        llm_config_architect = LLMProviderConfig(
+            provider_name=llm_provider,
+            model_name=architectural_model_name, # Có thể là model chung hoặc model riêng cho kiến trúc
+            temperature=llm_temp, # Hoặc một temp riêng cho agent này
+            api_key=decrypted_api_key_override
+        )
+        logger.info(f"Worker (Full Scan - Arch): Invoking LLMService with provider: {llm_config_architect.provider_name}, model: {llm_config_architect.model_name or 'provider_default'}")
+
+        architectural_llm_result: LLMProjectAnalysisOutput = await invoke_llm_analysis_chain(
+            prompt_template_str=arch_prompt_template_str,
+            dynamic_context_values=full_project_context,
+            output_pydantic_model_class=LLMProjectAnalysisOutput,
+            llm_provider_config=llm_config_architect,
+            settings_obj=settings_obj
+        )
+
+        if architectural_llm_result:
+            logger.info(f"Architectural analysis agent for '{project_name_for_log}' (model: {architectural_model_name or 'default'}) completed.")
+            if architectural_llm_result.project_summary:
+                final_project_analysis_output.project_summary = architectural_llm_result.project_summary
+            
+            if architectural_llm_result.project_level_findings:
+                final_project_analysis_output.project_level_findings.extend(architectural_llm_result.project_level_findings)
+            
+            if architectural_llm_result.granular_findings:
+                # Gán agent_name cho granular findings nếu LLM không tự điền
+                for finding in architectural_llm_result.granular_findings:
+                    if not finding.agent_name:
+                        finding.agent_name = agent_name_architect # Agent đã tạo ra nó
+                final_project_analysis_output.granular_findings.extend(architectural_llm_result.granular_findings)
+        else:
+            logger.warning(f"Architectural analysis agent for '{project_name_for_log}' returned no result.")
+
+
+
+    except LLMServiceError as e_llm_service:
+        logger.error(f"Worker (Full Scan - Arch): LLMServiceError for project '{project_name_for_log}': {e_llm_service}")
+        # Ghi nhận lỗi này vào project_summary để người dùng biết
+        error_summary = f"Architectural analysis encountered an error: {e_llm_service.args[0]}"
+        final_project_analysis_output.project_summary = (final_project_analysis_output.project_summary + "\n" + error_summary).strip()
+    except FileNotFoundError as e_fnf:
+        logger.error(f"Worker (Full Scan - Arch): Prompt file error for project '{project_name_for_log}': {e_fnf}")
+        error_summary = f"Architectural analysis failed: Prompt file missing."
+        final_project_analysis_output.project_summary = (final_project_analysis_output.project_summary + "\n" + error_summary).strip()
+    except Exception as e:
+        logger.exception(f"Worker (Full Scan - Arch): Unexpected error for project '{project_name_for_log}': {e}")
+        error_summary = f"Architectural analysis failed due to an unexpected error: {str(e)}"
+        current_summary = final_project_analysis_output.project_summary or ""
+        final_project_analysis_output.project_summary = (current_summary + "\n" + error_summary).strip()
+
+
+    # TODO: Thêm các agent khác nếu cần (ví dụ: Security Agent, Technical Debt Agent)
+    # và gộp kết quả của chúng vào final_project_analysis_output
+
+    if not final_project_analysis_output.project_level_findings and \
+        not final_project_analysis_output.granular_findings and \
+        (not final_project_analysis_output.project_summary or final_project_analysis_output.project_summary.strip() == ""):
+        # Lấy agent_name từ context hoặc một cách nào đó nếu cần
+        agent_name_for_summary = "Configured Agents" # Hoặc agent_name_architect nếu chỉ có 1 agent
+        final_project_analysis_output.project_summary = f"NovaGuard AI full project analysis (using {agent_name_for_summary}) completed. No specific issues or summary were explicitly reported."
+        logger.info(f"Full project analysis for '{project_name_for_log}' by {agent_name_for_summary} completed with no explicit findings or summary.")
+    elif not final_project_analysis_output.project_level_findings and \
+        not final_project_analysis_output.granular_findings and \
+        final_project_analysis_output.project_summary and \
+        "error" not in final_project_analysis_output.project_summary.lower() and \
+        "failed" not in final_project_analysis_output.project_summary.lower():
+        logger.info(f"Full project analysis for '{project_name_for_log}' completed with a summary but no explicit findings: {final_project_analysis_output.project_summary}")
+
+
+    return final_project_analysis_output
 
 async def process_message_logic(message_value: dict, db: Session, settings_obj: Settings):
     task_type = message_value.get("task_type", "pr_analysis") # Mặc định là pr_analysis nếu không có
     if task_type == "pr_analysis":
         pr_analysis_request_id = message_value.get("pr_analysis_request_id")
-        if not pr_analysis_request_id: 
-            logger.error("PML: Kafka message missing 'pr_analysis_request_id'. Skipping.")
+        if not pr_analysis_request_id:
+            logger.error("PML (PR): Kafka message missing 'pr_analysis_request_id'. Skipping.")
             return
 
-        logger.info(f"PML: Starting processing for PRAnalysisRequest ID: {pr_analysis_request_id}")
+        logger.info(f"PML (PR): Starting processing for PRAnalysisRequest ID: {pr_analysis_request_id}")
         db_pr_request = crud_pr_analysis.get_pr_analysis_request_by_id(db, pr_analysis_request_id)
 
         if not db_pr_request:
-            logger.error(f"PML: PRAnalysisRequest ID {pr_analysis_request_id} not found in DB. Skipping.")
+            logger.error(f"PML (PR): PRAnalysisRequest ID {pr_analysis_request_id} not found in DB. Skipping.")
             return
 
-        # Chỉ xử lý nếu đang PENDING, hoặc FAILED (để thử lại), hoặc DATA_FETCHED (để chạy lại LLM nếu cần)
         if db_pr_request.status not in [PRAnalysisStatus.PENDING, PRAnalysisStatus.FAILED, PRAnalysisStatus.DATA_FETCHED]:
-            logger.info(f"PML: PR ID {pr_analysis_request_id} has status '{db_pr_request.status.value}', not processable now. Skipping.")
+            logger.info(f"PML (PR): PR ID {pr_analysis_request_id} has status '{db_pr_request.status.value}', not processable now. Skipping.")
             return
-        
+
         db_project = db.query(Project).filter(Project.id == db_pr_request.project_id).first()
         if not db_project:
             error_msg = f"Associated project (ID: {db_pr_request.project_id}) not found for PR ID {pr_analysis_request_id}."
-            logger.error(error_msg)
+            logger.error(f"PML (PR): {error_msg}")
             crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
             return
 
-        # Cập nhật status lên PROCESSING, xóa error_message cũ nếu có
         crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.PROCESSING, error_message=None)
-        logger.info(f"PML: Updated PR ID {pr_analysis_request_id} to PROCESSING.")
+        logger.info(f"PML (PR): Updated PR ID {pr_analysis_request_id} to PROCESSING.")
 
-        user_id = message_value.get("user_id")
-        if not user_id:
-            error_msg = f"User ID missing in Kafka message for PRAnalysisRequest {pr_analysis_request_id}."
-            logger.error(error_msg)
-            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-            return
-
+        user_id = message_value.get("user_id") # Đã có trong message từ webhook_api
         db_user = db.query(User).filter(User.id == user_id).first()
         if not db_user or not db_user.github_access_token_encrypted:
             error_msg = f"User (ID: {user_id}) not found or GitHub token missing for PR ID {pr_analysis_request_id}."
-            logger.error(error_msg)
+            logger.error(f"PML (PR): {error_msg}")
             crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
             return
-        
+
         github_token = decrypt_data(db_user.github_access_token_encrypted)
         if not github_token:
             error_msg = f"GitHub token decryption failed for user ID {user_id} (PR ID {pr_analysis_request_id})."
-            logger.error(error_msg)
+            logger.error(f"PML (PR): {error_msg}")
             crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
             return
-        
+
         gh_client = GitHubAPIClient(token=github_token)
-        
-        if '/' not in db_project.repo_name:
-            error_msg = f"Invalid project repo_name format: {db_project.repo_name} for project ID {db_project.id}."
-            logger.error(error_msg)
-            crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg)
-            return
         owner, repo_slug = db_project.repo_name.split('/', 1)
-        
         pr_number = db_pr_request.pr_number
         head_sha_from_webhook = message_value.get("head_sha", db_pr_request.head_sha)
 
         try:
-            logger.info(f"PML: Fetching GitHub data for PR ID {pr_analysis_request_id}...")
+            logger.info(f"PML (PR): Fetching GitHub data for PR ID {pr_analysis_request_id}...")
             raw_pr_data = await fetch_pr_data_from_github(gh_client, owner, repo_slug, pr_number, head_sha_from_webhook)
             
             if raw_pr_data.get("pr_metadata"):
-                # ... (cập nhật db_pr_request với metadata từ GitHub) ...
                 pr_meta = raw_pr_data["pr_metadata"]
                 db_pr_request.pr_title = pr_meta.get("title", db_pr_request.pr_title)
                 html_url_val = pr_meta.get("html_url")
                 db_pr_request.pr_github_url = str(html_url_val) if html_url_val else db_pr_request.pr_github_url
-            db_pr_request.head_sha = raw_pr_data.get("head_sha", db_pr_request.head_sha)
-            db.commit()
+            db_pr_request.head_sha = raw_pr_data.get("head_sha", db_pr_request.head_sha) # Cập nhật head_sha từ API
+            db.commit() # Lưu thay đổi vào db_pr_request
             db.refresh(db_pr_request)
 
             crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.DATA_FETCHED)
-            logger.info(f"PML: PR ID {pr_analysis_request_id} status updated to DATA_FETCHED. Preparing for LLM analysis.")
+            logger.info(f"PML (PR): PR ID {pr_analysis_request_id} status updated to DATA_FETCHED. Preparing for LLM analysis.")
 
-            # Tạo dynamic_context
             dynamic_context = create_dynamic_project_context(raw_pr_data, db_project, db_pr_request)
-            # QUAN TRỌNG: Thêm raw_pr_data['changed_files'] vào context để agent có thể dùng để trích xuất snippet
             dynamic_context["raw_pr_data_changed_files"] = raw_pr_data.get("changed_files", [])
             
-            logger.info(f"PML: Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
-            
-            # Gọi agent mới thay vì run_deep_logic_bug_hunter_mvp1 cũ
+            logger.info(f"PML (PR): Invoking analysis agent via LLMService for PR ID {pr_analysis_request_id}...")
             analysis_findings_create_schemas: List[am_schemas.AnalysisFindingCreate] = await run_code_analysis_agent_v1(
                 dynamic_context=dynamic_context,
-                settings_obj=settings_obj
+                settings_obj=settings_obj,
+                project_model=db_project
             )
             
             if analysis_findings_create_schemas:
-                # crud_finding.create_analysis_findings nhận List[AnalysisFindingCreate]
                 created_db_findings = crud_finding.create_analysis_findings(
                     db, 
-                    pr_analysis_request_id, 
-                    analysis_findings_create_schemas # Đây là list các Pydantic model
+                    pr_analysis_request_id=pr_analysis_request_id, # Truyền pr_analysis_request_id
+                    findings_in=analysis_findings_create_schemas,
+                    full_project_analysis_request_id=None # PR scan thì full_project_analysis_request_id là None
                 )
-                logger.info(f"PML: Saved {len(created_db_findings)} findings from Langchain agent for PR ID {pr_analysis_request_id}.")
+                logger.info(f"PML (PR): Saved {len(created_db_findings)} findings for PR ID {pr_analysis_request_id}.")
             else:
-                logger.info(f"PML: Langchain agent returned no findings for PR ID {pr_analysis_request_id}.")
+                logger.info(f"PML (PR): LLM agent returned no findings for PR ID {pr_analysis_request_id}.")
 
             crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.COMPLETED)
-            logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED with Langchain agent.")
+            logger.info(f"PML (PR): PR ID {pr_analysis_request_id} analysis COMPLETED.")
             
             if db_pr_request.status == PRAnalysisStatus.COMPLETED:
                 logger.info(f"PML: PR ID {pr_analysis_request_id} analysis COMPLETED. Attempting to post summary comment to GitHub.")
@@ -524,39 +787,53 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
             error_msg_detail = f"Error in process_message_logic for PR ID {pr_analysis_request_id} (Provider: {settings_obj.DEFAULT_LLM_PROVIDER}): {type(e).__name__} - {str(e)}"
             logger.exception(error_msg_detail)
             try:
-                crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020])
+                crud_pr_analysis.update_pr_analysis_request_status(db, pr_analysis_request_id, PRAnalysisStatus.FAILED, error_msg_detail[:1020]) # Giới hạn độ dài error message
             except Exception as db_error:
-                logger.error(f"PML: Additionally, failed to update PR ID {pr_analysis_request_id} status to FAILED: {db_error}")
+                logger.error(f"PML (PR): Additionally, failed to update PR ID {pr_analysis_request_id} status to FAILED: {db_error}")
+
     elif task_type == "full_project_scan":
         full_scan_request_id = message_value.get("full_project_analysis_request_id")
         if not full_scan_request_id:
-            logger.error("Full Project Scan: Kafka message missing 'full_project_analysis_request_id'. Skipping.")
+            logger.error("PML (FullScan): Kafka message missing 'full_project_analysis_request_id'. Skipping.")
             return
 
-        logger.info(f"Full Project Scan: Starting processing for Request ID: {full_scan_request_id}")
+        logger.info(f"PML (FullScan): Starting processing for Request ID: {full_scan_request_id}")
         db_full_scan_request = crud_full_scan.get_full_scan_request_by_id(db, full_scan_request_id)
 
         if not db_full_scan_request:
-            logger.error(f"Full Project Scan: Request ID {full_scan_request_id} not found in DB. Skipping.")
+            logger.error(f"PML (FullScan): Request ID {full_scan_request_id} not found in DB. Skipping.")
             return
 
-        if db_full_scan_request.status not in [FullProjectAnalysisStatus.PENDING, FullProjectAnalysisStatus.FAILED]:
-            logger.info(f"Full Project Scan: Request ID {full_scan_request_id} has status '{db_full_scan_request.status.value}', not processable now. Skipping.")
+        # Cho phép resume từ các bước trước nếu bị lỗi giữa chừng
+        allowed_statuses_to_process = [
+            FullProjectAnalysisStatus.PENDING,
+            FullProjectAnalysisStatus.FAILED, # Cho phép thử lại nếu thất bại
+            FullProjectAnalysisStatus.SOURCE_FETCHED, # Có thể resume từ đây nếu CKG build lỗi
+            FullProjectAnalysisStatus.CKG_BUILDING # Có thể resume nếu analysis LLM lỗi
+        ]
+        if db_full_scan_request.status not in allowed_statuses_to_process:
+            logger.info(f"PML (FullScan): Request ID {full_scan_request_id} has status '{db_full_scan_request.status.value}', not processable or already completed. Skipping.")
             return
 
-        # Lấy thông tin project và user
-        project_id = message_value.get("project_id")
+        project_id = db_full_scan_request.project_id # Lấy từ DB record
+        # user_id cần để lấy token, nên lấy từ message nếu có, hoặc tìm cách khác nếu worker không nhận được user_id
+        # Giả sử message Kafka luôn có user_id cho full_scan task
         user_id = message_value.get("user_id")
-        repo_full_name = message_value.get("repo_full_name") # "owner/repo"
-        branch_to_scan = message_value.get("branch_to_scan")
+        if not user_id:
+            # Nếu không có user_id trong message, thử lấy từ project owner
+            temp_project_for_user = db.query(Project).filter(Project.id == project_id).first()
+            if temp_project_for_user:
+                user_id = temp_project_for_user.user_id
+            else: # Không tìm thấy project
+                error_msg = f"Full Project Scan: Project ID {project_id} not found, cannot determine user for token (Request ID {full_scan_request_id})."
+                logger.error(error_msg)
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
+                return
 
-        if not all([project_id, user_id, repo_full_name, branch_to_scan]):
-            error_msg = f"Full Project Scan: Missing critical info in Kafka message for Request ID {full_scan_request_id}."
-            logger.error(error_msg)
-            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
-            return
+        repo_full_name = db_full_scan_request.project.repo_name # Lấy từ relationship
+        branch_to_scan = db_full_scan_request.branch_name
 
-        db_project_model = db.query(Project).filter(Project.id == project_id).first()
+        db_project_model = db.query(Project).filter(Project.id == project_id).first() # Đã có project_id
         db_user_model = db.query(User).filter(User.id == user_id).first()
 
         if not db_project_model or not db_user_model or not db_user_model.github_access_token_encrypted:
@@ -565,8 +842,14 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
             crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
             return
 
-        crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.PROCESSING, error_message=None)
-        logger.info(f"Full Project Scan: Updated Request ID {full_scan_request_id} to PROCESSING.")
+        # Cập nhật trạng thái lên PROCESSING (nếu đang PENDING hoặc FAILED)
+        if db_full_scan_request.status in [FullProjectAnalysisStatus.PENDING, FullProjectAnalysisStatus.FAILED]:
+            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.PROCESSING, error_message=None)
+            db_full_scan_request.error_message = None # Xóa lỗi cũ
+            db_full_scan_request.started_at = datetime.now(timezone.utc)
+            db.commit() # Commit thay đổi trạng thái
+            db.refresh(db_full_scan_request)
+            logger.info(f"PML (FullScan): Updated Request ID {full_scan_request_id} to PROCESSING.")
 
         github_token = decrypt_data(db_user_model.github_access_token_encrypted)
         if not github_token:
@@ -575,96 +858,175 @@ async def process_message_logic(message_value: dict, db: Session, settings_obj: 
             crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg)
             return
 
-        repo_clone_dir = None
+        repo_clone_temp_dir: Optional[tempfile.TemporaryDirectory] = None
         try:
-            # --- Bước 1: Fetch/Clone source code ---
-            # Sử dụng tempfile để tạo thư mục tạm an toàn
-            repo_clone_dir_obj = tempfile.TemporaryDirectory(prefix=f"novaguard_scan_{full_scan_request_id}_")
-            repo_clone_dir = repo_clone_dir_obj.name
-            logger.info(f"Full Project Scan: Cloning {repo_full_name} (branch: {branch_to_scan}) into {repo_clone_dir}")
+            # === Bước 1: Fetch/Clone source code (Nếu chưa làm) ===
+            if db_full_scan_request.status not in [FullProjectAnalysisStatus.SOURCE_FETCHED, FullProjectAnalysisStatus.CKG_BUILDING, FullProjectAnalysisStatus.ANALYZING]:
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.PROCESSING) # Đảm bảo đang processing
+                repo_clone_temp_dir = tempfile.TemporaryDirectory(prefix=f"novaguard_scan_{full_scan_request_id}_")
+                repo_clone_dir_path_str = repo_clone_temp_dir.name
+                logger.info(f"PML (FullScan): Cloning {repo_full_name} (branch: {branch_to_scan}) into {repo_clone_dir_path_str}")
 
-            gh_client = GitHubAPIClient(token=github_token)
-            archive_link = await gh_client.get_repository_archive_link(
-                owner=repo_full_name.split('/')[0],
-                repo=repo_full_name.split('/')[1],
-                ref=branch_to_scan,
-                archive_format="tarball" # hoặc "zipball"
-            )
+                gh_client = GitHubAPIClient(token=github_token)
+                archive_link = await gh_client.get_repository_archive_link(
+                    owner=repo_full_name.split('/')[0], repo=repo_full_name.split('/')[1],
+                    ref=branch_to_scan, archive_format="tarball"
+                )
+                if not archive_link: raise Exception("Failed to get repository archive link.")
+                await gh_client.download_and_extract_archive(archive_link, repo_clone_dir_path_str)
+                
+                db_full_scan_request.source_fetched_at = datetime.now(timezone.utc)
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.SOURCE_FETCHED)
+                db.commit(); db.refresh(db_full_scan_request)
+            else:
+                # Nếu đã SOURCE_FETCHED hoặc CKG_BUILDING, cần đường dẫn tới code đã clone
+                # Điều này phức tạp nếu worker khác nhau xử lý.
+                # Giải pháp đơn giản nhất cho phép resume là luôn clone lại nếu không phải đang ANALYZING.
+                # Hoặc, worker cần lưu trữ đường dẫn clone.
+                # Hiện tại, nếu resume từ SOURCE_FETCHED/CKG_BUILDING, chúng ta phải clone lại.
+                # Điều này không tối ưu nhưng đơn giản hơn việc quản lý state thư mục tạm.
+                logger.info(f"PML (FullScan): Status is {db_full_scan_request.status.value}, will re-fetch source for consistency if needed or use existing logic that re-fetches.")
+                # Logic hiện tại sẽ clone lại nếu vào đây từ FAILED của các bước sau,
+                # hoặc nếu code được thiết kế để luôn chạy lại từ đầu nếu không phải ANALYZING.
+                # Để đơn giản, ta giả định là sẽ luôn có code để CKGBuilder chạy.
+                # Nếu muốn tối ưu: cần một nơi lưu repo_clone_dir_path_str nếu SOURCE_FETCHED.
+                # Tạm thời, nếu resume, sẽ phải clone lại nếu vào bước fetch code.
+                # Chúng ta sẽ tạo thư mục tạm mới.
+                if not repo_clone_temp_dir: # Chỉ tạo nếu chưa có (ví dụ resume từ FAILED ở bước CKG/Analysis)
+                    repo_clone_temp_dir = tempfile.TemporaryDirectory(prefix=f"novaguard_scan_{full_scan_request_id}_RESUME_")
+                    repo_clone_dir_path_str = repo_clone_temp_dir.name
+                    logger.info(f"PML (FullScan) - RESUMING: Re-cloning {repo_full_name} (branch: {branch_to_scan}) into {repo_clone_dir_path_str}")
+                    gh_client = GitHubAPIClient(token=github_token)
+                    archive_link = await gh_client.get_repository_archive_link(
+                        owner=repo_full_name.split('/')[0], repo=repo_full_name.split('/')[1],
+                        ref=branch_to_scan, archive_format="tarball"
+                    )
+                    if not archive_link: raise Exception("Failed to get repository archive link (resume).")
+                    await gh_client.download_and_extract_archive(archive_link, repo_clone_dir_path_str)
+                    # Không cập nhật source_fetched_at ở đây nữa nếu resume.
 
-            if not archive_link:
-                raise Exception("Failed to get repository archive link from GitHub.")
 
-            logger.info(f"Full Project Scan: Downloading archive from {archive_link}...")
-            # Hàm download và giải nén archive
-            await gh_client.download_and_extract_archive(archive_link, repo_clone_dir)
-            logger.info(f"Full Project Scan: Successfully downloaded and extracted source code to {repo_clone_dir}")
+            # === Bước 2: Xây dựng/Cập nhật CKG (Nếu chưa làm hoặc làm lại) ===
+            ckg_builder_instance = CKGBuilder(project_model=db_project_model) # Luôn cần CKGBuilder
+            if db_full_scan_request.status not in [FullProjectAnalysisStatus.CKG_BUILDING, FullProjectAnalysisStatus.ANALYZING]:
+                # Nếu chưa build CKG hoặc resume từ source_fetched
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.CKG_BUILDING)
+                db.commit(); db.refresh(db_full_scan_request)
 
-            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.SOURCE_FETCHED)
+                # Đường dẫn tới code phải có sẵn ở đây
+                if not 'repo_clone_dir_path_str' in locals() or not Path(repo_clone_dir_path_str).exists():
+                    # Đây là trường hợp resume mà không clone lại, cần xử lý.
+                    # Hiện tại, sẽ lỗi nếu không có repo_clone_dir_path_str.
+                    # Để an toàn, ta clone lại nếu đường dẫn không tồn tại (xem ở trên)
+                    raise FileNotFoundError(f"Source code directory not found for CKG building (Request ID: {full_scan_request_id}). This might happen on resume if temp dir was lost.")
 
-            # --- Bước 2: Xây dựng/Cập nhật CKG ---
-            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.CKG_BUILDING)
-            logger.info(f"Full Project Scan: Starting CKG build for Request ID {full_scan_request_id}")
-            
-            ckg_builder_instance = CKGBuilder(project_model=db_project_model) # db_project_model là Project SQLAlchemy object
-            files_processed_for_ckg = await ckg_builder_instance.build_for_project(repo_clone_dir)
-            
-            db_full_scan_request.ckg_built_at = datetime.now(timezone.utc)
-            # db_full_scan_request.total_files_analyzed = files_processed_for_ckg # Hoặc một con số khác nếu analysis sau này khác
-            db.commit() # Commit sau khi CKG build xong
-            db.refresh(db_full_scan_request)
-            logger.info(f"Full Project Scan: CKG build completed for Request ID {full_scan_request_id}. Processed {files_processed_for_ckg} files for CKG.")
-
-
-            # --- Bước 3: Phân tích code với LLM Agents (Sử dụng CKG nếu có) ---
-            crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING)
-            logger.info(f"Full Project Scan: Starting LLM analysis for Request ID {full_scan_request_id}")
-            
-            # TODO:
-            # 1. Tạo DynamicProjectContext cho TOÀN BỘ project.
-            #    - Cần duyệt qua các file trong repo_clone_dir.
-            #    - `create_dynamic_project_context` hiện tại được thiết kế cho PR. Cần điều chỉnh/tạo hàm mới.
-            #    - Context này sẽ cần được làm giàu bằng thông tin từ CKG (Mục 3 của Giai đoạn 2).
-            #
-            # 2. Điều chỉnh/Tạo Agent LLM phù hợp cho Full Scan.
-            #    - Prompt có thể khác, tập trung vào các vấn đề kiến trúc, nợ kỹ thuật, an ninh tổng thể.
-            #    - Có thể cần nhiều agent nhỏ hơn, mỗi agent tập trung vào một khía cạnh.
-            #
-            # 3. Gọi llm_service để thực hiện phân tích.
-            #
-            # 4. Lưu findings.
-            #    - Cần quyết định lưu vào bảng `analysisfindings` (thêm cột `full_project_analysis_request_id` và `scan_type`)
-            #      hay một bảng riêng `fullprojectanalysisfindings`.
-            #    - Schema Pydantic cho finding có thể cần điều chỉnh (ví dụ: không có line_number cho phát hiện ở mức project).
-
-            logger.warning(f"Full Project Scan: LLM Analysis for full project is NOT YET IMPLEMENTED. Marking as completed after CKG build for now (Request ID: {full_scan_request_id}).")
-            
-            # Cập nhật số file được CKG xử lý vào total_files_analyzed
-            if db_full_scan_request.total_files_analyzed is None : # Chỉ set nếu chưa có
+                files_processed_for_ckg = await ckg_builder_instance.build_for_project_from_path(repo_clone_dir_path_str)
+                
+                db_full_scan_request.ckg_built_at = datetime.now(timezone.utc)
                 db_full_scan_request.total_files_analyzed = files_processed_for_ckg
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING) # Chuyển sang ANALYZING
+                db.commit(); db.refresh(db_full_scan_request)
+                logger.info(f"PML (FullScan): CKG build completed for Request ID {full_scan_request_id}. Processed {files_processed_for_ckg} files.")
+            elif db_full_scan_request.status == FullProjectAnalysisStatus.CKG_BUILDING: # Nếu resume từ giữa CKG_BUILDING (khó) hoặc FAILED ở CKG_BUILDING
+                # Thì nên chạy lại CKG build
+                logger.info(f"PML (FullScan): Resuming CKG build for Request ID {full_scan_request_id}")
+                if not 'repo_clone_dir_path_str' in locals() or not Path(repo_clone_dir_path_str).exists():
+                    raise FileNotFoundError(f"Source code directory not found for CKG building (Resuming CKG_BUILDING for Request ID: {full_scan_request_id}).")
+                files_processed_for_ckg = await ckg_builder_instance.build_for_project_from_path(repo_clone_dir_path_str)
+                db_full_scan_request.ckg_built_at = datetime.now(timezone.utc) # Cập nhật lại thời gian
+                db_full_scan_request.total_files_analyzed = files_processed_for_ckg
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING)
+                db.commit(); db.refresh(db_full_scan_request)
 
-            db.commit() # Commit lại sau khi cập nhật các thông tin phân tích
-            db.refresh(db_full_scan_request)
 
+            # === Bước 3: Phân tích code với LLM Agents (Sử dụng CKG) ===
+            # Đảm bảo trạng thái là ANALYZING
+            if db_full_scan_request.status != FullProjectAnalysisStatus.ANALYZING:
+                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.ANALYZING)
+                db.commit(); db.refresh(db_full_scan_request)
+
+            logger.info(f"PML (FullScan): Starting LLM analysis using CKG for Request ID {full_scan_request_id}")
+            
+            if not 'repo_clone_dir_path_str' in locals() or not Path(repo_clone_dir_path_str).exists():
+                raise FileNotFoundError(f"Source code directory not found for LLM Analysis (Request ID: {full_scan_request_id}).")
+
+            full_project_context = await create_full_project_dynamic_context(
+                db_project_model, repo_clone_dir_path_str, ckg_builder_instance
+            )
+            llm_analysis_output: LLMProjectAnalysisOutput = await run_full_project_analysis_agents(
+                full_project_context, settings_obj, project_model=db_project_model
+            )
+            
+            all_findings_to_create_db: List[am_schemas.AnalysisFindingCreate] = []
+            if llm_analysis_output.project_level_findings:
+                for proj_finding in llm_analysis_output.project_level_findings:
+                    all_findings_to_create_db.append(am_schemas.AnalysisFindingCreate(
+                        file_path=f"Project Level: {proj_finding.finding_category}",
+                        severity=proj_finding.severity, message=proj_finding.description,
+                        suggestion=proj_finding.recommendation,
+                        agent_name=f"NovaGuard_ProjectAgent_{db_project_model.llm_provider.value if db_project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER}",
+                        code_snippet=f"Relevant: {', '.join(proj_finding.relevant_components)}" if proj_finding.relevant_components else None,
+                        finding_level="project", module_name=proj_finding.finding_category,
+                        meta_data=proj_finding.meta_data,
+                        finding_type=proj_finding.finding_category # Hoặc một type cụ thể hơn
+                    ))
+            if llm_analysis_output.granular_findings:
+                for granular_finding in llm_analysis_output.granular_findings:
+                    all_findings_to_create_db.append(am_schemas.AnalysisFindingCreate(
+                        file_path=granular_finding.file_path or "N/A",
+                        line_start=granular_finding.line_start, line_end=granular_finding.line_end,
+                        severity=granular_finding.severity, message=granular_finding.message,
+                        suggestion=granular_finding.suggestion,
+                        agent_name=granular_finding.agent_name or f"NovaGuard_FullScanDetailAgent_{db_project_model.llm_provider.value if db_project_model.llm_provider else settings_obj.DEFAULT_LLM_PROVIDER}",
+                        finding_level="file", meta_data=granular_finding.meta_data,
+                        finding_type=granular_finding.finding_type
+                    ))
+            
+            if all_findings_to_create_db:
+                # Trước khi tạo, xóa các finding cũ của full_scan_request_id này (nếu có, phòng trường hợp chạy lại)
+                db.query(AnalysisFinding).filter(AnalysisFinding.full_project_analysis_request_id == full_scan_request_id).delete(synchronize_session=False)
+                db.commit()
+
+                created_db_findings = crud_finding.create_analysis_findings(
+                    db, findings_in=all_findings_to_create_db,
+                    full_project_analysis_request_id=full_scan_request_id,
+                    pr_analysis_request_id=None
+                )
+                db_full_scan_request.total_findings = len(created_db_findings)
+            else:
+                db_full_scan_request.total_findings = 0
+            
+            db_full_scan_request.analysis_completed_at = datetime.now(timezone.utc)
+            # Lưu project_summary từ LLM vào error_message nếu không có lỗi thực sự, hoặc một field mới.
+            # Tạm thời, nếu không có lỗi, error_message sẽ là summary.
+            if llm_analysis_output.project_summary:
+                db_full_scan_request.error_message = llm_analysis_output.project_summary # Sử dụng error_message để lưu summary
+            db.commit()
+            
             crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.COMPLETED)
-            logger.info(f"Full Project Scan: Request ID {full_scan_request_id} marked as COMPLETED (CKG built, LLM analysis placeholder).")
+            logger.info(f"PML (FullScan): Request ID {full_scan_request_id} analysis COMPLETED.")
 
         except Exception as e_full_scan:
             error_msg_detail = f"Full Project Scan: Error processing Request ID {full_scan_request_id}: {type(e_full_scan).__name__} - {str(e_full_scan)}"
             logger.exception(error_msg_detail)
             try:
-                crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg_detail[:1020])
+                # Kiểm tra db_full_scan_request có tồn tại không trước khi cập nhật
+                if db.query(FullProjectAnalysisRequest).filter(FullProjectAnalysisRequest.id == full_scan_request_id).first():
+                    crud_full_scan.update_full_scan_request_status(db, full_scan_request_id, FullProjectAnalysisStatus.FAILED, error_msg_detail[:1020])
+                else:
+                    logger.error(f"PML (FullScan): db_full_scan_request (ID: {full_scan_request_id}) became None before updating to FAILED.")
             except Exception as db_error_fs:
-                logger.error(f"Full Project Scan: Additionally, failed to update Request ID {full_scan_request_id} status to FAILED: {db_error_fs}")
+                logger.error(f"PML (FullScan): Additionally, failed to update Request ID {full_scan_request_id} status to FAILED: {db_error_fs}")
         finally:
-            if repo_clone_dir_obj: # Kiểm tra xem object TemporaryDirectory có được tạo không
-                    try:
-                        logger.info(f"Full Project Scan: Attempting to clean up temporary directory: {repo_clone_dir_obj.name}")
-                        repo_clone_dir_obj.cleanup() # Gọi cleanup tường minh
-                        logger.info(f"Full Project Scan: Cleaned up temporary directory successfully.")
-                    except Exception as e_cleanup:
-                        logger.error(f"Full Project Scan: Error cleaning up temp directory {repo_clone_dir_obj.name}: {e_cleanup}")
+            if repo_clone_temp_dir:
+                try:
+                    logger.info(f"PML (FullScan): Cleaning up temporary directory: {repo_clone_temp_dir.name}")
+                    repo_clone_temp_dir.cleanup()
+                except Exception as e_cleanup:
+                    logger.error(f"PML (FullScan): Error cleaning up temp directory {repo_clone_temp_dir.name}: {e_cleanup}")
     else:
         logger.warning(f"Unknown task_type received in Kafka message: {task_type}")
+
 
 
 # --- Kafka Consumer Loop and Main Worker Function ---

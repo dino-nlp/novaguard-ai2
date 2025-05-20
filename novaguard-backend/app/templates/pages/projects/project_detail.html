@@ -97,6 +97,69 @@
             {% else %}
             <p class="text-sm text-gray-500 mt-4 italic">No custom project notes provided.</p>
             {% endif %}
+
+            <h3 class="text-lg font-semibold text-nv-dark mb-2 border-b pb-1">LLM & Analysis Configuration</h3>
+            <dl class="space-y-2 text-sm">
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">LLM Provider:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.llm_provider %}  {{ project.llm_provider.value | capitalize }} {% elif default_settings.DEFAULT_LLM_PROVIDER %}
+                            {{ default_settings.DEFAULT_LLM_PROVIDER | capitalize }} (Server Default)
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">LLM Model:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.llm_model_name %}
+                            {{ project.llm_model_name }}
+                        {% else %}
+                            {# Hiển thị model mặc định dựa trên provider của project hoặc provider mặc định của server #}
+                            {% set current_provider = project.llm_provider.value if project.llm_provider else default_settings.DEFAULT_LLM_PROVIDER %}
+                            {% if current_provider == 'ollama' %}
+                                {{ default_settings.OLLAMA_DEFAULT_MODEL }} (Default for Ollama)
+                            {% elif current_provider == 'openai' %}
+                                {{ default_settings.OPENAI_DEFAULT_MODEL }} (Default for OpenAI)
+                            {% elif current_provider == 'gemini' %}
+                                {{ default_settings.GEMINI_DEFAULT_MODEL }} (Default for Gemini)
+                            {% else %}
+                                Provider Default
+                            {% endif %}
+                        {% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Temperature:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {{ "%.1f" | format(project.llm_temperature if project.llm_temperature is not none else default_settings.get('LLM_DEFAULT_TEMPERATURE', 0.1)) }}
+                        {% if project.llm_temperature is none %}(Default){% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">API Key Override:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.llm_api_key_override_is_set %}
+                            <span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-700">Custom Key Set</span>
+                        {% else %}
+                            <span class="text-gray-500">Using Server Default</span>
+                        {% endif %}
+                    </dd>
+                </div>
+                <div class="grid grid-cols-3 gap-2">
+                    <dt class="font-medium text-gray-500">Output Language:</dt>
+                    <dd class="col-span-2 text-gray-800">
+                        {% if project.output_language == 'en' %}English
+                        {% elif project.output_language == 'vi' %}Tiếng Việt
+                        {% elif project.output_language == 'ko' %}한국어
+                        {% else %}{{ default_settings.DEFAULT_OUTPUT_LANGUAGE | capitalize if default_settings.DEFAULT_OUTPUT_LANGUAGE == 'en' else 'English' }}
+                        {% endif %}
+                        {% if not project.output_language %}(Server Default){% endif %}
+                    </dd>
+                </div>
+
+            </dl>
         </div>
     </div>
 
@@ -148,15 +211,15 @@
         <div class="overflow-x-auto bg-white rounded-lg shadow">
             <table class="min-w-full w-full whitespace-nowrap">
                 <thead class="bg-slate-100 border-b border-slate-200">
-                    <tr>
-                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Type</th>
-                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Identifier / Title</th>
-                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Status</th>
-                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Summary</th>
-                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Requested</th>
-                        <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Actions</th>
-                    </tr>
-                </thead>
+                <tr>
+                    <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Type</th>
+                    <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Identifier / Title</th>
+                    <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Status</th>
+                    <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Summary</th>
+                    <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Requested</th>
+                    <th class="text-left py-3 px-4 text-sm font-semibold text-slate-600 uppercase tracking-wider">Actions</th>
+                </tr>
+            </thead>
                 <tbody class="divide-y divide-slate-200">
                     {% for item in analysis_history_items %}
                     <tr class="hover:bg-slate-50 transition-colors duration-150">
@@ -177,32 +240,19 @@
                                 <div class="font-medium text-slate-800">{{ item.identifier }}</div>
                             {% endif %}
                         </td>
-
-                        {# Cột Status - Phần class cho badge #}
+                        {# Cột Status #}
                         <td class="py-3 px-4 text-sm">
                             <span class="status-badge
-                                {% if item.status == 'completed' %} status-completed  {# SO SÁNH TRỰC TIẾP STRING #}
+                                {% if item.status == 'completed' %} status-completed
                                 {% elif item.status == 'failed' %} status-failed
                                 {% elif item.status in ['pending', 'processing', 'source_fetched', 'ckg_building', 'analyzing', 'data_fetched'] %} status-in-progress
                                 {% else %} status-pending {% endif %}">
-                                
-                                {# Phần text hiển thị trạng thái #}
-                                {% if item.status == 'pending' %}Pending
-                                {% elif item.status == 'processing' %}Processing...
-                                {% elif item.status == 'data_fetched' %}Data Fetched...
-                                {% elif item.status == 'source_fetched' %}Source Fetched...
-                                {% elif item.status == 'ckg_building' %}Building CKG...
-                                {% elif item.status == 'analyzing' %}Analyzing...
-                                {% elif item.status == 'completed' %}Completed
-                                {% elif item.status == 'failed' %}Failed
-                                {% else %}{{ item.status | replace('_', ' ') | title }}
-                                {% endif %}
+                                {{ item.status | replace('_', ' ') | title }}
                             </span>
                         </td>
-
-                        {# Cột Summary #}
+                        {# Cột Summary - Đã có logic đếm error/warning trong main.py #}
                         <td class="py-3 px-4 text-sm text-slate-700">
-                            {% if item.status == 'completed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                            {% if item.status == 'completed' %}
                                 {% if item.total_errors == 0 and item.total_warnings == 0 and item.total_other_findings == 0 %}
                                     <span class="text-green-600">No issues</span>
                                 {% else %}
@@ -210,39 +260,29 @@
                                     {% if item.total_warnings > 0 %}<span class="font-semibold text-yellow-500 ml-1.5">{{ item.total_warnings }}W</span>{% endif %}
                                     {% if item.total_other_findings > 0 %}<span class="font-semibold text-sky-600 ml-1.5">{{ item.total_other_findings }}N</span>{% endif %}
                                 {% endif %}
-                            {% elif item.status == 'failed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                            {% elif item.status == 'failed' %}
                                 <span class="text-red-500 italic">Failed</span>
                             {% else %}
                                 <span class="text-gray-500 italic">In Progress...</span>
                             {% endif %}
                         </td>
-
                         <td class="py-3 px-4 text-sm text-slate-500">{{ item.requested_at.strftime('%d %b %Y, %H:%M') if item.requested_at else 'N/A' }}</td>
-                        
-                        {# Cột Actions #}
+                        {# Cột Actions - item.report_url đã được tạo đúng trong main.py #}
                         <td class="py-3 px-4 text-sm">
-                            {% if item.report_url and item.status == 'completed' %} {# SO SÁNH TRỰC TIẾP STRING #}
+                            {% if item.report_url and item.status == 'completed' %}
                                 <a href="{{ item.report_url }}"
                                     class="text-white bg-nv-accent hover:bg-nv-accent-dark font-medium rounded-md text-xs px-3 py-1.5 text-center transition duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-nv-accent">
                                     View Report
                                 </a>
-                            {% elif item.status != 'completed' and item.status != 'failed' %} {# SO SÁNH TRỰC TIẾP STRING #}
-                                {# Hiển thị text cụ thể hơn cho các trạng thái đang xử lý #}
+                            {# ... (phần else cho các status khác giữ nguyên) ... #}
+                            {% elif item.status != 'completed' and item.status != 'failed' %}
                                 <span class="text-slate-400 italic text-xs">
-                                    {% if item.status == 'pending' %}Queued
-                                    {% elif item.status == 'processing' %}Processing...
-                                    {% elif item.status == 'data_fetched' %}Fetching Data...
-                                    {% elif item.status == 'source_fetched' %}Source Fetched...
-                                    {% elif item.status == 'ckg_building' %}Building CKG...
-                                    {% elif item.status == 'analyzing' %}Analyzing...
-                                    {% else %}{{ item.status | replace('_', ' ') | title }}...
-                                    {% endif %}
+                                    {{ item.status | replace('_', ' ') | title }}...
                                 </span>
-                            {% else %} {# Mặc định là failed hoặc completed mà không có report_url #}
+                            {% else %}
                                 <span class="text-slate-400 italic text-xs">-</span>
                             {% endif %}
                         </td>
-
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -272,57 +312,59 @@ document.addEventListener('DOMContentLoaded', function() {
 
     if (triggerBtn) {
         triggerBtn.addEventListener('click', function() {
-            if (!confirm('Are you sure you want to start a full project scan for branch \'{{ project.main_branch }}\'? This may take some time and will use your configured LLM resources.')) {
-                return;
-            }
-            statusMsg.textContent = 'Requesting full scan...';
-            statusMsg.className = 'text-sm mt-2 text-blue-600 animate-pulse';
-            triggerBtn.disabled = true;
-            triggerBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                if (!confirm('Are you sure you want to start a full project scan for branch \'{{ project.main_branch }}\'? This may take some time and will use your configured LLM resources.')) {
+                    return;
+                }
+                statusMsg.textContent = 'Requesting full scan...';
+                statusMsg.className = 'text-sm mt-2 text-blue-600 animate-pulse';
+                triggerBtn.disabled = true;
+                triggerBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
-            fetch(`/api/projects/${projectId}/full-scan`, {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    // Cookie session sẽ tự động được gửi bởi trình duyệt cho các request cùng domain
-                }
-            })
-            .then(response => {
-                // Luôn cố gắng parse JSON, ngay cả khi lỗi, để lấy detail
-                return response.json().then(data => {
-                    if (!response.ok) { // status code không phải 2xx
-                        // Ném một object lỗi tùy chỉnh để catch có thể xử lý
-                        throw { status: response.status, data: data, message: data.detail || `HTTP error ${response.status}` };
+                // THAY ĐỔI URL Ở ĐÂY:
+                // fetch(`/api/projects/${projectId}/full-scan`, { // URL CŨ
+                fetch(`{{ url_for('ui_trigger_full_scan_post', project_id_path=project.id) }}`, { // URL MỚI
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json',
+                        // Cookie session sẽ tự động được gửi bởi trình duyệt.
+                        // Nếu bạn cần CSRF token, bạn sẽ phải thêm nó vào đây.
+                        // Hiện tại, FastAPI SessionMiddleware không tự bảo vệ CSRF cho POST từ JS.
+                        // Để đơn giản, chúng ta bỏ qua CSRF cho endpoint UI này,
+                        // nhưng trong môi trường production cần xem xét kỹ.
                     }
-                    return data; // Trả về data nếu response.ok
+                    // body không cần thiết vì chúng ta không gửi dữ liệu gì thêm từ form
+                })
+                .then(response => {
+                    return response.json().then(data => {
+                        if (!response.ok) {
+                            throw { status: response.status, data: data, message: data.detail || data.message || `HTTP error ${response.status}` };
+                        }
+                        return data;
+                    });
+                })
+                .then(data => {
+                    statusMsg.textContent = data.message || `Full scan request (ID: ${data.id}, Status: ${data.status}) has been queued. The page will reload in a few seconds.`;
+                    statusMsg.className = 'text-sm mt-2 text-green-600';
+                    setTimeout(() => window.location.reload(), 4000);
+                })
+                .catch(error => {
+                    let detailMsg = "An unknown error occurred while triggering the scan.";
+                    if (error && error.data && (error.data.detail || error.data.message) ) {
+                        detailMsg = error.data.detail || error.data.message;
+                    } else if (error && typeof error.message === 'string') {
+                        detailMsg = error.message;
+                    } else if (typeof error === 'string') {
+                        detailMsg = error;
+                    }
+                    
+                    statusMsg.textContent = `Error: ${detailMsg}`;
+                    statusMsg.className = 'text-sm mt-2 text-red-600';
+                    triggerBtn.disabled = false;
+                    triggerBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    console.error('Full scan trigger error:', error);
                 });
-            })
-            .then(data => { // Chỉ chạy nếu response.ok
-                statusMsg.textContent = `Full scan request (ID: ${data.id}, Status: ${data.status}) has been queued. The page will reload in a few seconds to reflect changes.`;
-                statusMsg.className = 'text-sm mt-2 text-green-600';
-                // Không disable nút nữa, để user có thể trigger lại nếu muốn (sau khi đã reload)
-                // triggerBtn.disabled = false; 
-                // triggerBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                setTimeout(() => window.location.reload(), 4000); // Tải lại trang để cập nhật trạng thái
-            })
-            .catch(error => {
-                let detailMsg = "An unknown error occurred while triggering the scan.";
-                if (error && error.data && error.data.detail) {
-                    detailMsg = error.data.detail;
-                } else if (error && typeof error.message === 'string') {
-                    detailMsg = error.message;
-                } else if (typeof error === 'string') {
-                    detailMsg = error;
-                }
-                
-                statusMsg.textContent = `Error: ${detailMsg}`;
-                statusMsg.className = 'text-sm mt-2 text-red-600';
-                triggerBtn.disabled = false;
-                triggerBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                console.error('Full scan trigger error:', error);
             });
-        });
-    }
-});
+        }
+    });
 </script>
 {% endblock %}

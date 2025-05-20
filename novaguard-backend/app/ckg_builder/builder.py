@@ -1,21 +1,20 @@
-# novaguard-ai2/novaguard-backend/app/ckg_builder/builder.py
+# novaguard-backend/app/ckg_builder/builder.py
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
-from neo4j import AsyncDriver # Thêm Async
+from neo4j import AsyncDriver
 
-from app.core.graph_db import get_async_neo4j_driver # Sử dụng driver đã tạo
-from app.models import Project # SQLAlchemy model để lấy project_id, language
+from app.core.graph_db import get_async_neo4j_driver
+from app.models import Project
 from .parsers import get_code_parser, ParsedFileResult, ExtractedFunction, ExtractedClass, ExtractedImport
 
 logger = logging.getLogger(__name__)
 
 class CKGBuilder:
-    # ... (__init__, _get_driver, _execute_write_queries, _ensure_project_node, _clear_existing_data_for_file giữ nguyên) ...
     def __init__(self, project_model: Project, neo4j_driver: Optional[AsyncDriver] = None):
         self.project = project_model
-        self.project_graph_id = f"novaguard_project_{project_model.id}" # ID của project trong graph
-        self.file_path_to_node_id_cache: Dict[str, int] = {} # Cache để tránh query lại File node ID
+        self.project_graph_id = f"novaguard_project_{project_model.id}"
+        self.file_path_to_node_id_cache: Dict[str, int] = {} # Cache này có thể không cần nếu dùng composite_id
         self._driver = neo4j_driver
 
     async def _get_driver(self) -> AsyncDriver:
@@ -30,10 +29,9 @@ class CKGBuilder:
     async def _execute_write_queries(self, queries_with_params: List[Tuple[str, Dict[str, Any]]]):
         if not queries_with_params: return
         driver = await self._get_driver()
-        # Sử dụng database được cấu hình trong settings hoặc mặc định 'neo4j'
-        db_name = getattr(driver, 'database', 'neo4j') # Lấy database name từ driver nếu có, fallback
+        db_name = getattr(driver, 'database', 'neo4j')
         async with driver.session(database=db_name) as session:
-            async with session.begin_transaction() as tx:
+            async with await session.begin_transaction() as tx:
                 for query, params in queries_with_params:
                     try:
                         # logger.debug(f"CKG Executing Cypher: {query} with params: {params}")
@@ -43,13 +41,13 @@ class CKGBuilder:
                         await tx.rollback()
                         raise
                 await tx.commit()
-    
+
     async def _ensure_project_node(self):
         query = """
         MERGE (p:Project {graph_id: $project_graph_id})
         ON CREATE SET p.name = $repo_name, p.novaguard_id = $novaguard_project_id, p.language = $language
-        ON MATCH SET p.name = $repo_name, p.language = $language
-        """
+        ON MATCH SET p.name = $repo_name, p.language = $language, p.novaguard_id = $novaguard_project_id
+        """ # Thêm novaguard_id vào ON MATCH
         params = {
             "project_graph_id": self.project_graph_id,
             "repo_name": self.project.repo_name,
@@ -60,30 +58,77 @@ class CKGBuilder:
         logger.info(f"CKGBuilder: Ensured Project node '{self.project_graph_id}' exists/updated.")
 
     async def _clear_existing_data_for_file(self, file_path_in_repo: str):
-        # Xóa các node Function, Class, và File (cùng relationships của chúng) cho file này
-        # Xóa relationships CALLS trỏ đến hoặc đi từ các function/method trong file này
-        queries = [
-            (
-                """
-                MATCH (f:File {path: $file_path, project_graph_id: $project_graph_id})
-                OPTIONAL MATCH (f)<-[:DEFINED_IN]-(entity) // Functions or Classes in this file
-                OPTIONAL MATCH (entity)-[r_calls:CALLS]->() // Calls từ entity này
-                OPTIONAL MATCH (entity)<-[r_called_by:CALLS]-() // Calls đến entity này
-                DETACH DELETE f, entity // Xóa file, entities và tất cả relationships của chúng
-                // Cần đảm bảo không xóa nhầm call target/source ở file khác nếu chỉ DETACH DELETE entity
-                // Cách an toàn hơn là xóa từng loại relationship trước nếu cần
-                """,
-                # Query trên cần test kỹ. DETACH DELETE trên f và entity sẽ xóa luôn :DEFINED_IN.
-                # CALLS relationships sẽ bị xóa nếu một trong hai đầu (entity) bị xóa.
-                {"file_path": file_path_in_repo, "project_graph_id": self.project_graph_id}
-            )
-        ]
+        file_composite_id = f"{self.project_graph_id}:{file_path_in_repo}"
         logger.info(f"CKGBuilder: Clearing existing CKG data for file '{file_path_in_repo}' in project '{self.project_graph_id}'")
-        await self._execute_write_queries(queries)
+
+        # Bước 1: Tìm tất cả các thực thể (Class, Function, Method) được định nghĩa trong file này.
+        # Bước 2: Xóa tất cả các relationship ĐẾN và ĐI TỪ các thực thể này.
+        # Bước 3: Xóa các thực thể này.
+        # Bước 4: Xóa node File và các relationship trực tiếp của nó (IMPORTS_MODULE, PART_OF_PROJECT).
+
+        # Lưu ý: Relationship INHERITS_FROM từ một class trong file này đến một class placeholder
+        # (superclass ở file khác) cũng sẽ bị xóa. Khi parse lại, nó sẽ được tạo lại.
+        # Nếu class cha cũng nằm trong file này, nó sẽ bị xóa và tạo lại cùng lúc.
+
+        query = """
+        MATCH (file_node:File {composite_id: $file_composite_id})
+        OPTIONAL MATCH (entity)-[:DEFINED_IN]->(file_node)
+        WHERE entity:Class OR entity:Function // Chỉ lấy Class và Function/Method
+        WITH file_node, collect(DISTINCT entity) as entities_in_file
+        CALL {
+            WITH entities_in_file
+            UNWIND entities_in_file as e
+            DETACH DELETE e
+            RETURN count(e) as deleted_entities_count
+        }
+        
+        DETACH DELETE file_node
+        RETURN deleted_entities_count, id(file_node) as deleted_file_node_id
+        """
+        # Ghi chú: Query này phức tạp hơn và có thể cần kiểm tra kỹ lưGhi chú: Query này phức tạp hơn và có thể cần kiểm tra kỹ lưỡng về hiệu năng.
+        # Một cách đơn giản hơn nhưng có thể để lại "placeholder" nodes là:
+        # MATCH (f:File {composite_id: $file_composite_id})<-[:DEFINED_IN]-(entity)
+        # DETACH DELETE entity
+        # WITH f
+        # DETACH DELETE f
+
+        params = {"file_composite_id": file_composite_id}
+        try:
+            results = await self._execute_write_queries_with_results([(query, params)])
+            if results and results[0] and results[0][0]: # Kiểm tra có kết quả không
+                deleted_info = results[0][0] # Kết quả của query đầu tiên
+                # logger.debug(f"CKGBuilder: Cleared entities count: {deleted_info.get('deleted_entities_count')}, deleted file node id: {deleted_info.get('deleted_file_node_id')}")
+            logger.info(f"CKGBuilder: Successfully cleared data for file '{file_path_in_repo}'.")
+        except Exception as e:
+            logger.error(f"CKGBuilder: Error clearing data for file '{file_path_in_repo}': {e}", exc_info=True)
+            # Cân nhắc có nên raise lỗi ở đây không
+
+    async def _execute_write_queries_with_results(self, queries_with_params: List[Tuple[str, Dict[str, Any]]]):
+        """ Một phiên bản của _execute_write_queries trả về kết quả (nếu cần cho debug/xác nhận) """
+        if not queries_with_params: return []
+        driver = await self._get_driver()
+        db_name = getattr(driver, 'database', 'neo4j')
+        all_results = []
+        async with driver.session(database=db_name) as session:
+            async with await session.begin_transaction() as tx:
+                for query, params in queries_with_params:
+                    try:
+                        result = await tx.run(query, params)
+                        records = [record.data() async for record in result]
+                        summary = await result.consume() # Nên consume để giải phóng tài nguyên
+                        all_results.append(records)
+                        # logger.debug(f"CKG Executed Cypher: {query[:70]}... with params: {params}. Summary: {summary.counters}")
+                    except Exception as e:
+                        logger.error(f"CKGBuilder: Error running Cypher (with results): {query[:150]}... with params {params}. Error: {e}", exc_info=True)
+                        await tx.rollback()
+                        raise
+                await tx.commit()
+        return all_results
 
 
     async def process_file_for_ckg(self, file_path_in_repo: str, file_content: str, language: Optional[str]):
-        if not language: # Ngôn ngữ phải được xác định
+        logger.info(f"CKGBuilder: Processing CKG for '{file_path_in_repo}' (lang: {language}), project: '{self.project_graph_id}'.")
+        if not language:
             logger.debug(f"CKGBuilder: Language not specified for file {file_path_in_repo}, skipping CKG.")
             return
 
@@ -99,194 +144,238 @@ class CKGBuilder:
             logger.error(f"CKGBuilder: Failed to parse file {file_path_in_repo} for CKG.")
             return
 
-        # Xóa dữ liệu CKG cũ của file này trước khi thêm mới
         await self._clear_existing_data_for_file(file_path_in_repo)
 
         cypher_batch: List[Tuple[str, Dict[str, Any]]] = []
+        file_composite_id = f"{self.project_graph_id}:{file_path_in_repo}"
 
         # 1. File Node
         file_node_props = {
             "path": file_path_in_repo,
             "project_graph_id": self.project_graph_id,
             "language": language,
-            "name": Path(file_path_in_repo).name
+            "name": Path(file_path_in_repo).name,
+            "composite_id": file_composite_id
         }
         cypher_batch.append((
             "MERGE (p:Project {graph_id: $project_graph_id}) "
-            "MERGE (f:File {path: $path, project_graph_id: $project_graph_id}) "
-            "ON CREATE SET f += $props "
-            "ON MATCH SET f += $props "
+            "MERGE (f:File {composite_id: $composite_id}) "
+            "ON CREATE SET f = $props "
+            "ON MATCH SET f.language = $props.language, f.name = $props.name "
             "MERGE (f)-[:PART_OF_PROJECT]->(p)",
-            {"project_graph_id": self.project_graph_id, "path": file_path_in_repo, "props": file_node_props}
+            {
+                "project_graph_id": self.project_graph_id,
+                "composite_id": file_composite_id,
+                "props": file_node_props
+            }
         ))
 
         # 2. Import Nodes and Relationships
         for imp_data in parsed_data.imports:
             if imp_data.module_path:
-                # Module Node (đại diện cho module được import)
-                # project_graph_id được thêm vào Module để phân biệt module cùng tên ở các project (nếu cần)
-                # hoặc có thể để Module là global. Tạm thời để là project-specific.
                 cypher_batch.append((
                     """
                     MERGE (m:Module {path: $module_path, project_graph_id: $project_graph_id})
                     ON CREATE SET m.name = last(split($module_path, '.'))
                     WITH m
-                    MATCH (f:File {path: $file_path, project_graph_id: $project_graph_id})
+                    MATCH (f:File {composite_id: $file_composite_id})
                     MERGE (f)-[r:IMPORTS_MODULE]->(m)
-                    SET r.type = $import_type
+                    SET r.type = $import_type, r.original_names = $original_names, r.aliases = $aliases
                     """,
                     {
-                        "module_path": imp_data.module_path, "project_graph_id": self.project_graph_id,
-                        "file_path": file_path_in_repo, "import_type": imp_data.import_type
+                        "module_path": imp_data.module_path,
+                        "project_graph_id": self.project_graph_id,
+                        "file_composite_id": file_composite_id,
+                        "import_type": imp_data.import_type,
+                        "original_names": [name for name, alias in imp_data.imported_names] if imp_data.imported_names else [],
+                        "aliases": [alias for name, alias in imp_data.imported_names if alias] if imp_data.imported_names else []
                     }
                 ))
-                if imp_data.import_type == "from" and imp_data.imported_names:
-                    for name, alias in imp_data.imported_names:
-                        # Relationship IMPORTS_NAME_FROM_MODULE (hoặc property trên IMPORTS_MODULE)
-                        # Đây là một ví dụ, bạn có thể muốn cấu trúc khác
-                        cypher_batch.append((
-                            """
-                            MATCH (f:File {path: $file_path, project_graph_id: $project_graph_id})
-                            MATCH (m:Module {path: $module_path, project_graph_id: $project_graph_id})
-                            MERGE (f)-[r:IMPORTS_NAME_FROM_MODULE {original_name: $name}]->(m)
-                            SET r.alias = $alias
-                            """,
-                            {
-                                "file_path": file_path_in_repo, "module_path": imp_data.module_path,
-                                "name": name, "alias": alias, "project_graph_id": self.project_graph_id
-                            }
-                        ))
-
-
         # 3. Class Nodes, Methods, and Inheritance
         for cls_data in parsed_data.classes:
+            class_composite_id = f"{self.project_graph_id}:{file_path_in_repo}:{cls_data.name}:{cls_data.start_line}"
             class_props = {
                 "name": cls_data.name, "file_path": file_path_in_repo,
                 "start_line": cls_data.start_line, "end_line": cls_data.end_line,
-                "project_graph_id": self.project_graph_id
+                "project_graph_id": self.project_graph_id,
+                "composite_id": class_composite_id
             }
             cypher_batch.append((
                 """
-                MATCH (f:File {path: $file_path, project_graph_id: $project_graph_id})
-                MERGE (c:Class {name: $name, file_path: $file_path, start_line: $start_line, project_graph_id: $project_graph_id})
-                ON CREATE SET c += $props_on_create
+                MATCH (f:File {composite_id: $file_composite_id})
+                MERGE (c:Class {composite_id: $composite_id})
+                ON CREATE SET c = $props_on_create
                 ON MATCH SET c.end_line = $props_on_create.end_line
                 MERGE (c)-[:DEFINED_IN]->(f)
                 """,
-                {"file_path": file_path_in_repo, "project_graph_id": self.project_graph_id,
-                 "name": cls_data.name, "start_line": cls_data.start_line,
-                 "props_on_create": class_props} # Truyền toàn bộ props để set khi CREATE
+                {
+                    "file_composite_id": file_composite_id,
+                    "composite_id": class_composite_id,
+                    "props_on_create": class_props
+                }
             ))
 
             for super_name in cls_data.superclasses:
                 cypher_batch.append((
                     """
-                    MATCH (this_class:Class {name: $class_name, file_path: $file_path, project_graph_id: $project_graph_id})
-                    MERGE (super_class:Class {name: $super_name, project_graph_id: $project_graph_id}) // Giả định superclass cùng project, cần resolve sau
-                    ON CREATE SET super_class.placeholder = true // Đánh dấu nếu nó chưa được parse từ file khác
+                    MATCH (this_class:Class {composite_id: $class_composite_id})
+                    MERGE (super_class:Class {name: $super_name, project_graph_id: $project_graph_id})
+                    ON CREATE SET super_class.placeholder = true, 
+                                  super_class.file_path = "UNKNOWN",
+                                  super_class.start_line = -1,       
+                                  super_class.composite_id = $project_graph_id + ":UNKNOWN:" + $super_name + ":-1"
                     MERGE (this_class)-[:INHERITS_FROM]->(super_class)
                     """,
-                    {"class_name": cls_data.name, "file_path": file_path_in_repo,
-                     "super_name": super_name, "project_graph_id": self.project_graph_id}
+                    {
+                        "class_composite_id": class_composite_id,
+                        "super_name": super_name,
+                        "project_graph_id": self.project_graph_id
+                    }
                 ))
 
             for method_data in cls_data.methods:
+                method_composite_id = f"{self.project_graph_id}:{file_path_in_repo}:{method_data.name}:{method_data.start_line}"
                 method_props = {
                     "name": method_data.name, "file_path": file_path_in_repo,
                     "start_line": method_data.start_line, "end_line": method_data.end_line,
                     "signature": method_data.signature, "parameters": method_data.parameters_str,
-                    "class_name": cls_data.name, "project_graph_id": self.project_graph_id
+                    "class_name": cls_data.name, "project_graph_id": self.project_graph_id,
+                    "composite_id": method_composite_id
                 }
                 cypher_batch.append((
                     """
-                    MATCH (f:File {path: $file_path, project_graph_id: $project_graph_id})
-                    MATCH (cls:Class {name: $class_name, file_path: $file_path, project_graph_id: $project_graph_id})
-                    MERGE (m:Method:Function { // Sử dụng cả hai label
-                        name: $name, file_path: $file_path, start_line: $start_line, project_graph_id: $project_graph_id
-                    })
-                    ON CREATE SET m += $props
-                    ON MATCH SET m.end_line = $props.end_line, m.signature = $props.signature, m.parameters = $props.parameters
+                    MATCH (f:File {composite_id: $file_composite_id})
+                    MATCH (cls:Class {composite_id: $class_composite_id})
+                    MERGE (m:Method:Function {composite_id: $composite_id})
+                    ON CREATE SET m = $props
+                    ON MATCH SET m.end_line = $props.end_line, m.signature = $props.signature, 
+                                 m.parameters = $props.parameters, m.class_name = $props.class_name
                     MERGE (m)-[:DEFINED_IN]->(f)
                     MERGE (m)-[:DEFINED_IN_CLASS]->(cls)
                     """,
-                    {"file_path": file_path_in_repo, "project_graph_id": self.project_graph_id,
-                     "class_name": cls_data.name, **method_props} # Merge method_props vào params
+                    {
+                        "file_composite_id": file_composite_id,
+                        "class_composite_id": class_composite_id,
+                        "composite_id": method_composite_id,
+                        "props": method_props
+                    }
                 ))
 
         # 4. Global Function Nodes
-        for func_data in parsed_data.functions: # Global functions
+        for func_data in parsed_data.functions:
+            func_composite_id = f"{self.project_graph_id}:{file_path_in_repo}:{func_data.name}:{func_data.start_line}"
             func_props = {
                 "name": func_data.name, "file_path": file_path_in_repo,
                 "start_line": func_data.start_line, "end_line": func_data.end_line,
                 "signature": func_data.signature, "parameters": func_data.parameters_str,
-                "project_graph_id": self.project_graph_id
+                "project_graph_id": self.project_graph_id,
+                "composite_id": func_composite_id
             }
             cypher_batch.append((
                 """
-                MATCH (f:File {path: $file_path, project_graph_id: $project_graph_id})
-                MERGE (fn:Function {
-                    name: $name, file_path: $file_path, start_line: $start_line, project_graph_id: $project_graph_id
-                })
-                ON CREATE SET fn += $props
+                MATCH (f:File {composite_id: $file_composite_id})
+                MERGE (fn:Function {composite_id: $composite_id})
+                ON CREATE SET fn = $props
                 ON MATCH SET fn.end_line = $props.end_line, fn.signature = $props.signature, fn.parameters = $props.parameters
                 MERGE (fn)-[:DEFINED_IN]->(f)
                 """,
-                {"file_path": file_path_in_repo, "project_graph_id": self.project_graph_id, **func_props}
+                {
+                    "file_composite_id": file_composite_id,
+                    "composite_id": func_composite_id,
+                    "props": func_props
+                }
             ))
-        
-        # Thực thi batch tạo node và define relationships
+
         if cypher_batch:
             logger.debug(f"CKGBuilder: Executing initial batch of {len(cypher_batch)} Cypher queries for file {file_path_in_repo}.")
             await self._execute_write_queries(cypher_batch)
 
-        # 5. Link CALLS (Sau khi tất cả functions/methods đã được MERGE)
+        # 5. Link CALLS
         call_link_queries_batch: List[Tuple[str, Dict[str, Any]]] = []
-        all_defined_entities_in_file = parsed_data.functions + [m for c in parsed_data.classes for m in c.methods]
+        all_defined_entities_in_file = parsed_data.functions + [
+            method for cls_data in parsed_data.classes for method in cls_data.methods
+        ]
 
         for defined_entity in all_defined_entities_in_file:
-            if not defined_entity.calls: continue
-            
+            if not defined_entity.calls:
+                continue
+
             caller_label = ":Method:Function" if defined_entity.class_name else ":Function"
-            
-            for called_name, base_object_name, call_type in defined_entity.calls:
-                # Đây là logic rất cơ bản, cần cải thiện với resolution engine
-                # Cố gắng tìm callee trong cùng project, ưu tiên cùng file
+            caller_composite_id = f"{self.project_graph_id}:{file_path_in_repo}:{defined_entity.name}:{defined_entity.start_line}"
+
+            for called_name, base_object_name, call_type, call_site_line in defined_entity.calls: # Thêm call_site_line
                 call_params = {
-                    "caller_name": defined_entity.name, "caller_file_path": file_path_in_repo,
-                    "caller_start_line": defined_entity.start_line,
-                    "callee_name": called_name, "project_graph_id": self.project_graph_id
+                    "caller_composite_id": caller_composite_id,
+                    "callee_name": called_name,
+                    "project_graph_id": self.project_graph_id,
+                    "caller_file_path_for_local_search": file_path_in_repo,
+                    "call_type_prop": call_type,
+                    "base_object_prop": base_object_name,
+                    "call_site_line_prop": call_site_line # Thêm tham số cho query
                 }
-                # Query tìm callee có thể rất phức tạp
-                # MVP: tìm Function/Method có tên đó trong CÙNG FILE trước, sau đó là CÙNG PROJECT
-                # Query này có thể tạo nhiều mối quan hệ CALLS nếu có nhiều function/method cùng tên
-                # Cần một cơ chế "resolve" tốt hơn.
-                resolve_query = f"""
-                MATCH (caller{caller_label} {{
-                    name: $caller_name, file_path: $caller_file_path, 
-                    start_line: $caller_start_line, project_graph_id: $project_graph_id
+
+                # Query Cypher để tìm callee và tạo CALLS relationship.
+                # Ưu tiên tìm trong cùng file, sau đó trong cùng class (nếu caller là method), rồi mới đến toàn project.
+                # Node callee được tìm thấy sẽ có composite_id của nó.
+                # TÁCH BIỆT QUERY TÌM CALLEE VÀ MERGE RELATIONSHIP ĐỂ DỄ DEBUG HƠN
+                resolve_and_link_query = f"""
+                MATCH (caller{caller_label} {{composite_id: $caller_composite_id}})
+
+                // Attempt 1: Callee is a function/method in the same file as the caller
+                // and has the Function label (covers global functions and methods if methods also have :Function)
+                OPTIONAL MATCH (callee_same_file:Function {{
+                    name: $callee_name,
+                    file_path: $caller_file_path_for_local_search,
+                    project_graph_id: $project_graph_id
                 }})
-                // Ưu tiên tìm trong cùng file
-                OPTIONAL MATCH (callee_same_file:Function {{name: $callee_name, file_path: $caller_file_path, project_graph_id: $project_graph_id}})
+                // We need to be careful if callee_name is a common method name like 'append' or 'init'
+                // and base_object_prop is set (indicating it's likely a method call on an instance).
+                // In such cases, callee_same_file might wrongly match a global function with the same name.
+
                 WITH caller, callee_same_file
-                // Nếu không tìm thấy trong cùng file, tìm trong toàn bộ project
-                OPTIONAL MATCH (callee_any_file:Function {{name: $callee_name, project_graph_id: $caller.project_graph_id}})
-                WHERE callee_same_file IS NULL // Chỉ tìm nếu không thấy ở same_file
+
+                // Attempt 2: If caller is a method, try to find callee as another method in the same class or a superclass method.
+                // This is a simplified version for now. True resolution would require walking the MRO.
+                OPTIONAL MATCH (caller)-[:DEFINED_IN_CLASS]->(caller_class:Class)
+                WHERE ($call_type_prop = "method" OR $base_object_prop IS NOT NULL) AND callee_same_file IS NULL // Only if method call and not found yet
+                OPTIONAL MATCH (callee_in_same_or_superclass:Method {{ // Assuming methods have :Method label
+                    name: $callee_name,
+                    project_graph_id: $project_graph_id
+                }})
+                WHERE (callee_in_same_or_superclass)-[:DEFINED_IN_CLASS]->(caller_class) OR
+                      ( (caller_class)-[:INHERITS_FROM*0..5]->(:Class)<-[:DEFINED_IN_CLASS]-(callee_in_same_or_superclass) AND
+                        callee_in_same_or_superclass.name = $callee_name ) // Check name explicitly for superclass methods
+                WITH caller, COALESCE(callee_same_file, callee_in_same_or_superclass) as callee_local_or_class_level
+
+                // Attempt 3: Callee is any function/method in the project if not found by previous, more specific attempts
+                // This is a broad match and might lead to incorrect links if names are not unique.
+                // Consider adding more context (e.g., from imports) if possible.
+                OPTIONAL MATCH (callee_in_project:Function {{ // Assuming global functions and methods are :Function
+                    name: $callee_name,
+                    project_graph_id: $project_graph_id
+                }})
+                WHERE callee_local_or_class_level IS NULL AND $base_object_prop IS NULL // Only if not found and likely a direct global call
+
+                // Final Callee: Prioritize matches: same_file (and same class) > any_in_project
+                WITH caller, COALESCE(callee_local_or_class_level, callee_in_project) AS final_callee
                 
-                WITH caller, COALESCE(callee_same_file, callee_any_file) AS callee
-                WHERE callee IS NOT NULL // Chỉ tạo relationship nếu tìm thấy callee
-                MERGE (caller)-[r:CALLS {{type: $call_type, base_object: $base_object_name }}]->(callee)
+                WHERE final_callee IS NOT NULL // Proceed only if a callee is found
+                MERGE (caller)-[r:CALLS]->(final_callee)
+                SET r.type = $call_type_prop,
+                    r.base_object = $base_object_prop,
+                    r.call_site_line = $call_site_line_prop
+                // RETURN caller.name as CallerName, final_callee.name as CalleeName, r.type as CallType // For debugging
                 """
-                call_params_full = {**call_params, "call_type": call_type, "base_object_name": base_object_name}
-                call_link_queries_batch.append((resolve_query, call_params_full))
+                call_link_queries_batch.append((resolve_and_link_query, call_params))
 
         if call_link_queries_batch:
             logger.debug(f"CKGBuilder: Executing batch of {len(call_link_queries_batch)} CALLS link queries for file {file_path_in_repo}.")
             await self._execute_write_queries(call_link_queries_batch)
-        
+
         logger.info(f"CKGBuilder: Finished CKG processing for file '{file_path_in_repo}'.")
 
+
     async def build_for_project_from_path(self, repo_local_path: str):
-        # ... (logic duyệt file và gọi process_file_for_ckg như lần trước, đảm bảo await self._ensure_project_node()) ...
         logger.info(f"CKGBuilder: Starting CKG build for project '{self.project_graph_id}' from path: {repo_local_path}")
         await self._ensure_project_node()
 
@@ -294,46 +383,79 @@ class CKGBuilder:
         files_processed_count = 0
         files_to_process: List[Tuple[Path, Optional[str]]] = []
 
+        # Hint ngôn ngữ chính của dự án từ model Project
         project_main_language = self.project.language.lower().strip() if self.project.language else None
         logger.info(f"CKGBuilder: Project main language hint: {project_main_language}")
 
+        # Danh sách các extension code phổ biến và ngôn ngữ tương ứng
         common_code_extensions = {
             '.py': 'python', '.js': 'javascript', '.jsx': 'javascript',
             '.ts': 'typescript', '.tsx': 'typescript',
             '.java': 'java', '.go': 'go', '.rb': 'ruby', '.php': 'php', '.cs': 'c_sharp',
-            # Ngôn ngữ C/C++ cần cẩn thận với header files
-            '.c': 'c', '.h': 'c', # Coi .h là C
-            '.cpp': 'cpp', '.hpp': 'cpp', '.cxx': 'cpp', '.hxx': 'cpp', # Coi header C++ là cpp
+            '.c': 'c', '.h': 'c',
+            '.cpp': 'cpp', '.hpp': 'cpp', '.cxx': 'cpp', '.hxx': 'cpp',
         }
-        ignored_parts = {'.git', 'node_modules', '__pycache__', 'venv', 'target', 'build', 'dist', '.idea', '.vscode', '.settings', 'bin', 'obj', 'lib', 'docs', 'examples', 'tests', 'test', 'samples'}
-        ignored_extensions = {'.log', '.tmp', '.swp', '.DS_Store', '.map', '.min.js', '.min.css', '.lock', '.cfg', '.ini', '.txt', '.md', '.json', '.xml', '.yaml', '.yml', '.csv', '.tsv', '.bak', '.old', '.orig', '.zip', '.tar.gz', '.rar', '.7z', '.exe', '.dll', '.so', '.o', '.a', '.lib', '.jar', '.class', '.pyc', '.pyd', '.egg-info', '.pytest_cache', '.mypy_cache', '.tox', '.nox', '.hypothesis', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.mov'}
-
+        # Các thư mục/file cần bỏ qua
+        # (Nên lấy từ một file config hoặc cấu hình project sau này)
+        ignored_parts = {
+            '.git', 'node_modules', '__pycache__', 'venv', 'target', 'build', 'dist',
+            '.idea', '.vscode', '.settings', 'bin', 'obj', 'lib', 'docs', 'examples',
+            'tests', 'test', 'samples', # Cân nhắc việc có parse code test không
+            '.DS_Store', 'coverage', '.pytest_cache', '.mypy_cache', '.tox', '.nox',
+            'site-packages', 'dist-packages', 'migrations', 'static', 'media', 'templates',
+            'vendor', 'third_party'
+        }
+        ignored_extensions = {
+            '.log', '.tmp', '.swp', '.map', '.min.js', '.min.css', '.lock', '.cfg', '.ini',
+            '.txt', '.md', '.json', '.xml', '.yaml', '.yml', '.csv', '.tsv', '.bak', '.old', '.orig',
+            '.zip', '.tar.gz', '.rar', '.7z', '.exe', '.dll', '.so', '.o', '.a', '.lib',
+            '.jar', '.class', '.pyc', '.pyd', '.egg-info', '.hypothesis',
+            '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.pdf', '.doc', '.docx',
+            '.xls', '.xlsx', '.ppt', '.pptx', '.mp3', '.mp4', '.avi', '.mov',
+            '.db', '.sqlite', '.sqlite3'
+        }
+        min_file_size_for_ckg = 10 # bytes, bỏ qua các file quá nhỏ (ví dụ: __init__.py rỗng)
+        max_file_size_for_ckg = 5 * 1024 * 1024 # 5MB, bỏ qua file quá lớn
 
         for file_p in source_path_obj.rglob('*'):
-            relative_path_parts = file_p.relative_to(source_path_obj).parts
-            if any(part in ignored_parts for part in relative_path_parts) or \
-                (file_p.name.startswith('.') and file_p.is_dir() and file_p.name != "."): # Bỏ qua thư mục ẩn trừ thư mục gốc '.'
-                if file_p.is_dir(): logger.debug(f"CKGBuilder: Skipping ignored directory: {file_p.relative_to(source_path_obj)}")
+            if not file_p.is_file():
                 continue
 
-            if file_p.is_file():
-                if file_p.name.startswith('.') or file_p.suffix.lower() in ignored_extensions:
-                    logger.debug(f"CKGBuilder: Skipping ignored file: {file_p.relative_to(source_path_obj)}")
-                    continue
-                
-                file_lang = common_code_extensions.get(file_p.suffix.lower())
-                
-                # Nếu project có ngôn ngữ chính được định nghĩa, có thể chỉ ưu tiên parse ngôn ngữ đó
-                # hoặc dùng nó làm fallback. Hiện tại, chỉ parse nếu có trong common_code_extensions.
-                # if project_main_language and file_lang != project_main_language:
-                #     logger.debug(f"CKGBuilder: Skipping file {file_p.relative_to(source_path_obj)} as its language '{file_lang}' does not match project's main language '{project_main_language}'.")
-                #     continue
+            relative_path_parts = file_p.relative_to(source_path_obj).parts
+            if any(part.lower() in ignored_parts for part in relative_path_parts) or \
+               any(file_p.name.lower().endswith(ext) for ext in ignored_parts if not ext.startswith('.')) or \
+               (file_p.name.startswith('.') and file_p.name not in ['.env', '.flaskenv']): # Bỏ qua file ẩn trừ một số file cụ thể
+                logger.debug(f"CKGBuilder: Skipping ignored file/path: {file_p.relative_to(source_path_obj)}")
+                continue
 
-                if file_lang:
-                    files_to_process.append((file_p, file_lang))
-                else:
-                    logger.debug(f"CKGBuilder: Skipping file with unsupported/unknown code extension for CKG: {file_p.relative_to(source_path_obj)}")
-        
+            if file_p.suffix.lower() in ignored_extensions:
+                logger.debug(f"CKGBuilder: Skipping file with ignored extension: {file_p.relative_to(source_path_obj)}")
+                continue
+
+            try:
+                file_size = file_p.stat().st_size
+                if file_size < min_file_size_for_ckg:
+                    logger.debug(f"CKGBuilder: Skipping too small file: {file_p.relative_to(source_path_obj)} ({file_size} bytes)")
+                    continue
+                if file_size > max_file_size_for_ckg:
+                    logger.warning(f"CKGBuilder: Skipping too large file: {file_p.relative_to(source_path_obj)} ({file_size} bytes)")
+                    continue
+            except OSError: # Có thể xảy ra với broken symlinks
+                logger.warning(f"CKGBuilder: Could not stat file (possibly broken symlink): {file_p.relative_to(source_path_obj)}. Skipping.")
+                continue
+
+            file_lang = common_code_extensions.get(file_p.suffix.lower())
+            if project_main_language and file_lang != project_main_language:
+                 # Nếu dự án có ngôn ngữ chính, có thể chỉ ưu tiên phân tích ngôn ngữ đó trong lần đầu
+                 # Hoặc tùy chọn cho phép phân tích nhiều ngôn ngữ.
+                 # Hiện tại, chúng ta vẫn thêm vào để phân tích nếu có parser.
+                 pass
+
+            if file_lang:
+                files_to_process.append((file_p, file_lang))
+            else:
+                logger.debug(f"CKGBuilder: Skipping file with unsupported/unknown code extension for CKG: {file_p.relative_to(source_path_obj)}")
+
         logger.info(f"CKGBuilder: Found {len(files_to_process)} files to process for CKG.")
 
         for file_p, lang_to_use in files_to_process:
@@ -348,11 +470,17 @@ class CKGBuilder:
                     except Exception as e_enc:
                         logger.error(f"CKGBuilder: Could not read file {file_path_in_repo} due to encoding: {e_enc}. Skipping.")
                         continue
-                
+                except OSError as e_os_read: # Ví dụ file bị xóa giữa chừng
+                    logger.error(f"CKGBuilder: OS error reading file {file_path_in_repo}: {e_os_read}. Skipping.")
+                    continue
+
+
                 await self.process_file_for_ckg(file_path_in_repo, content, lang_to_use)
                 files_processed_count += 1
             except Exception as e:
                 logger.error(f"CKGBuilder: Critical error processing file {file_path_in_repo} for CKG: {e}", exc_info=True)
-        
+                # Cân nhắc việc có nên dừng toàn bộ quá trình build CKG của project nếu một file lỗi nặng không.
+                # Hoặc chỉ bỏ qua file đó.
+
         logger.info(f"CKGBuilder: Finished CKG build for project '{self.project_graph_id}'. Processed {files_processed_count} files for CKG.")
         return files_processed_count

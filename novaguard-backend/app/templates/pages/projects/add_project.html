@@ -1,7 +1,7 @@
 {% extends "layout/base.html" %}
 
 {% block content %}
-<div class="bg-white p-6 md:p-8 rounded-lg shadow-xl max-w-2xl mx-auto">
+<div class="bg-white p-6 md:p-8 rounded-lg shadow-xl max-w-3xl mx-auto"> {# Tăng max-width #}
     <h1 class="text-2xl font-semibold text-nv-dark mb-6 border-b pb-4">Add New GitHub Project</h1>
 
     {% if error_github %}
@@ -25,8 +25,8 @@
     </div>
     <hr class="my-6">
     <p class="text-sm text-gray-600 mb-4 text-center">
-        {% if prefill_data and prefill_data.repo_name %} {# Kiểm tra prefill_data có tồn tại và có repo_name không #}
-            Review the prefilled details below or select a different repository above.
+        {% if prefill_data and prefill_data.repo_name %}
+            Review the prefilled details below or select a different repository above. Default LLM & Language settings will be applied.
         {% else %}
             Or fill the details manually:
         {% endif %}
@@ -39,6 +39,8 @@
 
 
     <form action="{{ url_for('ui_add_project_post') }}" method="post" class="space-y-6">
+        {# --- Project Identification --- #}
+        <h3 class="text-lg font-medium text-nv-dark pt-2">Project Identification</h3>
         <div>
             <label for="repo_name" class="block text-sm font-medium text-gray-700 mb-1">
                 Repository Name <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(Format: `owner/repository-name`)</span>
@@ -47,49 +49,88 @@
                    value="{{ prefill_data.repo_name if prefill_data else '' }}"
                    placeholder="your-github-username/your-repo-name"
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
-            <p class="mt-1 text-xs text-gray-500">This must be the full name of the repository on GitHub (e.g., MyOrg/my-cool-repo).</p>
         </div>
-
         <div>
             <label for="github_repo_id" class="block text-sm font-medium text-gray-700 mb-1">
-                GitHub Repository ID <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(Numeric ID from GitHub)</span>
+                GitHub Repository ID <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(Numeric ID)</span>
             </label>
             <input type="text" name="github_repo_id" id="github_repo_id" required 
                    value="{{ prefill_data.repo_id if prefill_data else '' }}"
                    placeholder="e.g., 123456789"
                    pattern="[0-9]+" title="Please enter a numeric GitHub Repository ID."
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
-            <p class="mt-1 text-xs text-gray-500">
-                This is the unique numerical ID for the repository from GitHub, not the repository name.
-            </p>
         </div>
-
         <div>
             <label for="main_branch" class="block text-sm font-medium text-gray-700 mb-1">
-                Main Branch <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(e.g., `main`, `master`, `develop`)</span>
+                Main Branch <span class="text-red-500">*</span> <span class="text-xs text-gray-500">(e.g., `main`, `master`)</span>
             </label>
             <input type="text" name="main_branch" id="main_branch" 
                    value="{{ prefill_data.main_branch if prefill_data else 'main' }}" required
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
         </div>
-
         <div>
             <label for="language" class="block text-sm font-medium text-gray-700 mb-1">
-                Primary Language (Optional)
+                Project's Primary Programming Language (Optional)
             </label>
             <input type="text" name="language" id="language" placeholder="e.g., Python, JavaScript, Java"
-                   value="" {# Bỏ prefill cho language và notes nếu không có trong prefill_data #}
+                   value="{{ prefill_data.language if prefill_data and prefill_data.language else '' }}"
                    class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+            <p class="mt-1 text-xs text-gray-500">Language of the codebase (e.g., Python). This helps improve analysis context.</p>
         </div>
-
         <div>
             <label for="custom_project_notes" class="block text-sm font-medium text-gray-700 mb-1">
                 Custom Project Notes (Optional)
             </label>
-            <textarea name="custom_project_notes" id="custom_project_notes" rows="4"
+            <textarea name="custom_project_notes" id="custom_project_notes" rows="3"
                       placeholder="Any specific coding conventions, architectural guidelines, or important notes for the LLM to consider during analysis."
-                      class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm"></textarea>
+                      class="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">{{ prefill_data.custom_project_notes if prefill_data and prefill_data.custom_project_notes else '' }}</textarea>
         </div>
+
+        <hr class="my-6">
+        <h3 class="text-lg font-medium text-nv-dark">LLM & Analysis Language Configuration (Optional)</h3>
+        <p class="text-xs text-gray-500 mb-4">Defaults will be used if not specified. You can change these later in Project Settings.</p>
+
+        <div>
+            <label for="llm_provider_add" class="block text-sm font-medium text-gray-700">LLM Provider</label>
+            <select name="llm_provider" id="llm_provider_add" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+                <option value="ollama" {% if default_settings.DEFAULT_LLM_PROVIDER == 'ollama' %}selected{% endif %}>Ollama (Local)</option>,
+                <option value="openai" {% if default_settings.DEFAULT_LLM_PROVIDER == 'openai' %}selected{% endif %}>OpenAI</option>
+                <option value="gemini" {% if default_settings.DEFAULT_LLM_PROVIDER == 'gemini' %}selected{% endif %}>Google Gemini</option>
+            </select>
+        </div>
+
+        <div>
+            <label for="llm_model_name_add" class="block text-sm font-medium text-gray-700">LLM Model Name</label>
+            <input type="text" name="llm_model_name" id="llm_model_name_add"
+                   value="" {# Để trống, sẽ dùng default của provider #}
+                   placeholder="Leave empty for provider's default (e.g., {{ default_settings.OLLAMA_DEFAULT_MODEL }} for Ollama)"
+                   class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+        
+        <div>
+            <label for="llm_temperature_add" class="block text-sm font-medium text-gray-700">LLM Temperature (0.0 - 2.0)</label>
+            <input type="number" name="llm_temperature" id="llm_temperature_add"
+                   value="{{ default_settings.get('LLM_DEFAULT_TEMPERATURE', 0.1) }}" 
+                   min="0.0" max="2.0" step="0.1"
+                   class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+
+        <div>
+            <label for="llm_api_key_override_add" class="block text-sm font-medium text-gray-700">LLM API Key Override (Optional)</label>
+            <input type="password" name="llm_api_key_override" id="llm_api_key_override_add"
+                   placeholder="Only for OpenAI/Gemini. Overrides server default."
+                   class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+        </div>
+        
+        <div>
+            <label for="output_language_add" class="block text-sm font-medium text-gray-700">Analysis Output Language</label>
+            <select name="output_language" id="output_language_add" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-nv-accent focus:border-nv-accent sm:text-sm">
+                <option value="en" {% if default_settings.DEFAULT_OUTPUT_LANGUAGE == 'en' %}selected{% endif %}>English</option>
+                <option value="vi" {% if default_settings.DEFAULT_OUTPUT_LANGUAGE == 'vi' %}selected{% endif %}>Tiếng Việt (Vietnamese)</option>
+                <option value="ko" {% if default_settings.DEFAULT_OUTPUT_LANGUAGE == 'ko' %}selected{% endif %}>한국어 (Korean)</option>
+            </select>
+        </div>
+
 
         <div class="flex justify-end pt-4">
             <a href="{{ url_for('ui_dashboard_get') }}" class="mr-3 py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-nv-accent">
@@ -103,26 +144,29 @@
     </form>
 </div>
 
-{% if github_connected %} {# Chỉ chạy script nếu người dùng đã kết nối GitHub (biến này được truyền từ route /add) #}
+{% if github_connected %}
 <script>
+// JavaScript để prefill form từ select box giữ nguyên như trước
+// ... (copy script từ add_project.html đã có) ...
 document.addEventListener('DOMContentLoaded', function() {
     const repoSelect = document.getElementById('github_repo_select');
     const repoNameInput = document.getElementById('repo_name');
     const repoIdInput = document.getElementById('github_repo_id');
     const mainBranchInput = document.getElementById('main_branch');
+    // Các trường mới không cần prefill tự động từ GitHub repo list này,
+    // chúng sẽ lấy giá trị mặc định từ server settings hoặc để trống.
+
+    // ... (phần fetch và populateSelectWithOptions giữ nguyên) ...
+    // Bạn chỉ cần đảm bảo các ID của input fields trên là đúng.
     const loadingReposMessage = document.getElementById('loading_repos_message');
 
-    // Lấy giá trị prefill ban đầu từ context của Jinja2
-    // (Những giá trị này sẽ là None nếu người dùng vào trang /add trực tiếp mà không có query params)
     const initialPrefillRepoId = "{{ prefill_data.repo_id or '' }}";
     const initialPrefillRepoName = "{{ prefill_data.repo_name or '' }}";
-    // main_branch đã có value="{{ prefill_data.main_branch or 'main' }}" trong input rồi
-
+    
     function populateSelectWithOptions(repos) {
-        if(!repoSelect) return; // Kiểm tra repoSelect tồn tại
+        if(!repoSelect) return;
         if(loadingReposMessage) loadingReposMessage.style.display = 'none';
         
-        // Xóa các option cũ (ví dụ: "Loading...")
         while (repoSelect.firstChild && (repoSelect.firstChild.disabled || repoSelect.firstChild.value === "")) {
             repoSelect.removeChild(repoSelect.firstChild);
         }
@@ -141,18 +185,16 @@ document.addEventListener('DOMContentLoaded', function() {
                 option.dataset.repoId = repo.id; 
                 option.dataset.defaultBranch = repo.default_branch || 'main';
                 
-                // Nếu ID này trùng với initialPrefillRepoId (từ URL query params) thì chọn nó
                 if (initialPrefillRepoId && String(repo.id) === initialPrefillRepoId) {
                     option.selected = true;
                 }
                 repoSelect.appendChild(option);
             });
             repoSelect.disabled = false;
-            // Nếu có prefill từ URL, tự động trigger 'change' để điền form lần đầu
             if (initialPrefillRepoId && repoSelect.value === initialPrefillRepoId) {
                 repoSelect.dispatchEvent(new Event('change'));
             } else {
-                defaultOption.selected = true; // Chọn lại option mặc định nếu không có prefill khớp
+                defaultOption.selected = true;
             }
 
         } else {
@@ -165,37 +207,23 @@ document.addEventListener('DOMContentLoaded', function() {
         if(loadingReposMessage) loadingReposMessage.textContent = 'Loading your GitHub repositories...';
         repoSelect.disabled = true;
 
-        // Gọi route UI mới để lấy repo, không phải API /api/projects/github-repos
         fetch("{{ url_for('ui_list_gh_repos_for_form') }}") 
             .then(response => {
-                if (response.status === 401) {
-                     throw new Error('Unauthorized to fetch repositories. Please ensure you are logged in.');
-                }
-                if (!response.ok) {
-                    return response.json().then(err_data => {
-                        throw new Error(err_data.detail || 'Failed to load repositories. Status: ' + response.status);
-                    }).catch(() => {
-                        throw new Error('Failed to load repositories. Status: ' + response.status + ' ' + response.statusText);
-                    });
-                }
+                if (response.status === 401) { throw new Error('Unauthorized'); }
+                if (!response.ok) { throw new Error('Failed to load'); }
                 return response.json();
             })
-            .then(repos => {
-                populateSelectWithOptions(repos);
-            })
+            .then(repos => { populateSelectWithOptions(repos); })
             .catch(error => {
-                console.error('Error fetching GitHub repos for UI form:', error);
+                console.error('Error fetching GitHub repos:', error);
                 if(loadingReposMessage) loadingReposMessage.textContent = 'Could not load repositories: ' + error.message;
                 if(loadingReposMessage) loadingReposMessage.classList.add('text-red-500');
-                
-                while (repoSelect.firstChild && (repoSelect.firstChild.disabled || repoSelect.firstChild.value === "")) {
+                 while (repoSelect.firstChild && (repoSelect.firstChild.disabled || repoSelect.firstChild.value === "")) {
                     repoSelect.removeChild(repoSelect.firstChild);
                 }
                 let errorOption = document.createElement('option');
-                errorOption.value = "";
-                errorOption.textContent = "Error loading repositories.";
-                errorOption.selected = true;
-                errorOption.disabled = true;
+                errorOption.value = ""; errorOption.textContent = "Error loading repositories.";
+                errorOption.selected = true; errorOption.disabled = true;
                 repoSelect.appendChild(errorOption);
                 repoSelect.disabled = false;
             });
@@ -203,24 +231,22 @@ document.addEventListener('DOMContentLoaded', function() {
         repoSelect.addEventListener('change', function() {
             const selectedOption = this.options[this.selectedIndex];
             if (selectedOption && selectedOption.value) { 
-                repoNameInput.value = selectedOption.dataset.fullName;
-                repoIdInput.value = selectedOption.dataset.repoId;
-                mainBranchInput.value = selectedOption.dataset.defaultBranch;
+                if(repoNameInput) repoNameInput.value = selectedOption.dataset.fullName;
+                if(repoIdInput) repoIdInput.value = selectedOption.dataset.repoId;
+                if(mainBranchInput) mainBranchInput.value = selectedOption.dataset.defaultBranch;
             } else {
-                // Nếu chọn lại "-- Select --", xóa các trường (hoặc giữ giá trị prefill từ URL nếu có)
-                repoNameInput.value = initialPrefillRepoName; // Giữ lại prefill ban đầu nếu có
-                repoIdInput.value = initialPrefillRepoId;     // Giữ lại prefill ban đầu nếu có
-                mainBranchInput.value = "{{ prefill_data.main_branch or 'main' }}"; // Giữ lại prefill hoặc default
+                if(repoNameInput) repoNameInput.value = initialPrefillRepoName;
+                if(repoIdInput) repoIdInput.value = initialPrefillRepoId;
+                if(mainBranchInput) mainBranchInput.value = "{{ prefill_data.main_branch or 'main' }}";
             }
         });
     } else if (!github_connected && loadingReposMessage) { 
         loadingReposMessage.textContent = 'Connect to GitHub on Dashboard to select repositories from this list.';
     } else if (loadingReposMessage && !github_connected) {
-        // Nếu không có select box (vì github_connected=false) và có loading message
-        loadingReposMessage.style.display = 'none'; // Ẩn thông báo loading
+        loadingReposMessage.style.display = 'none';
     }
 });
 </script>
-{% endif %} {# Kết thúc if github_connected cho script #}
+{% endif %}
 
 {% endblock %}

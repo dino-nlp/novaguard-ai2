@@ -270,6 +270,10 @@ Các agent này sẽ là trái tim của khả năng phân tích chuyên sâu, t
 * **Trải nghiệm Người dùng (UX/UI):** Phải đảm bảo người dùng có thể dễ dàng hiểu và hành động dựa trên các phân tích chuyên sâu mà không cảm thấy bị quá tải thông tin.
 * **Độ chính xác và Giảm False Positives:** Cần cơ chế feedback mạnh mẽ để hệ thống ngày càng "học" và trở nên chính xác hơn.
 
+
+**XII. Tính năng khác**
+* Ngoài các tính năng chính được liệt kê, Novaguard-AI hỗ trợ output cho 3 ngôn ngữ: Tiếng Anh, tiếng Việt, tiếng Hàn.
+* Có thể chọn lựa sử dụng các provider như: Ollama cho local run, OpenAI, Gemini và lựa chọn tên model tương ứng.
 ---
 
 # Working process

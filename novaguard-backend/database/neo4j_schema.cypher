@@ -1,34 +1,59 @@
 // novaguard-backend/database/neo4j_schema.cypher
 
-// Constraints (đảm bảo tính duy nhất và tạo index tự động cho property đó)
-CREATE CONSTRAINT project_id_path_unique IF NOT EXISTS FOR (f:File) REQUIRE (f.project_id, f.path) IS UNIQUE;
-CREATE CONSTRAINT project_id_module_path_unique IF NOT EXISTS FOR (m:Module) REQUIRE (m.project_id, m.path) IS UNIQUE;
-// Function và Class có thể trùng tên trong các file khác nhau, nhưng trong cùng 1 file và project_id thì nên là duy nhất (hoặc kết hợp thêm start_line)
-CREATE CONSTRAINT project_id_file_func_name_line_unique IF NOT EXISTS FOR (fn:Function) REQUIRE (fn.project_id, fn.file_path, fn.name, fn.start_line) IS UNIQUE;
-CREATE CONSTRAINT project_id_file_class_name_line_unique IF NOT EXISTS FOR (c:Class) REQUIRE (c.project_id, c.file_path, c.name, c.start_line) IS UNIQUE;
+// === Constraints for Uniqueness ===
+// Giúp đảm bảo không có node trùng lặp dựa trên các thuộc tính quan trọng.
+// Tên constraint nên là duy nhất.
+
+// Project Node
+CREATE CONSTRAINT project_graph_id_unique IF NOT EXISTS
+FOR (p:Project) REQUIRE p.graph_id IS UNIQUE;
+
+// File Node
+CREATE CONSTRAINT file_composite_id_unique IF NOT EXISTS
+FOR (f:File) REQUIRE f.composite_id IS UNIQUE;
+
+// Class Node
+CREATE CONSTRAINT class_composite_id_unique IF NOT EXISTS
+FOR (c:Class) REQUIRE c.composite_id IS UNIQUE;
+
+// Function Node (bao gồm cả Method vì Method cũng có label Function)
+CREATE CONSTRAINT function_composite_id_unique IF NOT EXISTS
+FOR (fn:Function) REQUIRE fn.composite_id IS UNIQUE;
+
+// Module Node
+// Một module được xác định duy nhất bởi project và đường dẫn của nó.
+// Sử dụng IS NODE KEY cho các thuộc tính kết hợp.
+CREATE CONSTRAINT module_project_path_key IF NOT EXISTS
+FOR (m:Module) REQUIRE (m.project_graph_id, m.path) IS NODE KEY;
 
 
-// Indexes (tạo index cho các property thường xuyên được query để tăng tốc độ)
-CREATE INDEX file_path_idx IF NOT EXISTS FOR (f:File) ON (f.path);
-CREATE INDEX file_project_id_idx IF NOT EXISTS FOR (f:File) ON (f.project_id);
+// === Indexes for Performance ===
+// Giúp tăng tốc độ truy vấn các node dựa trên các thuộc tính thường được tìm kiếm.
 
-CREATE INDEX function_name_idx IF NOT EXISTS FOR (fn:Function) ON (fn.name);
-CREATE INDEX function_file_path_idx IF NOT EXISTS FOR (fn:Function) ON (fn.file_path);
-CREATE INDEX function_project_id_idx IF NOT EXISTS FOR (fn:Function) ON (fn.project_id);
+// Project Node
+CREATE INDEX project_novaguard_id_idx IF NOT EXISTS
+FOR (p:Project) ON (p.novaguard_id);
 
-CREATE INDEX class_name_idx IF NOT EXISTS FOR (c:Class) ON (c.name);
-CREATE INDEX class_file_path_idx IF NOT EXISTS FOR (c:Class) ON (c.file_path);
-CREATE INDEX class_project_id_idx IF NOT EXISTS FOR (c:Class) ON (c.project_id);
+// File Node
+CREATE INDEX file_project_path_idx IF NOT EXISTS
+FOR (f:File) ON (f.project_graph_id, f.path);
 
-CREATE INDEX module_name_idx IF NOT EXISTS FOR (m:Module) ON (m.name);
-CREATE INDEX module_project_id_idx IF NOT EXISTS FOR (m:Module) ON (m.project_id);
+// Class Node
+CREATE INDEX class_project_name_idx IF NOT EXISTS
+FOR (c:Class) ON (c.project_graph_id, c.name);
 
-// Ghi chú:
-// - Node Labels cơ bản: File, Function, Class, Module
-// - Relationship Types cơ bản: DEFINED_IN, CALLS, IMPORTS, INHERITS_FROM, IMPLEMENTS (cho interfaces)
-// Các labels và relationships này sẽ được tạo động bởi CodeGraphBuilderNode.
-// Script này chủ yếu là để thiết lập constraints và indexes.
+// Function Node
+CREATE INDEX function_project_name_idx IF NOT EXISTS
+FOR (fn:Function) ON (fn.project_graph_id, fn.name);
 
-// Ví dụ về cách bạn có thể kiểm tra sau khi chạy:
-// SHOW CONSTRAINTS;
-// SHOW INDEXES;
+CREATE INDEX function_file_path_idx IF NOT EXISTS
+FOR (fn:Function) ON (fn.file_path); // Nếu thường xuyên tìm function theo file
+
+// General name index (có thể hữu ích nếu tìm kiếm theo tên không kèm project_graph_id)
+// Cân nhắc kỹ vì index quá nhiều cũng không tốt.
+// CREATE INDEX generic_name_idx IF NOT EXISTS
+// FOR (n) ON (n.name);
+
+// Index cho tìm kiếm nhanh các placeholder classes (nếu cần)
+CREATE INDEX class_placeholder_idx IF NOT EXISTS
+FOR (c:Class) ON (c.placeholder);

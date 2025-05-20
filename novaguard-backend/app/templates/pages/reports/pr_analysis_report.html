@@ -90,7 +90,7 @@
         <div class="finding-card finding-severity-{{ finding.severity | lower }} bg-white border border-gray-200 rounded-lg shadow-md mb-6">
             <div class="p-4 border-b border-gray-200 flex justify-between items-center">
                 {# Giả sử message chứa title hoặc message chính của finding #}
-                <span class="finding-title text-gray-800">{{ finding.message | truncate(80, True) }}</span>
+                <span class="finding-title text-gray-800 whitespace-normal break-words">{{ finding.message }}</span>
                 <span class="severity-badge-{{ finding.severity | lower }} px-2.5 py-1 text-xs font-bold rounded-full">
                     {{ finding.severity | capitalize }}
                 </span>

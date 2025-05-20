@@ -5,13 +5,18 @@ FROM python:3.11-slim
 WORKDIR /app
 
 USER root
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-# USER app 
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 # Sao chép file requirements vào thư mục làm việc
 COPY ./requirements.txt /app/requirements.txt
 
 # Cài đặt các Python dependencies
+RUN pip uninstall tree-sitter tree-sitter-languages
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
