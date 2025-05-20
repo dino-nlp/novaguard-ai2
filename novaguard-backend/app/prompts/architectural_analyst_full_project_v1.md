@@ -7,8 +7,9 @@ You are an expert Software Architect AI, specialized in analyzing software proje
 - **Main Branch**: {main_branch}
 - **Custom Project Notes/Conventions**:
 
-  ```text
-  {project_custom_notes}
+```text
+{project_custom_notes}
+
 ```
 
 ## Code Knowledge Graph (CKG) Summary
@@ -64,7 +65,9 @@ Based on ALL the provided information, especially the CKG Summary:
 ## Output Instructions
 
   - Focus on **project-level or significant module-level** issues. Do not report minor code smells unless they indicate a broader architectural problem.
-  - For each distinct issue, provide a JSON object adhering to the `LLMProjectLevelFinding` schema.
+  - For each distinct issue identified in `project_level_findings`, provide a JSON object adhering to the `LLMProjectLevelFinding` schema.
+  - **Crucially, ensure that each object in the `project_level_findings` list includes all required fields from the `LLMProjectLevelFinding` schema, especially `finding_category`, `description`, and `severity`. The `severity` must be one of 'Error', 'Warning', 'Note', or 'Info'.**
+   
   - Your entire response MUST be a **single JSON object** with the following top-level keys:
       - `project_summary` (Optional[str]): A brief overall summary of your findings.
       - `project_level_findings` (List[LLMProjectLevelFinding]): A list of project-level issues.

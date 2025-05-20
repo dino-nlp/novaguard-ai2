@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY ./requirements.txt /app/requirements.txt
 
 # Cài đặt các Python dependencies
+RUN pip uninstall tree-sitter tree-sitter-languages
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 

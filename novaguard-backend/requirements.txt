@@ -23,4 +23,5 @@ langchain-google-genai
 GitPython
 neo4j>=5.0
 tree-sitter==0.21.0
-tree-sitter-languages==1.10.2
+# tree-sitter-languages==1.10.2
+tree-sitter-languages==1.9.1
